@@ -1,0 +1,39 @@
+name: deeppurpose-md-env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11    # 🔧 Add this line to avoid Python 3.13
+  - numpy<2.0
+  - openmm
+  - openmmforcefields
+  - openff-toolkit
+  - mdtraj
+  - scikit-learn
+  - pdbfixer
+  - rdkit
+  - pip
+  - pip:
+      - meeko
+      - vina
+      - scipy
+      - gemmi
+      - biopython
+      - pubchempy
+      - transformers
+      - torch
+      - tqdm
+      - matplotlib
+      - pandas
+      - pandas-flavor
+      - subword-nmt
+      - sentencepiece
+      # ✅ DeepPurpose deps
+      - torch
+      - tqdm
+      - requests
+      - wget
+      - lifelines
+      - prettytable
+      - tensorboard
+      - ax-platform
