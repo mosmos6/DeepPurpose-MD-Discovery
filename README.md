@@ -68,7 +68,7 @@ condacolab.check()
 # Install custom fork of DeepPurpose without overwriting key dependencies
 !conda run -n deeppurpose-md-env pip install --no-deps ./Deeppurpose
 
-# Install optional dependencies like ProtTrans
+# Install optional dependencies like Open Babel
 !conda run -n deeppurpose-md-env python scripts/install_optional.py
 ```
 
