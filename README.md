@@ -74,11 +74,7 @@ Sample .py and .ipynb scripts are included in the repository.
 
 environment.yml — Full environment for conda setup
 
-pipeline_main.py — Unified script for ligand → DeepPurpose → docking → MD → analysis
 
-notebooks/ — Example Colab notebooks (coming soon)
-
-docs/ — Description of each pipeline module (WIP)
 
 ### 📜 License
 MIT License. Please cite this repository if used in academic work.
