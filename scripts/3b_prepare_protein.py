@@ -1,4 +1,4 @@
-# 1b_prepare_protein.py
+# 3b_prepare_protein.py
 # Author: Iori Mochizuki
 # Created: 2025-05-13
 # Description: Clean and standardize receptor using PDBFixer
@@ -8,7 +8,7 @@ from pdbfixer import PDBFixer
 from openmm.app import PDBFile
 
 """
-Step 1b: Receptor Preprocessing
+Step 3b: Receptor Preprocessing
 - Fix missing atoms and residues
 - Replace nonstandard residues
 - Add hydrogens
