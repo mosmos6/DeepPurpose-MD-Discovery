@@ -12,7 +12,7 @@ from rdkit.Chem import AllChem
 import sys
 
 # --- SETTINGS ---
-smiles = sys.argv[1]  # DHEA as example
+smiles = sys.argv[1]  
 ligand_name = "ligand"
 
 # --- 1. Generate RDKit molecule from SMILES ---
