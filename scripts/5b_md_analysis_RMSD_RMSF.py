@@ -1,5 +1,6 @@
 # 5b_md_analysis_RMSD_RMSF.py
 # Author: Iori Mochizuki
+# Created: 2025-05-13
 # Description: Analyze RMSD and RMSF after MD simulation
 
 import mdtraj as md
