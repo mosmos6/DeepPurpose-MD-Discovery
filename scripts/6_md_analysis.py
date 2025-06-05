@@ -1,5 +1,6 @@
 # 6_md_analysis.py
 # Author: Iori Mochizuki
+# Created: 2025-05-13
 # Description: Analyze MD trajectory (ligand binding, RMSD/F, PCA, FEL)
 
 import mdtraj as md
