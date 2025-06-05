@@ -2,7 +2,7 @@
 
 A streamlined, Colab-optimized drug discovery pipeline integrating:
 
-- ✅ Ligand-target prediction with a custom-trained [DeepPurpose](https://github.com/mosmos6/Deeppurpose) fork
+- ✅ Ligand-target prediction with a custom-trained [DeepPurpose](https://github.com/BioMolDynamics/Deeppurpose) fork
 - ✅ Structural docking using [AutoDock Vina](http://vina.scripps.edu/)
 - ✅ GPU-accelerated Molecular Dynamics with [OpenMM](https://openmm.org/) and [OpenFF](https://openforcefield.org/)
 - ✅ Stability and mechanistic analyses via PCA, FEL, RMSD, H-bonding, water networks, and more.
