@@ -1,5 +1,6 @@
 # utils.py
 # Author: Iori Mochizuki
+# Created: 2025-05-13
 # Shared helper functions for DeepPurpose-MD-Discovery pipeline
 
 import numpy as np
