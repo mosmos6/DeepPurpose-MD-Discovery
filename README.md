@@ -94,12 +94,12 @@ Each script corresponds to a specific stage in the full drug discovery pipeline 
 This demo uses a COVID-19 specific subset of BindingDB, available from UC San Diego.  
 To simplify setup, we provide pre-cleaned versions of this dataset:
 
-- `BindingDB_Covid-19.tsv` (214MB, hosted via OSF)
+- `BindingDB_Covid-19.tsv` (214MB, hosted via Zenodo)
 - `strong_binders_cleaned.csv` (optional for filtering)
 - `protein.faa` (optional for filtering)
 - `metrics - SARS2 FASTA.csv` (matching data of SARS-CoV-2 proteins and FASTA)
 
-📎 Dataset download link: [https://osf.io/your-dataset-id](https://osf.io/your-dataset-id)
+📎 Dataset download link: [https://doi.org/10.5281/zenodo.15613825)
 
 You are welcome to use your own SMILES/FASTA data by modifying `7_deeppurpose_training.py`.
 
@@ -114,6 +114,11 @@ Cleaned outputs ready for visualization and MD refinement
 
 ### 📜 License
 MIT License. Please cite this repository if used in academic work.
+
+### 📖 Citation
+If you use **DeepPurpose-MD** in your work, please cite:
+
+Mochizuki, I. (2025). DeepPurpose-MD: An End-to-End Colab-Based Drug Discovery Pipeline Integrating Docking, Molecular Dynamics, and Deep Learning. Zenodo. https://doi.org/10.5281/zenodo.15613825
 
 ### 📫 Contact
 Maintained by BioMolDynamics
