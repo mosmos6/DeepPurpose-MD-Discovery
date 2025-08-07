@@ -1,41 +1,60 @@
 # 5_md_simulation.py
 # Author: Iori Mochizuki
-# Created: 2025-05-13
-# Description: Run OpenMM-based 2 ns MD simulation of ligand-receptor complex using OpenFF
+# Updated: 2025-07-30
+# Description: Run OpenMM-based 2 ns MD simulation of ligand-receptor complex using OpenFF (RNA & no-ligand compatible)
 
+
+import argparse
 from openmm.app import *
-from openmm import MonteCarloBarostat, Platform, LangevinMiddleIntegrator
+from openmm import MonteCarloBarostat, LangevinMiddleIntegrator
 from openmm.unit import *
 from openmmforcefields.generators import SMIRNOFFTemplateGenerator
 from openff.toolkit.topology import Molecule, Topology as OFFTopology
 from openff.units.openmm import to_openmm
 from sys import stdout
-import mdtraj as md
-import matplotlib.pyplot as plt
+import openmm as mm
 
-# === Load Receptor ===
-receptor_pdb = PDBFile("receptor_cleaned.pdb")
+parser = argparse.ArgumentParser(description="Run OpenMM MD (RNA, protein, ligand, no-ligand)")
+parser.add_argument("--rna", action="store_true", help="Enable RNA forcefield and logic")
+parser.add_argument("--no-ligand", action="store_true", help="Run without ligand (receptor only)")
+parser.add_argument("--input-receptor", type=str, default="receptor_cleaned.pdb", help="Input receptor PDB")
+parser.add_argument("--input-ligand", type=str, default="ligand.sdf", help="Input ligand SDF")
+parser.add_argument("--n-steps", type=int, default=1000000, help="Number of steps for production MD (default: 1,000,000)")
+args = parser.parse_args()
 
-# === Load Ligand ===
-ligand = Molecule.from_file("ligand.sdf")
-ligand_positions = to_openmm(ligand.conformers[0])
-ligand_top = OFFTopology.from_molecules([ligand]).to_openmm()
+suffix = "_no_ligand" if args.no_ligand else ""
 
-# === Define Force Field ===
-forcefield = ForceField("amber14-all.xml", "amber14/tip3pfb.xml")
-smirnoff = SMIRNOFFTemplateGenerator(molecules=[ligand])
-forcefield.registerTemplateGenerator(smirnoff.generator)
+# 1. Load receptor
+receptor_pdb = PDBFile(args.input_receptor)
 
-# === Merge Systems ===
-modeller = Modeller(receptor_pdb.topology, receptor_pdb.positions)
-modeller.add(ligand_top, ligand_positions)
+# 2. Force field setup
+if args.rna:
+    print("🧬 [RNA MODE] Using amber14/RNA.OL3 forcefield")
+    forcefield = ForceField("amber14/RNA.OL3.xml", "amber14/tip3pfb.xml")
+else:
+    print("🧬 [Protein MODE] Using amber14-all forcefield")
+    forcefield = ForceField("amber14-all.xml", "amber14/tip3pfb.xml")
+
+# 3. Ligand logic
+if not args.no_ligand:
+    ligand = Molecule.from_file(args.input_ligand)
+    ligand_positions = to_openmm(ligand.conformers[0])
+    ligand_top = OFFTopology.from_molecules([ligand]).to_openmm()
+    smirnoff = SMIRNOFFTemplateGenerator(molecules=[ligand])
+    forcefield.registerTemplateGenerator(smirnoff.generator)
+    modeller = Modeller(receptor_pdb.topology, receptor_pdb.positions)
+    modeller.add(ligand_top, ligand_positions)
+    print("✅ Ligand merged")
+else:
+    modeller = Modeller(receptor_pdb.topology, receptor_pdb.positions)
+    print("✅ No ligand: Running receptor-only MD")
+
 modeller.addHydrogens(forcefield)
 
-with open("combined_receptor_ligand.pdb", "w") as f:
+with open(f"combined_receptor_ligand{suffix}.pdb", "w") as f:
     PDBFile.writeFile(modeller.topology, modeller.positions, f)
-print("✅ Receptor + ligand merged and hydrogens added.")
+print(f"✅ System ready for solvation ({'apo' if args.no_ligand else 'holo'})")
 
-# === Solvation ===
 modeller.addSolvent(
     forcefield,
     model="tip3p",
@@ -43,12 +62,10 @@ modeller.addSolvent(
     ionicStrength=0.15 * molar,
     neutralize=True
 )
-
-with open("solvated_receptor_ligand.pdb", "w") as f:
+with open(f"solvated_receptor_ligand{suffix}.pdb", "w") as f:
     PDBFile.writeFile(modeller.topology, modeller.positions, f)
 print("✅ Solvated system ready.")
 
-# === System Definition ===
 system = forcefield.createSystem(
     modeller.topology,
     nonbondedMethod=PME,
@@ -58,36 +75,29 @@ system = forcefield.createSystem(
 system.addForce(MonteCarloBarostat(1 * bar, 300 * kelvin, 25))
 
 integrator = LangevinMiddleIntegrator(300 * kelvin, 1 / picosecond, 0.002 * picoseconds)
-platform = Platform.getPlatformByName("CUDA")
-simulation = Simulation(modeller.topology, system, integrator, platform)
+#platform = Platform.getPlatformByName("CUDA")
+simulation = Simulation(modeller.topology, system, integrator)
 simulation.context.setPositions(modeller.positions)
 
-# === Energy Minimization ===
 print("🔹 Energy Minimization...")
 simulation.minimizeEnergy()
-simulation.reporters.append(PDBReporter("minimized.pdb", 100))
+simulation.reporters.append(PDBReporter(f"minimized{suffix}.pdb", 100))
 
-# === NVT Equilibration ===
 print("🔹 NVT Equilibration (1 ps)...")
 simulation.context.setVelocitiesToTemperature(300 * kelvin)
-simulation.reporters.append(PDBReporter("nvt_equilibrated.pdb", 100))
+simulation.reporters.append(PDBReporter(f"nvt_equilibrated{suffix}.pdb", 100))
 simulation.reporters.append(StateDataReporter(stdout, 100, step=True, potentialEnergy=True, temperature=True))
 simulation.step(500)  # 1 ps
 
-# === NPT Equilibration ===
 print("🔹 NPT Equilibration (5 ps)...")
-simulation.reporters.append(PDBReporter("npt_equilibrated.pdb", 500))
+simulation.reporters.append(PDBReporter(f"npt_equilibrated{suffix}.pdb", 500))
 simulation.step(2500)  # 5 ps
 
-# === Production MD (2 ns) ===
-print("🔥 Production MD: 2 ns (1,000,000 steps)")
-simulation.reporters.append(DCDReporter("production_md.dcd", 1000))
-simulation.reporters.append(StateDataReporter("production_md.log", 1000, step=True, potentialEnergy=True, temperature=True))
-simulation.step(1000000)  # 2 ns
+print(f"🔥 Production MD: {args.n_steps:,} steps")
+simulation.reporters.append(DCDReporter(f"production_md{suffix}.dcd", 1000))
+simulation.reporters.append(StateDataReporter(f"production_md{suffix}.log", 1000, step=True, potentialEnergy=True, temperature=True))
+simulation.step(args.n_steps)  # default = 1,000,000 steps for 2 ns
 
-# === Save Final Frame ===
-with open("final_structure.pdb", "w") as f:
+with open(f"final_structure{suffix}.pdb", "w") as f:
     PDBFile.writeFile(simulation.topology, simulation.context.getState(getPositions=True).getPositions(), f)
-print("🎉 MD complete → final_structure.pdb saved.")
-
-
+print(f"🎉 MD complete → final_structure{suffix}.pdb saved.")
