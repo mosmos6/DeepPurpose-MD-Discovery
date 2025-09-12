@@ -78,11 +78,20 @@ def resolve_multichain_alt_dups(input_pdb: str, output_pdb: str, keep_hetatm: bo
         fixed = line[:16] + " " + line[17:]
         chosen.append(fixed)
 
+    safe_header = [
+        ln for ln in other
+        if not (ln.startswith("CONECT") or ln.startswith("END") or ln.startswith("ENDMDL") or ln.startswith("MASTER"))
+    ]
+
     with open(output_pdb, "w") as out:
-        for line in other:
+        # 1) safe headers / remarks only
+        for line in safe_header:
             out.write(line)
+        # 2) atom records
         for line in chosen:
             out.write(line)
+        # 3) write a single clean END at the very end
+        out.write("END\n")
 
     print(f"🔧 Alt/dup resolver → {output_pdb} (kept {len(chosen)} atom records)")
 
@@ -105,7 +114,7 @@ else:
     receptor_fixed = "receptor_fixed.pdb"
 
     print(f"📦 Downloading {args.pdb_id} from RCSB...")
-    subprocess.run(["wget", f"https://files.rcsb.org/download/{args.pdb_id}.pdb", "-O", receptor_raw], check=False)
+    #subprocess.run(["wget", f"https://files.rcsb.org/download/{args.pdb_id}.pdb", "-O", receptor_raw], check=False)
 
     # 1) Make two branches from the raw file, removing HOH in both
     #    - receptor_for_centroid.pdb : keep HETATM (for centroid logic)
