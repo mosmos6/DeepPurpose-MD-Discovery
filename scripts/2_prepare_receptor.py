@@ -114,7 +114,7 @@ else:
     receptor_fixed = "receptor_fixed.pdb"
 
     print(f"📦 Downloading {args.pdb_id} from RCSB...")
-    subprocess.run(["wget", f"https://files.rcsb.org/download/{args.pdb_id}.pdb", "-O", receptor_raw], check=False)
+    #subprocess.run(["wget", f"https://files.rcsb.org/download/{args.pdb_id}.pdb", "-O", receptor_raw], check=False)
 
     # 1) Make two branches from the raw file, removing HOH in both
     #    - receptor_for_centroid.pdb : keep HETATM (for centroid logic)
