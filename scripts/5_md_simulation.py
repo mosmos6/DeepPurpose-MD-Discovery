@@ -58,7 +58,7 @@ print(f"✅ System ready for solvation ({'apo' if args.no_ligand else 'holo'})")
 modeller.addSolvent(
     forcefield,
     model="tip3p",
-    boxSize=(8.0, 8.0, 8.0) * nanometer,
+    boxSize=(7.0, 7.0, 7.0) * nanometer,
     ionicStrength=0.15 * molar,
     neutralize=True
 )
