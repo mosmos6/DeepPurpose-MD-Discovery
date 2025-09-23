@@ -77,7 +77,7 @@ seed = int(args.seed)
 #system.addForce(MonteCarloBarostat(1 * bar, 300 * kelvin, 25))
 
 # Barostat with a fixed seed
-barostat = MonteCarloBarostat(1 * unit.bar, 300 * unit.kelvin, 25)
+barostat = MonteCarloBarostat(1 * bar, 300 * kelvin, 25)
 barostat.setRandomNumberSeed(seed)
 system.addForce(barostat)
 
