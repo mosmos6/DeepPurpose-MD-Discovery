@@ -20,6 +20,7 @@ parser.add_argument("--no-ligand", action="store_true", help="Run without ligand
 parser.add_argument("--input-receptor", type=str, default="receptor_cleaned.pdb", help="Input receptor PDB")
 parser.add_argument("--input-ligand", type=str, default="ligand.sdf", help="Input ligand SDF")
 parser.add_argument("--n-steps", type=int, default=1000000, help="Number of steps for production MD (default: 1,000,000)")
+parser.add_argument("--seed", type=int, default=13579, help="Random seed for barostat/integrator/velocities")
 args = parser.parse_args()
 
 suffix = "_no_ligand" if args.no_ligand else ""
@@ -72,7 +73,7 @@ system = forcefield.createSystem(
     nonbondedCutoff=1 * nanometer,
     constraints=HBonds
 )
-seed = 13579
+seed = int(args.seed)
 #system.addForce(MonteCarloBarostat(1 * bar, 300 * kelvin, 25))
 
 # Barostat with a fixed seed
