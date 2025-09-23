@@ -28,6 +28,8 @@ parser.add_argument("--res-range", type=str, default=None,
 parser.add_argument("--center_x", type=float, default=None, help="Manual docking box center X (Å)")
 parser.add_argument("--center_y", type=float, default=None, help="Manual docking box center Y (Å)")
 parser.add_argument("--center_z", type=float, default=None, help="Manual docking box center Z (Å)")
+parser.add_argument("--vina_seed", type=int, default=12345,
+                    help="Random seed passed to AutoDock Vina (default: 12345)")
 
 args = parser.parse_args()
 
@@ -142,7 +144,7 @@ vina_command = f"""
 --center_y {y_center} \
 --center_z {z_center} \
 --size_x 30 --size_y 30 --size_z 30 \
---seed 12345 --exhaustiveness 20
+--seed {args.vina_seed} --exhaustiveness 20
 """
 print("Running AutoDock Vina...")
 subprocess.run(vina_command, shell=True, check=True)
