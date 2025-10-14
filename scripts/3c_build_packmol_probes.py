@@ -1,208 +1,253 @@
-#!/usr/bin/env python3
 # scripts/3c_build_packmol_probes.py
-# Universal Packmol mixture builder (target-agnostic)
-# Creates a cosolvent PDB around the receptor so coordinates align with your MD.
+# Universal Packmol driver for MixMD-style placement (protein/RNA targets, incl. 40S)
+# Author: Iori Mochizuki (pipeline owner) + collaborator patch
+# Updated: 2025-10-14
 
-import argparse, os, shutil, subprocess, sys
+import argparse, os, shutil, subprocess, sys, math, csv
 from pathlib import Path
+from typing import Dict, List, Tuple
+from dataclasses import dataclass
 
-from openff.toolkit.topology import Molecule, Topology as OFFTopology
-import numpy as _np
-from openff.units import unit as offunit
+# ---- minimal RDKit-only helpers (no OpenMM/OpenFF here)
+from rdkit import Chem
+from rdkit.Chem import AllChem
 
-
-PROBES = {
-    # key      resname  smiles
-    "ipa":   ("IPA",  "CC(C)O"),            # isopropanol
-    "acn":   ("ACN",  "CC#N"),              # acetonitrile
-    "imd":   ("IMD",  "c1[nH]cnc1"),        # imidazole (N1 protonated)
-    "aceam": ("ACEA", "CC(=O)N"),           # acetamide
-    "phol":  ("PHOL", "c1ccc(cc1)O"),       # phenol
-    "acoh":  ("ACOH", "CC(=O)O"),           # acetic acid (optional)
+PROBES: Dict[str, Tuple[str, str]] = {
+    # key: (RESNAME, SMILES)
+    "ipa":   ("IPA",  "CC(C)O"),        # isopropanol
+    "acn":   ("ACN",  "CC#N"),          # acetonitrile
+    "imd":   ("IMD",  "c1[nH]cnc1"),    # imidazole (neutral, N1 protonated)
+    "aceam": ("ACEA", "CC(=O)N"),       # acetamide
+    "phol":  ("PHOL", "c1ccc(cc1)O"),   # phenol
+    "acoh":  ("ACOH", "CC(=O)O"),       # acetic acid
 }
 
-def parse_fractions(s: str):
-    # accepts "ipa=0.40,acn=0.20,imd=0.15,aceam=0.15,phol=0.10"
-    parts = [p.strip() for p in s.split(",") if p.strip()]
-    kv = {}
-    for p in parts:
-        if "=" not in p:
-            raise ValueError(f"Bad token: {p!r} (use key=val)")
-        k, v = p.split("=", 1)
+@dataclass
+class Box:
+    L: float  # nm
+    lo: float # nm
+    hi: float # nm
+
+def parse_kv_fracs(s: str) -> Dict[str, float]:
+    fr = {}
+    for tok in s.split(","):
+        tok = tok.strip()
+        if not tok: 
+            continue
+        if "=" not in tok:
+            raise ValueError(f"Bad token in --probe-fractions: '{tok}' (use key=val)")
+        k, v = tok.split("=", 1)
         k = k.strip().lower()
         if k not in PROBES:
-            raise ValueError(f"Unknown key {k!r}. Allowed: {list(PROBES.keys())}")
-        kv[k] = float(v.strip())
-    total = sum(kv.values())
-    if total <= 0:
-        raise ValueError("Probe fractions must sum to > 0")
-    # normalize so minor rounding doesn’t matter
-    for k in kv:
-        kv[k] /= total
-    return kv
+            raise ValueError(f"Unknown probe key '{k}'. Allowed: {list(PROBES.keys())}")
+        fr[k] = float(v.strip())
+    if not fr:
+        raise ValueError("At least one probe fraction must be provided.")
+    ssum = sum(fr.values())
+    if ssum <= 0:
+        raise ValueError("Sum of fractions must be > 0.")
+    for k in fr:
+        fr[k] /= ssum
+    return fr
 
-def write_probe_pdbs(out_dir: Path):
-    """
-    Write one PDB template per probe (Å units), centered at its own centroid.
-    Pure OpenFF + Python; no OpenMM objects are used (avoids value_in_unit / .element errors).
-    Returns: dict {probe_key: Path-to-PDB}
-    """
-    from openff.toolkit.topology import Molecule
-    from openff.units import unit as offunit
-    import numpy as _np
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    probe_pdb_paths = {}
-
-    # Minimal periodic table mapping for expected atoms; defaults to 'C' if unknown.
-    _Z2SYM = {
-        1: "H", 6: "C", 7: "N", 8: "O", 9: "F",
-        15: "P", 16: "S", 17: "Cl", 35: "Br", 53: "I"
-    }
-
-    def _pdb_hetatm_line(serial, name4, resname4, chain, resseq, x, y, z, occ=1.00, bfac=0.00, elem="C"):
-        # Columns (approx PDB v3.3): record(1-6) serial(7-11) name(13-16) resName(18-21) chain(22)
-        # resSeq(23-26) x(31-38) y(39-46) z(47-54) occ(55-60) temp(61-66) element(77-78)
-        return (f"HETATM{serial:5d} "
-                f"{name4:<4s}"
-                f"{resname4:>4s}"
-                f"{chain:1s}"
-                f"{resseq:4d}    "
-                f"{x:8.3f}{y:8.3f}{z:8.3f}"
-                f"{occ:6.2f}{bfac:6.2f}"
-                f"          {elem:>2s}\n")
-
-    for key, (resname, smiles) in PROBES.items():
-        # Build probe and a single conformer
-        off = Molecule.from_smiles(smiles, allow_undefined_stereo=True)
-        off.generate_conformers(n_conformers=1)  # RDKit backend by default
-
-        # Coordinates in Å as plain floats; shape (n_atoms, 3)
-        coords = _np.asarray(off.conformers[0].m_as(offunit.angstrom), dtype=float)
-        # Center on centroid so PACKMOL can position without bias
-        coords -= coords.mean(axis=0, keepdims=True)
-
-        # Prepare PDB text
-        lines = []
-        serial = 1
-        resname4 = (resname[:4]).upper()  # PDB resname up to 4 chars
-        chain = "A"
-        resseq = 1
-
-        # Make atom names like C1, C2, O1... (4-char field)
-        elem_counts = {}
-        for i, atom in enumerate(off.atoms):
-            znum = int(getattr(atom, "atomic_number", 6) or 6)
-            elem = _Z2SYM.get(znum, "C")
-            elem_counts[elem] = elem_counts.get(elem, 0) + 1
-            name = f"{elem}{elem_counts[elem]}"
-            x, y, z = coords[i]
-            lines.append(_pdb_hetatm_line(
-                serial=serial,
-                name4=name[:4],
-                resname4=resname4,
-                chain=chain,
-                resseq=resseq,
-                x=x, y=y, z=z,
-                elem=elem
-            ))
-            serial += 1
-
-        lines.append("TER\nEND\n")
-
-        out_pdb = out_dir / f"{resname4}.pdb"
-        with open(out_pdb, "w") as f:
-            f.writelines(lines)
-
-        probe_pdb_paths[key] = out_pdb
-
-    return probe_pdb_paths
-
-
-
-def build_packmol_input(
-    receptor_pdb: Path,
-    probe_pdbs: dict,
-    counts: dict,
-    box_size_nm: float,
-    tolerance_ang: float,
-    out_pdb: Path,
-    inp_path: Path,
-):
-    """Compose a Packmol input that fixes the receptor and packs probes inside the same 0..L nm cube."""
-    L_ang = box_size_nm * 10.0  # nm->Å; Packmol uses Å
+def rdkit_centered_pdb(mol: Chem.Mol, resname: str) -> str:
+    """Return a PDB block with the molecule centered at its centroid and residue name set."""
+    # Ensure 3D conformer
+    mol = Chem.AddHs(mol)
+    if mol.GetNumConformers() == 0:
+        AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
+        AllChem.UFFOptimizeMolecule(mol, maxIters=200)
+    conf = mol.GetConformer()
+    n = mol.GetNumAtoms()
+    coords = []
+    cx = cy = cz = 0.0
+    for i in range(n):
+        x, y, z = conf.GetAtomPosition(i)
+        coords.append((x, y, z))  # Å
+        cx += x; cy += y; cz += z
+    cx /= n; cy /= n; cz /= n
+    # Translate to centroid 0, then write PDB lines ourselves to control resname
     lines = []
-    lines.append(f"tolerance {tolerance_ang:.3f}")
+    for idx, (x, y, z) in enumerate(coords, start=1):
+        x0 = x - cx; y0 = y - cy; z0 = z - cz
+        atom = mol.GetAtomWithIdx(idx-1)
+        elem = atom.GetSymbol().rjust(2)
+        name = (elem + "  ").ljust(4)[:4]  # crude but stable
+        # HETATM serial, name, resname, chain, resid, x,y,z, occ, b, element
+        lines.append(f"HETATM{idx:5d} {name} {resname:>3s} Z{1:4d}    "
+                     f"{x0:8.3f}{y0:8.3f}{z0:8.3f}  1.00  0.00          {elem:>2s}")
+    # TER + END
+    lines.append("TER")
+    lines.append("END")
+    return "\n".join(lines) + "\n"
+
+def write_probe_templates(out_dir: Path) -> Dict[str, Path]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = {}
+    for key, (resname, smi) in PROBES.items():
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            raise RuntimeError(f"SMILES parse failed for {key}: {smi}")
+        pdb_block = rdkit_centered_pdb(mol, resname)
+        path = out_dir / f"{resname}.pdb"
+        path.write_text(pdb_block, encoding="utf-8")
+        out[key] = path
+    return out
+
+def receptor_box_auto(pdb_path: Path, pad_nm: float) -> Box:
+    """Compute receptor bounding box from ATOM/HETATM and add padding (nm)."""
+    xs, ys, zs = [], [], []
+    with open(pdb_path, "r") as f:
+        for line in f:
+            if not (line.startswith("ATOM") or line.startswith("HETATM")):
+                continue
+            try:
+                x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])  # Å
+            except ValueError:
+                continue
+            xs.append(x*0.1); ys.append(y*0.1); zs.append(z*0.1)  # nm
+    if not xs:
+        raise RuntimeError("No atom coordinates found in receptor PDB.")
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+    zmin, zmax = min(zs), max(zs)
+    span = max(xmax-xmin, ymax-ymin, zmax-zmin) + 2.0*pad_nm
+    L = max(span, 4.0)  # at least 4 nm box
+    return Box(L=L, lo=-L/2.0, hi=+L/2.0)
+
+def write_packmol_input(outfile: Path,
+                        receptor_pdb: Path,
+                        probe_pdbs: Dict[str, Path],
+                        counts: Dict[str, int],
+                        box: Box,
+                        tolerance_A: float,
+                        out_pdb: Path):
+    lines = []
+    lines.append(f"tolerance {tolerance_A:.3f}")
     lines.append("filetype pdb")
     lines.append(f"output {out_pdb.as_posix()}")
-    lines.append("add_box_sides 0.0")  # keep exact box
-    lines.append("")  # receptor fixed to preserve frame
-    lines.append(f"struct {receptor_pdb.as_posix()}")
+    lines.append("")    
+    # Fix receptor at origin (keeps the same coordinates)
+    lines.append(f"structures")
+    lines.append(f"end structures")  # (Packmol Memgen prints this header; harmless if absent)
+    lines.append(f"structure {receptor_pdb.as_posix()}")
     lines.append("  number 1")
     lines.append("  fixed 0. 0. 0. 0. 0. 0.")
-    lines.append("end struct")
-    lines.append("")
-    # probes
+    lines.append("end structure")
+    # Probes inside cubic box (nm→Å)
+    loA, hiA = box.lo*10.0, box.hi*10.0
     for key, n in counts.items():
-        if n <= 0:
+        if n <= 0: 
             continue
-        resname = PROBES[key][0]
-        lines.append(f"struct {probe_pdbs[key].as_posix()}")
-        lines.append(f"  number {int(n)}")
-        lines.append(f"  inside box 0.0 0.0 0.0 {L_ang:.3f} {L_ang:.3f} {L_ang:.3f}")
-        lines.append("end struct")
-        lines.append("")
-    inp_path.write_text("\n".join(lines))
+        ppath = probe_pdbs[key]
+        lines.append(f"structure {ppath.as_posix()}")
+        lines.append(f"  number {n}")
+        lines.append(f"  inside box {loA:.3f} {loA:.3f} {loA:.3f} {hiA:.3f} {hiA:.3f} {hiA:.3f}")
+        lines.append("end structure")
+    outfile.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+def run_packmol(input_file: Path):
+    exe = shutil.which("packmol")
+    if exe is None:
+        raise RuntimeError("Packmol executable not found in PATH.")
+    # Run as: packmol < input.inp
+    cmd = [exe]
+    proc = subprocess.run(cmd, input=input_file.read_text().encode("utf-8"),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stdout.decode("utf-8", errors="ignore"))
+        sys.stderr.write(proc.stderr.decode("utf-8", errors="ignore"))
+        raise RuntimeError("[3c] Packmol failed. See console above.")
+    print("[3c] Packmol completed.")
+
+def parse_probe_centroids(packmol_pdb: Path, probe_resnames: List[str], out_csv: Path):
+    # centroid per (resname, resid). PDB coords are Å.
+    groups: Dict[Tuple[str,int], List[Tuple[float,float,float]]] = {}
+    with open(packmol_pdb, "r") as f:
+        for line in f:
+            if not (line.startswith("HETATM") or line.startswith("ATOM")):
+                continue
+            resname = line[17:20].strip()
+            if resname not in probe_resnames:
+                continue
+            resid = int(line[22:26])
+            x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])  # Å
+            groups.setdefault((resname, resid), []).append((x, y, z))
+    rows = []
+    for (resname, resid), xyzs in groups.items():
+        n = len(xyzs)
+        cx = sum(p[0] for p in xyzs)/n * 0.1  # nm
+        cy = sum(p[1] for p in xyzs)/n * 0.1
+        cz = sum(p[2] for p in xyzs)/n * 0.1
+        rows.append((resname, resid, cx, cy, cz))
+    with open(out_csv, "w", newline="") as fp:
+        w = csv.writer(fp)
+        w.writerow(["resname","resid","x_nm","y_nm","z_nm"])
+        w.writerows(rows)
+    print(f"[3c] Wrote centroids for {len(rows)} probe instances → {out_csv}")
 
 def main():
-    ap = argparse.ArgumentParser(description="Build a Packmol cosolvent mixture PDB (universal, target‑agnostic).")
-    ap.add_argument("--input-receptor", default="receptor_cleaned.pdb")
-    ap.add_argument("--target-name", default=None, help="Name used in outputs; default = stem of receptor filename")
-    ap.add_argument("--box-size-nm", type=float, default=7.0, help="Cubic box edge used in MD and packing (nm)")
-    ap.add_argument("--tolerance-ang", type=float, default=2.0, help="Packmol inter‑molecule tolerance (Å)")
-    ap.add_argument("--probe-total", type=int, default=200, help="Total probes to place")
-    ap.add_argument("--probe-fractions", default="ipa=0.40,acn=0.20,imd=0.15,aceam=0.15,phol=0.10",
-                    help="Comma‑sep key=frac. Keys: ipa,acn,imd,aceam,phol,acoh")
-    ap.add_argument("--packmol-bin", default="packmol", help="Packmol executable on PATH")
-    ap.add_argument("--out-dir", default="build", help="Output directory")
+    ap = argparse.ArgumentParser(description="Build a Packmol mixture around receptor for MixMD-style runs.")
+    ap.add_argument("--input-receptor", type=str, default="receptor_cleaned.pdb")
+    ap.add_argument("--box-mode", choices=["auto","fixed"], default="auto",
+                    help="auto: size from receptor bounding box + padding; fixed: use --box-size-nm.")
+    ap.add_argument("--box-size-nm", type=float, default=7.0,
+                    help="Cubic box edge length if --box-mode fixed.")
+    ap.add_argument("--padding-nm", type=float, default=1.2,
+                    help="Padding added to receptor span if --box-mode auto.")
+    ap.add_argument("--probe-total", type=int, default=200)
+    ap.add_argument("--probe-fractions", type=str,
+                    default="ipa=0.40,acn=0.20,imd=0.15,aceam=0.15,phol=0.10")
+    ap.add_argument("--tolerance-A", type=float, default=2.0,
+                    help="Packmol minimum distance in Å (applies between *any* atoms).")
+    ap.add_argument("--output-prefix", type=str, default="mixmd")
     args = ap.parse_args()
 
-    rec_path = Path(args.input_receptor)
-    if not rec_path.exists():
-        sys.exit(f"[3c] Receptor not found: {rec_path}")
+    receptor_pdb = Path(args.input_receptor)
+    if not receptor_pdb.exists():
+        raise FileNotFoundError(f"Receptor PDB not found: {receptor_pdb}")
 
-    target = args.target_name or rec_path.stem  # universal — no hard‑coded target strings
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    tmp_dir = out_dir / "packmol_inputs"
-    tmp_dir.mkdir(exist_ok=True)
+    build = Path("build"); tmp = build / "tmp_probes"
+    build.mkdir(exist_ok=True); tmp.mkdir(parents=True, exist_ok=True)
 
-    # 1) make per‑probe PDB templates
-    probe_pdbs = write_probe_pdbs(tmp_dir)
+    # Fractions → integer counts
+    fr = parse_kv_fracs(args.probe_fractions)
+    counts = {k: int(round(args.probe_total*fr[k])) for k in fr}
+    # Ensure sum exactly equals probe_total
+    diff = args.probe_total - sum(counts.values())
+    if diff != 0:
+        # adjust the largest fraction
+        kmax = max(counts, key=lambda k: fr[k])
+        counts[kmax] += diff
 
-    # 2) decide counts from fractions
-    fracs = parse_fractions(args.probe_fractions)
-    counts = {k: int(round(args.probe_total * fracs.get(k, 0.0))) for k in PROBES.keys()}
-    # last key absorbs rounding
-    deficit = args.probe_total - sum(counts.values())
-    if deficit != 0 and fracs:
-        last = list(fracs.keys())[-1]
-        counts[last] += deficit
+    # Box
+    if args.box_mode == "auto":
+        box = receptor_box_auto(receptor_pdb, pad_nm=args.padding_nm)
+    else:
+        L = float(args.box_size_nm)
+        box = Box(L=L, lo=-L/2.0, hi=+L/2.0)
+    print(f"[3c] Box: {box.L:.2f} nm (lo={box.lo:.2f}, hi={box.hi:.2f})")
 
-    # 3) write Packmol input
-    out_pdb = out_dir / f"{target}_mixmd.probes.pdb"
-    inp_path = out_dir / f"{target}_mixmd.packmol.inp"
-    build_packmol_input(rec_path, probe_pdbs, counts, args.box_size_nm, args.tolerance_ang, out_pdb, inp_path)
+    # Templates
+    probe_pdbs = write_probe_templates(tmp)
 
-    # 4) run Packmol
-    cmd = [args.packmol_bin, "<", inp_path.as_posix()]
-    print(f"[3c] Running: {' '.join(cmd)}")
-    # Use shell so "<" redirection works cross‑platform where Packmol expects stdin
-    ret = subprocess.run(" ".join(cmd), shell=True)
-    if ret.returncode != 0 or not out_pdb.exists():
-        sys.exit("[3c] Packmol failed (see console).")
-    print(f"[3c] ✅ Wrote mixture: {out_pdb.as_posix()}")
-    print(f"[3c] Next: run 5 with --packmol-probes-pdb {out_pdb.as_posix()}")
+    # Packmol input/output
+    out_pdb = build / f"{receptor_pdb.stem}_{args.output-prefix}.pdb"
+    inp = build / f"{receptor_pdb.stem}_{args.output-prefix}.packmol.inp"
+    write_packmol_input(inp, receptor_pdb, probe_pdbs, counts, box, args.tolerance_A, out_pdb)
+
+    print(f"[3c] Running: packmol < {inp}")
+    run_packmol(inp)
+
+    # Centroids CSV for script 5
+    out_csv = build / f"{receptor_pdb.stem}_{args.output-prefix}_placements.csv"
+    probe_resnames = [PROBES[k][0] for k in fr.keys()]
+    parse_probe_centroids(out_pdb, probe_resnames, out_csv)
+
+    print("[3c] Done.")
+    print(f"  • mixture pdb : {out_pdb}")
+    print(f"  • placements  : {out_csv}")
+    print(f"  • input file  : {inp}")
 
 if __name__ == "__main__":
     main()
