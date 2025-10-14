@@ -232,8 +232,10 @@ def main():
     probe_pdbs = write_probe_templates(tmp)
 
     # Packmol input/output
-    out_pdb = build / f"{receptor_pdb.stem}_{args.output-prefix}.pdb"
-    inp = build / f"{receptor_pdb.stem}_{args.output-prefix}.packmol.inp"
+    tag = args.output_prefix  # argparse converts --output-prefix -> output_prefix
+    root = f"{receptor_pdb.stem}_{tag}"
+    out_pdb = build / f"{root}.pdb"
+    inp = build / f"{root}.packmol.inp"
     write_packmol_input(inp, receptor_pdb, probe_pdbs, counts, box, args.tolerance_A, out_pdb)
 
     print(f"[3c] Running: packmol < {inp}")
