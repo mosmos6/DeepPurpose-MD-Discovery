@@ -147,18 +147,36 @@ def write_packmol_input(outfile: Path,
     outfile.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 def run_packmol(input_file: Path):
+    """
+    Run Packmol by giving it a *seekable* stdin (the input file handle).
+    This avoids the Fortran 'Illegal seek' when stdin is a pipe.
+
+    Equivalent CLI:  packmol < input_file
+    """
     exe = shutil.which("packmol")
     if exe is None:
         raise RuntimeError("Packmol executable not found in PATH.")
-    # Run as: packmol < input.inp
-    cmd = [exe]
-    proc = subprocess.run(cmd, input=input_file.read_text().encode("utf-8"),
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    print(f"[3c] Running: {exe} < {input_file}")
+
+    # IMPORTANT: open a real file handle for stdin so Fortran REWIND works
+    with open(input_file, "rb") as fin:
+        proc = subprocess.run(
+            [exe],
+            stdin=fin,                      # <-- key change (no 'input=...')
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False
+        )
+
     if proc.returncode != 0:
+        # show Packmol's own messages to help diagnose
         sys.stderr.write(proc.stdout.decode("utf-8", errors="ignore"))
         sys.stderr.write(proc.stderr.decode("utf-8", errors="ignore"))
         raise RuntimeError("[3c] Packmol failed. See console above.")
+
     print("[3c] Packmol completed.")
+
 
 def parse_probe_centroids(packmol_pdb: Path, probe_resnames: List[str], out_csv: Path):
     # centroid per (resname, resid). PDB coords are Å.
