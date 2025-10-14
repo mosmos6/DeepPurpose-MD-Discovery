@@ -1,8 +1,7 @@
-# 5_md_simulation.py
-# Author: Iori Mochizuki
-# Updated: 2025-09-17
-# Description: Run OpenMM-based 2 ns MD simulation of ligand-receptor complex using OpenFF (RNA & no-ligand compatible)
-
+# 5_md_simulation.py (add-only, non-breaking update)
+# Author: Iori Mochizuki (base) / minor hook by ChatGPT
+# Updated: 2025-10-14
+# Description: Original 2 ns OpenMM MD with an optional --packmol-probes-pdb hook
 
 import argparse
 from openmm.app import *
@@ -14,6 +13,18 @@ from openff.units.openmm import to_openmm
 from sys import stdout
 import openmm as mm
 
+# ---- NEW: optional Packmol hook flags (universal) ----------------------------
+PROBE_DEF = {
+    # resname : (smiles)
+    "IPA":  "CC(C)O",
+    "ACN":  "CC#N",
+    "IMD":  "c1[nH]cnc1",
+    "ACEA": "CC(=O)N",
+    "PHOL": "c1ccc(cc1)O",
+    "ACOH": "CC(=O)O",
+}
+# -----------------------------------------------------------------------------
+
 parser = argparse.ArgumentParser(description="Run OpenMM MD (RNA, protein, ligand, no-ligand)")
 parser.add_argument("--rna", action="store_true", help="Enable RNA forcefield and logic")
 parser.add_argument("--no-ligand", action="store_true", help="Run without ligand (receptor only)")
@@ -21,8 +32,13 @@ parser.add_argument("--input-receptor", type=str, default="receptor_cleaned.pdb"
 parser.add_argument("--input-ligand", type=str, default="ligand.sdf", help="Input ligand SDF")
 parser.add_argument("--n-steps", type=int, default=1000000, help="Number of steps for production MD (default: 1,000,000)")
 parser.add_argument("--seed", type=int, default=13579, help="Random seed for barostat/integrator/velocities")
-args = parser.parse_args()
 
+# ---- NEW: if present, add probes (no changes if omitted) ---------------------
+parser.add_argument("--packmol-probes-pdb", type=str, default=None,
+                    help="Optional Packmol mixture PDB (from 3c). Only residues named IPA/ACN/IMD/ACEA/PHOL/ACOH will be added.")
+# ------------------------------------------------------------------------------
+
+args = parser.parse_args()
 suffix = "_no_ligand" if args.no_ligand else ""
 
 # 1. Load receptor
@@ -36,7 +52,7 @@ else:
     print("🧬 [Protein MODE] Using amber14-all forcefield")
     forcefield = ForceField("amber14-all.xml", "amber14/tip3pfb.xml")
 
-# 3. Ligand logic
+# 3. Ligand logic (unchanged)
 if not args.no_ligand:
     ligand = Molecule.from_file(args.input_ligand)
     ligand_positions = to_openmm(ligand.conformers[0])
@@ -49,6 +65,42 @@ if not args.no_ligand:
 else:
     modeller = Modeller(receptor_pdb.topology, receptor_pdb.positions)
     print("✅ No ligand: Running receptor-only MD")
+
+# ---- NEW: add Packmol probes if provided ------------------------------------
+present_probe_resnames = set()
+if args.packmol_probes_pdb is not None:
+    print(f"🧪 [Packmol] Importing probes from: {args.packmol_probes_pdb}")
+    pack_pdb = PDBFile(args.packmol_probes_pdb)
+    probe_names = set(PROBE_DEF.keys())
+    # Extract only probe residues
+    sub = Modeller(pack_pdb.topology, pack_pdb.positions)
+    # delete everything that is NOT one of the probe resnames
+    to_delete = []
+    for res in sub.topology.residues():
+        if res.name not in probe_names:
+            to_delete.extend(list(res.atoms()))
+        else:
+            present_probe_resnames.add(res.name)
+    if len(to_delete) > 0:
+        sub.delete(to_delete)
+    if sum(1 for _ in sub.topology.atoms()) == 0:
+        print("⚠️ Packmol file contains no residues named IPA/ACN/IMD/ACEA/PHOL/ACOH. Skipping.")
+    else:
+        # Register SMIRNOFF templates for molecules we might add
+        off_mols = []
+        for resname in sorted(present_probe_resnames):
+            smiles = PROBE_DEF[resname]
+            off = Molecule.from_smiles(smiles, allow_undefined_stereo=True)
+            off.generate_conformers(n_conformers=1)
+            off_mols.append(off)
+        if off_mols:
+            smirnoff_all = SMIRNOFFTemplateGenerator(molecules=off_mols)
+            forcefield.registerTemplateGenerator(smirnoff_all.generator)
+
+        # Add all probes at their positions
+        modeller.add(sub.topology, sub.positions)
+        print(f"✅ Added probes: {', '.join(sorted(present_probe_resnames))}")
+# -----------------------------------------------------------------------------
 
 modeller.addHydrogens(forcefield)
 
@@ -74,17 +126,13 @@ system = forcefield.createSystem(
     constraints=HBonds
 )
 seed = int(args.seed)
-#system.addForce(MonteCarloBarostat(1 * bar, 300 * kelvin, 25))
 
-# Barostat with a fixed seed
 barostat = MonteCarloBarostat(1 * bar, 300 * kelvin, 25)
 barostat.setRandomNumberSeed(seed)
 system.addForce(barostat)
 
-# Langevin integrator with a fixed seed
 integrator = LangevinMiddleIntegrator(300 * kelvin, 1 / picosecond, 0.002 * picoseconds)
 integrator.setRandomNumberSeed(seed)
-#platform = Platform.getPlatformByName("CUDA")
 simulation = Simulation(modeller.topology, system, integrator)
 simulation.context.setPositions(modeller.positions)
 
