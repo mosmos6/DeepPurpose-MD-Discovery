@@ -115,36 +115,54 @@ def receptor_box_auto(pdb_path: Path, pad_nm: float) -> Box:
     L = max(span, 4.0)  # at least 4 nm box
     return Box(L=L, lo=-L/2.0, hi=+L/2.0)
 
-def write_packmol_input(outfile: Path,
+def write_packmol_input(inp_path: Path,
                         receptor_pdb: Path,
-                        probe_pdbs: Dict[str, Path],
-                        counts: Dict[str, int],
-                        box: Box,
-                        tolerance_A: float,
+                        probe_pdbs: dict,
+                        counts: dict,
+                        box_nm: float,
+                        tol_A: float,
                         out_pdb: Path):
+    """
+    Emit a Packmol input file that:
+      - fixes the receptor at the box center,
+      - distributes probes uniformly inside the full box,
+      - uses correct 'structure ... end structure' blocks.
+    Units: Packmol expects Å. We convert nm -> Å where needed.
+    """
+    side_A = box_nm * 10.0               # nm -> Å
+    half_A = side_A / 2.0
+    lo = -half_A
+    hi =  half_A
+
     lines = []
-    lines.append(f"tolerance {tolerance_A:.3f}")
+    # Global header (order follows Packmol examples)
+    lines.append(f"tolerance {tol_A:.3f}")     # in Å (2.0–2.2 Å is typical)
     lines.append("filetype pdb")
+    lines.append("add_box_sides")              # put CRYST1 in the output PDB (optional, helpful)
     lines.append(f"output {out_pdb.as_posix()}")
-    lines.append("")    
-    # Fix receptor at origin (keeps the same coordinates)
-    lines.append(f"structures")
-    lines.append(f"end structures")  # (Packmol Memgen prints this header; harmless if absent)
+
+    # Receptor: one copy, fixed at the center, orientation preserved
     lines.append(f"structure {receptor_pdb.as_posix()}")
     lines.append("  number 1")
+    lines.append("  center")
     lines.append("  fixed 0. 0. 0. 0. 0. 0.")
     lines.append("end structure")
-    # Probes inside cubic box (nm→Å)
-    loA, hiA = box.lo*10.0, box.hi*10.0
+
+    # Probes: one structure-block per probe type
     for key, n in counts.items():
-        if n <= 0: 
+        if n <= 0:
             continue
-        ppath = probe_pdbs[key]
-        lines.append(f"structure {ppath.as_posix()}")
-        lines.append(f"  number {n}")
-        lines.append(f"  inside box {loA:.3f} {loA:.3f} {loA:.3f} {hiA:.3f} {hiA:.3f} {hiA:.3f}")
+        probe_pdb = probe_pdbs[key]
+        lines.append(f"structure {probe_pdb.as_posix()}")
+        lines.append(f"  number {int(n)}")
+        # Fill the entire orthorhombic box (lo..hi in Å)
+        lines.append(f"  inside box {lo:.3f} {lo:.3f} {lo:.3f} {hi:.3f} {hi:.3f} {hi:.3f}")
+        # Keep residue numbering simple for small-molecule probes (optional)
+        # lines.append("  resnumbers 0")
         lines.append("end structure")
-    outfile.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    inp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
 
 def run_packmol(input_file: Path):
     """
