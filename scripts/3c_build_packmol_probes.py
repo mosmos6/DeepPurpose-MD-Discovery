@@ -43,51 +43,81 @@ def parse_fractions(s: str):
 
 def write_probe_pdbs(out_dir: Path):
     """
-    Write one centered PDB template per probe (Å units), no OpenMM involved.
-    Expects PROBES like: {"ipa": ("IPA","CC(C)O"), ...}
-    Returns: dict key -> Path to written PDB.
+    Write one PDB template per probe (Å units), centered at its own centroid.
+    Pure OpenFF + Python; no OpenMM objects are used (avoids value_in_unit / .element errors).
+    Returns: dict {probe_key: Path-to-PDB}
     """
+    from openff.toolkit.topology import Molecule
+    from openff.units import unit as offunit
+    import numpy as _np
+
     out_dir.mkdir(parents=True, exist_ok=True)
     probe_pdb_paths = {}
 
+    # Minimal periodic table mapping for expected atoms; defaults to 'C' if unknown.
+    _Z2SYM = {
+        1: "H", 6: "C", 7: "N", 8: "O", 9: "F",
+        15: "P", 16: "S", 17: "Cl", 35: "Br", 53: "I"
+    }
+
+    def _pdb_hetatm_line(serial, name4, resname4, chain, resseq, x, y, z, occ=1.00, bfac=0.00, elem="C"):
+        # Columns (approx PDB v3.3): record(1-6) serial(7-11) name(13-16) resName(18-21) chain(22)
+        # resSeq(23-26) x(31-38) y(39-46) z(47-54) occ(55-60) temp(61-66) element(77-78)
+        return (f"HETATM{serial:5d} "
+                f"{name4:<4s}"
+                f"{resname4:>4s}"
+                f"{chain:1s}"
+                f"{resseq:4d}    "
+                f"{x:8.3f}{y:8.3f}{z:8.3f}"
+                f"{occ:6.2f}{bfac:6.2f}"
+                f"          {elem:>2s}\n")
+
     for key, (resname, smiles) in PROBES.items():
-        # Build probe, generate one conformer
+        # Build probe and a single conformer
         off = Molecule.from_smiles(smiles, allow_undefined_stereo=True)
-        off.generate_conformers(n_conformers=1)
-        off.name = resname
+        off.generate_conformers(n_conformers=1)  # RDKit backend by default
 
-        # Conformer coordinates as plain floats in Å (shape: [n_atoms, 3])
-        conf = off.conformers[0]                                # Pint Quantity
-        xyz_ang = _np.asarray(conf.m_as(offunit.angstrom), float)
+        # Coordinates in Å as plain floats; shape (n_atoms, 3)
+        coords = _np.asarray(off.conformers[0].m_as(offunit.angstrom), dtype=float)
+        # Center on centroid so PACKMOL can position without bias
+        coords -= coords.mean(axis=0, keepdims=True)
 
-        # Center on centroid (Packmol uses relative geometry; absolute placement is done later)
-        centroid = xyz_ang.mean(axis=0, keepdims=True)
-        xyz_centered = xyz_ang - centroid                       # still in Å
+        # Prepare PDB text
+        lines = []
+        serial = 1
+        resname4 = (resname[:4]).upper()  # PDB resname up to 4 chars
+        chain = "A"
+        resseq = 1
 
-        # Write a minimal PDB with HETATM records (Å). Packmol is tolerant to formatting.
-        out_pdb = out_dir / f"{resname}.pdb"
-        with open(out_pdb, "w") as fh:
-            fh.write(f"REMARK  Probe template for {resname} ({smiles})\n")
-            chain_id = "A"
-            resseq = 1
-            for i, atom in enumerate(off.atoms, start=1):
-                # Element & atom name
-                elem = atom.element.symbol if atom.element is not None else ("H" if atom.atomic_number == 1 else "C")
-                name = (elem + str(i)).ljust(4)[:4]  # 4-char atom name field
+        # Make atom names like C1, C2, O1... (4-char field)
+        elem_counts = {}
+        for i, atom in enumerate(off.atoms):
+            znum = int(getattr(atom, "atomic_number", 6) or 6)
+            elem = _Z2SYM.get(znum, "C")
+            elem_counts[elem] = elem_counts.get(elem, 0) + 1
+            name = f"{elem}{elem_counts[elem]}"
+            x, y, z = coords[i]
+            lines.append(_pdb_hetatm_line(
+                serial=serial,
+                name4=name[:4],
+                resname4=resname4,
+                chain=chain,
+                resseq=resseq,
+                x=x, y=y, z=z,
+                elem=elem
+            ))
+            serial += 1
 
-                x, y, z = xyz_centered[i - 1]
-                # Columns: HETATM, serial, name, resname, chain, resseq, x, y, z, occ, bfac, element
-                line = (
-                    f"HETATM{i:5d} {name:4s}{resname:>3s} {chain_id}"
-                    f"{resseq:4d}    {x:8.3f}{y:8.3f}{z:8.3f}"
-                    f"{1.00:6.2f}{0.00:6.2f}          {elem:>2s}\n"
-                )
-                fh.write(line)
-            fh.write("END\n")
+        lines.append("TER\nEND\n")
+
+        out_pdb = out_dir / f"{resname4}.pdb"
+        with open(out_pdb, "w") as f:
+            f.writelines(lines)
 
         probe_pdb_paths[key] = out_pdb
 
     return probe_pdb_paths
+
 
 
 def build_packmol_input(
