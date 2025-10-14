@@ -7,9 +7,9 @@ import argparse, os, shutil, subprocess, sys
 from pathlib import Path
 
 from openff.toolkit.topology import Molecule, Topology as OFFTopology
-from openmm.app import PDBFile, Modeller
-from openmm import Vec3
-from openmm.unit import angstrom, nanometer
+import numpy as _np
+from openff.units import unit as offunit
+
 
 PROBES = {
     # key      resname  smiles
@@ -42,32 +42,53 @@ def parse_fractions(s: str):
     return kv
 
 def write_probe_pdbs(out_dir: Path):
-    """Write one PDB template per probe with proper residue name."""
+    """
+    Write one centered PDB template per probe (Å units), no OpenMM involved.
+    Expects PROBES like: {"ipa": ("IPA","CC(C)O"), ...}
+    Returns: dict key -> Path to written PDB.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     probe_pdb_paths = {}
+
     for key, (resname, smiles) in PROBES.items():
+        # Build probe, generate one conformer
         off = Molecule.from_smiles(smiles, allow_undefined_stereo=True)
         off.generate_conformers(n_conformers=1)
         off.name = resname
-        top = OFFTopology.from_molecules([off]).to_openmm()
-        # Center on own centroid (Å -> nm inside write)
-        conf = off.conformers[0]  # quantity (Å)
-        # Convert Å to nm and center
-        coords_nm = []
-        cx = sum([v.x for v in conf.value_in_unit(angstrom)]) / len(conf)
-        cy = sum([v.y for v in conf.value_in_unit(angstrom)]) / len(conf)
-        cz = sum([v.z for v in conf.value_in_unit(angstrom)]) / len(conf)
-        for v in conf.value_in_unit(angstrom):
-            coords_nm.append(Vec3((v.x - cx)*0.1, (v.y - cy)*0.1, (v.z - cz)*0.1))  # nm
-        mod = Modeller(top, coords_nm)
-        # rename the single residue to resname
-        for res in mod.topology.residues():
-            res.name = resname
+
+        # Conformer coordinates as plain floats in Å (shape: [n_atoms, 3])
+        conf = off.conformers[0]                                # Pint Quantity
+        xyz_ang = _np.asarray(conf.m_as(offunit.angstrom), float)
+
+        # Center on centroid (Packmol uses relative geometry; absolute placement is done later)
+        centroid = xyz_ang.mean(axis=0, keepdims=True)
+        xyz_centered = xyz_ang - centroid                       # still in Å
+
+        # Write a minimal PDB with HETATM records (Å). Packmol is tolerant to formatting.
         out_pdb = out_dir / f"{resname}.pdb"
-        with open(out_pdb, "w") as f:
-            PDBFile.writeFile(mod.topology, mod.positions, f, keepIds=True)
+        with open(out_pdb, "w") as fh:
+            fh.write(f"REMARK  Probe template for {resname} ({smiles})\n")
+            chain_id = "A"
+            resseq = 1
+            for i, atom in enumerate(off.atoms, start=1):
+                # Element & atom name
+                elem = atom.element.symbol if atom.element is not None else ("H" if atom.atomic_number == 1 else "C")
+                name = (elem + str(i)).ljust(4)[:4]  # 4-char atom name field
+
+                x, y, z = xyz_centered[i - 1]
+                # Columns: HETATM, serial, name, resname, chain, resseq, x, y, z, occ, bfac, element
+                line = (
+                    f"HETATM{i:5d} {name:4s}{resname:>3s} {chain_id}"
+                    f"{resseq:4d}    {x:8.3f}{y:8.3f}{z:8.3f}"
+                    f"{1.00:6.2f}{0.00:6.2f}          {elem:>2s}\n"
+                )
+                fh.write(line)
+            fh.write("END\n")
+
         probe_pdb_paths[key] = out_pdb
+
     return probe_pdb_paths
+
 
 def build_packmol_input(
     receptor_pdb: Path,
