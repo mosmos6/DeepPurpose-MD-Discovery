@@ -49,41 +49,6 @@ class Box:
     lo: float # nm
     hi: float # nm
 
-def auto_box_from_receptor(receptor_pdb: Path, padding_nm: float) -> Box:
-    """
-    Infer a cubic box that encloses the receptor with margin = padding_nm (nm).
-    PDB coords are in Å; we convert to nm internally.
-    Returns: Box(side_nm=<float>)
-    """
-    coords_A = []
-    with open(receptor_pdb, "r") as fh:
-        for line in fh:
-            if line.startswith(("ATOM", "HETATM")) and len(line) >= 54:
-                # PDB columns: x[30:38], y[38:46], z[46:54] in Å
-                try:
-                    x = float(line[30:38])
-                    y = float(line[38:46])
-                    z = float(line[46:54])
-                    coords_A.append((x, y, z))
-                except ValueError:
-                    continue
-
-    if not coords_A:
-        raise ValueError("No ATOM/HETATM coordinates found in receptor PDB.")
-
-    import numpy as _np
-    xyz_nm = _np.asarray(coords_A, dtype=_np.float64) * 0.1  # Å → nm
-    mins = xyz_nm.min(axis=0)
-    maxs = xyz_nm.max(axis=0)
-    span_nm = float((maxs - mins).max())
-    side_nm = span_nm + 2.0 * float(padding_nm)
-
-    # nice printout (unchanged from your logs)
-    half = 0.5 * side_nm
-    print(f"[3c] Box: {side_nm:.2f} nm (lo={-half:.2f}, hi={half:.2f})")
-
-    return Box(side_nm=side_nm)
-
 def parse_kv_fracs(s: str) -> Dict[str, float]:
     fr = {}
     for tok in s.split(","):
@@ -149,6 +114,41 @@ def write_probe_templates(out_dir: Path) -> Dict[str, Path]:
         path.write_text(pdb_block, encoding="utf-8")
         out[key] = path
     return out
+
+def auto_box_from_receptor(receptor_pdb: Path, padding_nm: float) -> Box:
+    """
+    Infer a cubic box that encloses the receptor with margin = padding_nm (nm).
+    PDB coords are in Å; we convert to nm internally.
+    Returns: Box(side_nm=<float>)
+    """
+    coords_A = []
+    with open(receptor_pdb, "r") as fh:
+        for line in fh:
+            if line.startswith(("ATOM", "HETATM")) and len(line) >= 54:
+                # PDB columns: x[30:38], y[38:46], z[46:54] in Å
+                try:
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    coords_A.append((x, y, z))
+                except ValueError:
+                    continue
+
+    if not coords_A:
+        raise ValueError("No ATOM/HETATM coordinates found in receptor PDB.")
+
+    import numpy as _np
+    xyz_nm = _np.asarray(coords_A, dtype=_np.float64) * 0.1  # Å → nm
+    mins = xyz_nm.min(axis=0)
+    maxs = xyz_nm.max(axis=0)
+    span_nm = float((maxs - mins).max())
+    side_nm = span_nm + 2.0 * float(padding_nm)
+
+    # nice printout (unchanged from your logs)
+    half = 0.5 * side_nm
+    print(f"[3c] Box: {side_nm:.2f} nm (lo={-half:.2f}, hi={half:.2f})")
+
+    return Box(side_nm=side_nm)
 
 def write_packmol_input(inp_path: Path,
                         receptor_pdb: Path,
