@@ -12,6 +12,27 @@ from dataclasses import dataclass
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
+# --- Box helper --------------------------------------------------------------
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Box:
+    """Simple cubic box (nm)."""
+    side_nm: float
+
+    @property
+    def half_nm(self) -> float:
+        return 0.5 * self.side_nm
+
+    @property
+    def lo_nm(self) -> float:
+        return -self.half_nm
+
+    @property
+    def hi_nm(self) -> float:
+        return self.half_nm
+# ---------------------------------------------------------------------------
+
 PROBES: Dict[str, Tuple[str, str]] = {
     # key: (RESNAME, SMILES)
     "ipa":   ("IPA",  "CC(C)O"),        # isopropanol
@@ -27,6 +48,41 @@ class Box:
     L: float  # nm
     lo: float # nm
     hi: float # nm
+
+def auto_box_from_receptor(receptor_pdb: Path, padding_nm: float) -> Box:
+    """
+    Infer a cubic box that encloses the receptor with margin = padding_nm (nm).
+    PDB coords are in Å; we convert to nm internally.
+    Returns: Box(side_nm=<float>)
+    """
+    coords_A = []
+    with open(receptor_pdb, "r") as fh:
+        for line in fh:
+            if line.startswith(("ATOM", "HETATM")) and len(line) >= 54:
+                # PDB columns: x[30:38], y[38:46], z[46:54] in Å
+                try:
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    coords_A.append((x, y, z))
+                except ValueError:
+                    continue
+
+    if not coords_A:
+        raise ValueError("No ATOM/HETATM coordinates found in receptor PDB.")
+
+    import numpy as _np
+    xyz_nm = _np.asarray(coords_A, dtype=_np.float64) * 0.1  # Å → nm
+    mins = xyz_nm.min(axis=0)
+    maxs = xyz_nm.max(axis=0)
+    span_nm = float((maxs - mins).max())
+    side_nm = span_nm + 2.0 * float(padding_nm)
+
+    # nice printout (unchanged from your logs)
+    half = 0.5 * side_nm
+    print(f"[3c] Box: {side_nm:.2f} nm (lo={-half:.2f}, hi={half:.2f})")
+
+    return Box(side_nm=side_nm)
 
 def parse_kv_fracs(s: str) -> Dict[str, float]:
     fr = {}
@@ -94,34 +150,13 @@ def write_probe_templates(out_dir: Path) -> Dict[str, Path]:
         out[key] = path
     return out
 
-def receptor_box_auto(pdb_path: Path, pad_nm: float) -> Box:
-    """Compute receptor bounding box from ATOM/HETATM and add padding (nm)."""
-    xs, ys, zs = [], [], []
-    with open(pdb_path, "r") as f:
-        for line in f:
-            if not (line.startswith("ATOM") or line.startswith("HETATM")):
-                continue
-            try:
-                x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])  # Å
-            except ValueError:
-                continue
-            xs.append(x*0.1); ys.append(y*0.1); zs.append(z*0.1)  # nm
-    if not xs:
-        raise RuntimeError("No atom coordinates found in receptor PDB.")
-    xmin, xmax = min(xs), max(xs)
-    ymin, ymax = min(ys), max(ys)
-    zmin, zmax = min(zs), max(zs)
-    span = max(xmax-xmin, ymax-ymin, zmax-zmin) + 2.0*pad_nm
-    L = max(span, 4.0)  # at least 4 nm box
-    return Box(L=L, lo=-L/2.0, hi=+L/2.0)
-
 def write_packmol_input(inp_path: Path,
                         receptor_pdb: Path,
                         probe_pdbs: dict,
                         counts: dict,
-                        box_side_nm: float,   # <— now a plain float in nm
+                        box_side_nm: float,   # <— numeric (nm)
                         tol_A: float,
-                        out_pdb: Path) -> None:
+                        out_pdb: Path):
     """
     Emit a Packmol input file that:
       - fixes the receptor at the box center,
@@ -130,25 +165,25 @@ def write_packmol_input(inp_path: Path,
 
     Units: Packmol expects Å. We convert nm -> Å where needed.
     """
-    side_A = float(box_side_nm) * 10.0    # nm -> Å
-    half_A = side_A * 0.5
+    side_A = float(box_side_nm) * 10.0      # nm -> Å
+    half_A = 0.5 * side_A
     lo, hi = -half_A, half_A
 
     lines = []
     # Global header
     lines.append(f"tolerance {float(tol_A):.3f}")  # Å
     lines.append("filetype pdb")
-    lines.append("add_box_sides")                  # remove if your Packmol build doesn't recognize it
+    lines.append("add_box_sides")
     lines.append(f"output {out_pdb.as_posix()}")
 
-    # Receptor fixed at the box center
+    # Receptor fixed at center
     lines.append(f"structure {receptor_pdb.as_posix()}")
     lines.append("  number 1")
     lines.append("  center")
     lines.append("  fixed 0. 0. 0. 0. 0. 0.")
     lines.append("end structure")
 
-    # Probes across the full orthorhombic box
+    # Probes across full orthorhombic box
     for key, n in counts.items():
         n_int = int(n)
         if n_int <= 0:
@@ -160,9 +195,6 @@ def write_packmol_input(inp_path: Path,
         lines.append("end structure")
 
     inp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-
 
 def run_packmol(input_file: Path):
     """
@@ -256,30 +288,32 @@ def main():
         kmax = max(counts, key=lambda k: fr[k])
         counts[kmax] += diff
 
-    # Box
+    # Determine box
     if args.box_mode == "auto":
-        box = receptor_box_auto(receptor_pdb, pad_nm=args.padding_nm)
+        box = auto_box_from_receptor(receptor_pdb, args.padding_nm)
     else:
-        L = float(args.box_size_nm)
-        box = Box(L=L, lo=-L/2.0, hi=+L/2.0)
+        # manual: side length in nm expected from --box-size-nm
+        box = Box(side_nm=float(args.box_size_nm))
     print(f"[3c] Box: {box.L:.2f} nm (lo={box.lo:.2f}, hi={box.hi:.2f})")
 
     # Templates
     probe_pdbs = write_probe_templates(tmp)
 
     # Packmol input/output
-    tag = args.output_prefix  # argparse converts --output-prefix -> output_prefix
+    tag = args.output_prefix
     root = f"{receptor_pdb.stem}_{tag}"
     out_pdb = build / f"{root}.pdb"
-    inp = build / f"{root}.packmol.inp"
+    inp     = build / f"{root}.packmol.inp"
+    # NOTE: pass a numeric side length (nm) here
     write_packmol_input(
-    inp,
-    receptor_pdb,
-    probe_pdbs,
-    counts,
-    float(box.side_nm),           # <— pass a numeric side length (nm)
-    args.tolerance_A,
-    out_pdb)
+        inp,
+        receptor_pdb,
+        probe_pdbs,
+        counts,
+        box.side_nm,          # <<< this is now guaranteed to exist
+        args.tolerance_A,
+        out_pdb
+    )
 
     print(f"[3c] Running: packmol < {inp}")
     run_packmol(inp)
