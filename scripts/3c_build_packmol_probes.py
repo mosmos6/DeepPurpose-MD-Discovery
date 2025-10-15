@@ -119,7 +119,7 @@ def write_packmol_input(inp_path: Path,
                         receptor_pdb: Path,
                         probe_pdbs: dict,
                         counts: dict,
-                        box_nm: float,
+                        box,                # float in nm OR Box dataclass with .side_nm
                         tol_A: float,
                         out_pdb: Path):
     """
@@ -127,38 +127,44 @@ def write_packmol_input(inp_path: Path,
       - fixes the receptor at the box center,
       - distributes probes uniformly inside the full box,
       - uses correct 'structure ... end structure' blocks.
+
     Units: Packmol expects Å. We convert nm -> Å where needed.
     """
-    side_A = box_nm * 10.0               # nm -> Å
+
+    # Accept either Box dataclass or a numeric (nm)
+    try:
+        side_nm = float(getattr(box, "side_nm", box))
+    except Exception:
+        # Very defensive: if box is a numpy scalar etc.
+        side_nm = float(box)
+
+    side_A = side_nm * 10.0    # nm -> Å
     half_A = side_A / 2.0
-    lo = -half_A
-    hi =  half_A
+    lo, hi = -half_A, half_A
 
     lines = []
-    # Global header (order follows Packmol examples)
-    lines.append(f"tolerance {tol_A:.3f}")     # in Å (2.0–2.2 Å is typical)
+    # Global header
+    lines.append(f"tolerance {float(tol_A):.3f}")  # Å
     lines.append("filetype pdb")
-    lines.append("add_box_sides")              # put CRYST1 in the output PDB (optional, helpful)
+    lines.append("add_box_sides")
     lines.append(f"output {out_pdb.as_posix()}")
 
-    # Receptor: one copy, fixed at the center, orientation preserved
+    # Receptor fixed at the box center
     lines.append(f"structure {receptor_pdb.as_posix()}")
     lines.append("  number 1")
     lines.append("  center")
     lines.append("  fixed 0. 0. 0. 0. 0. 0.")
     lines.append("end structure")
 
-    # Probes: one structure-block per probe type
+    # Probes across the full orthorhombic box
     for key, n in counts.items():
-        if n <= 0:
+        n_int = int(n)
+        if n_int <= 0:
             continue
-        probe_pdb = probe_pdbs[key]
-        lines.append(f"structure {probe_pdb.as_posix()}")
-        lines.append(f"  number {int(n)}")
-        # Fill the entire orthorhombic box (lo..hi in Å)
+        probe_path = probe_pdbs[key]
+        lines.append(f"structure {probe_path.as_posix()}")
+        lines.append(f"  number {n_int}")
         lines.append(f"  inside box {lo:.3f} {lo:.3f} {lo:.3f} {hi:.3f} {hi:.3f} {hi:.3f}")
-        # Keep residue numbering simple for small-molecule probes (optional)
-        # lines.append("  resnumbers 0")
         lines.append("end structure")
 
     inp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
