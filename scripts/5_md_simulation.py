@@ -222,10 +222,6 @@ parser.add_argument("--seed", type=int, default=13579, help="Random seed for bar
 
 # MixMD-from-Packmol options
 
-parser.add_argument("--mixmd-packmol-pdb", type=str, default=None,
-                    help="Path to Packmol mixture PDB (default: build/<stem>_mixmd.pdb).")
-parser.add_argument("--mixmd-placements-csv", type=str, default=None,
-                    help="Path to placements CSV (default: build/<stem>_mixmd_placements.csv).")
 parser.add_argument("--mixmd-box-size-nm", type=float, default=7.0,
                     help="MD cubic box edge length; probes outside this cube are dropped (default 7.0 nm).")
 parser.add_argument("--mixmd-resnames", type=str, default="IPA,ACN,IMD,ACEA,PHOL,ACOH",
