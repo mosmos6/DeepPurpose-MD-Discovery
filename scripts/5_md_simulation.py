@@ -47,10 +47,40 @@ if args.mixmd_from_packmol:
 suffix = "_no_ligand" if args.no_ligand else ""
 
 # ---- Helpers ----------------------------------------------------------------
-def _default_packmol_paths(receptor_pdb: Path):
-    stem = receptor_pdb.stem
-    prefix = Path("build") / f"{stem}_mixmd"
-    return prefix.with_suffix(".pdb"), prefix.with_suffix("_placements.csv")
+def _default_packmol_paths(receptor_path: Path, tag: str = "mixmd"):
+    """
+    Given receptor_cleaned.pdb -> defaults to:
+      build/receptor_cleaned_mixmd.pdb
+      build/receptor_cleaned_mixmd_placements.csv
+    """
+    build = Path("build")
+    prefix = build / f"{Path(receptor_path).stem}_{tag}"
+
+    packmol_pdb = prefix.with_suffix(".pdb")                     # OK: real suffix
+    placements_csv = prefix.with_name(prefix.name + "_placements.csv")  # tail via with_name
+    return packmol_pdb, placements_csv
+
+# Resolve defaults if flags are not set
+if args.mixmd_packmol_pdb is None or args.mixmd_placements_csv is None:
+    packmol_pdb, packmol_csv = _default_packmol_paths(receptor_path)
+else:
+    packmol_pdb = Path(args.mixmd_packmol_pdb)
+    packmol_csv = Path(args.mixmd_placements_csv)
+
+# Helpful diagnostics
+print(f"ℹ️  MixMD inputs: PDB={packmol_pdb} | CSV={packmol_csv}")
+
+if not packmol_pdb.exists() or not packmol_csv.exists():
+    raise FileNotFoundError(
+        "Packmol outputs not found.\n"
+        f"  Expected PDB: {packmol_pdb}\n"
+        f"  Expected CSV: {packmol_csv}\n"
+        "Tip: 3c writes into the ./build/ folder by default. Run 3c in the SAME project "
+        "directory as 5, or pass explicit paths with:\n"
+        "  --mixmd-packmol-pdb build/<stem>_mixmd.pdb "
+        "--mixmd-placements-csv build/<stem>_mixmd_placements.csv"
+    )
+
 
 def _parse_cryst1_box_nm(pdb_path: Path):
     """Return cubic box length (nm) from CRYST1 if present; else None."""
