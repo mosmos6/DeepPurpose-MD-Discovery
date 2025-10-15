@@ -1,190 +1,197 @@
 # 5_md_simulation.py
-# Author: Iori Mochizuki (pipeline owner) + collaborator patch
+# Author: Iori Mochizuki
 # Updated: 2025-10-15
-# Description: OpenMM MD (protein/RNA ± ligand). Optional MixMD-from-Packmol mode.
-# - Defaults unchanged from your original script.
-# - --mixmd-from-packmol reads build/<receptor_stem>_mixmd.{pdb,csv} from 3c and places probes.
+# Description: OpenMM 2 ns MD (protein/RNA/ligand) with optional MixMD-from-Packmol import.
+# - Keeps original behavior and file names.
+# - When --mixmd-from-packmol is supplied:
+#     * implies --no-ligand
+#     * reads build/<receptor_stem>_mixmd.pdb and ..._mixmd_placements.csv (or user-provided paths)
+#     * filters probe placements to a user-sized MD box (default 7.0 nm)
+#     * parametrizes probes via OpenFF/SMIRNOFF and adds them before solvation.
 
-import argparse, os, sys, csv
+import argparse, csv
 from pathlib import Path
+from sys import stdout
 
+import numpy as _np
+import openmm as mm
 from openmm.app import *
 from openmm import MonteCarloBarostat, LangevinMiddleIntegrator
 from openmm.unit import *
-import openmm as mm
-
 from openmmforcefields.generators import SMIRNOFFTemplateGenerator
+
 from openff.toolkit.topology import Molecule, Topology as OFFTopology
 from openff.units.openmm import to_openmm
 
-# ---- CLI --------------------------------------------------------------------
-parser = argparse.ArgumentParser(description="Run OpenMM MD (RNA, protein, ligand, no-ligand)")
+# ---------------------------
+# Probe library (resname -> SMILES)
+# ---------------------------
+PROBE_MAP = {
+    "IPA":  "CC(C)O",          # isopropanol
+    "ACN":  "CC#N",            # acetonitrile
+    "IMD":  "c1[nH]cnc1",      # imidazole (neutral)
+    "ACEA": "CC(=O)N",         # acetamide
+    "PHOL": "c1ccc(cc1)O",     # phenol
+    "ACOH": "CC(=O)O",         # acetic acid (optional)
+}
 
-# original flags (unchanged)
+# ---------------------------
+# Helpers
+# ---------------------------
+def _default_packmol_paths(receptor_path: Path):
+    """Return default Packmol output paths for a given receptor path."""
+    stem = receptor_path.stem
+    build = Path("build")
+    return build / f"{stem}_mixmd.pdb", build / f"{stem}_mixmd_placements.csv"
+
+def _read_centroids_csv(csv_path: Path):
+    """Read placements CSV written by 3c; returns list of dicts."""
+    rows = []
+    with open(csv_path, newline="") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            rows.append({
+                "resname": row["resname"].strip().upper(),
+                "resid":   int(row["resid"]),
+                "x_nm":    float(row["x_nm"]),
+                "y_nm":    float(row["y_nm"]),
+                "z_nm":    float(row["z_nm"]),
+            })
+    return rows
+
+def _make_off_molecules(resnames):
+    """Build OFF Molecule objects (with 1 conformer) for the requested probe resnames."""
+    off = {}
+    for res in resnames:
+        if res not in PROBE_MAP:
+            raise ValueError(f"Unknown probe resname '{res}'. Allowed: {list(PROBE_MAP.keys())}")
+        m = Molecule.from_smiles(PROBE_MAP[res], allow_undefined_stereo=True)
+        m.generate_conformers(n_conformers=1)
+        # keep a readable name; residue name in topology may still appear as MOL/UNL, which is fine
+        m.name = res
+        off[res] = m
+    return off
+
+def _positions_for_centroid(off_mol: Molecule, centroid_nm):
+    """
+    Create OpenMM positions for 'off_mol' centered at 'centroid_nm' (x,y,z in nm).
+    Returns a unit.Quantity(list(Vec3), nanometer).
+    """
+    # OFF conformer coordinates come with units (Å) via to_openmm
+    conf_angs = to_openmm(off_mol.conformers[0])  # Quantity(list(Vec3), angstrom)
+    # Convert to plain float array in Å
+    arr_A = _np.asarray([[v.x, v.y, v.z] for v in conf_angs.value_in_unit(angstrom)], dtype=float)
+    # Center molecule at its own centroid
+    arr_A -= arr_A.mean(axis=0, keepdims=True)
+    # Convert Å -> nm
+    arr_nm = arr_A * 0.1
+    # Translate to centroid
+    tx, ty, tz = centroid_nm
+    arr_nm[:, 0] += tx
+    arr_nm[:, 1] += ty
+    arr_nm[:, 2] += tz
+    # Wrap back to Vec3 and attach units
+    vecs = [mm.Vec3(float(x), float(y), float(z)) for x, y, z in arr_nm]
+    return Quantity(vecs, nanometer)
+
+def _add_probes_from_packmol(modeller: Modeller,
+                             forcefield: ForceField,
+                             receptor_path: Path,
+                             packmol_pdb: Path|None,
+                             placements_csv: Path|None,
+                             box_size_nm: float,
+                             resname_list: list[str]):
+    """
+    Import Packmol probes but only keep those inside the target MD box (centered at 0, cube of edge box_size_nm).
+    Adds SMIRNOFF parameters for all used probes to 'forcefield' and adds molecules to 'modeller'.
+    """
+    # Resolve defaults
+    if packmol_pdb is None or placements_csv is None:
+        default_pdb, default_csv = _default_packmol_paths(receptor_path)
+        packmol_pdb = packmol_pdb or default_pdb
+        placements_csv = placements_csv or default_csv
+
+    if not Path(placements_csv).exists():
+        raise FileNotFoundError(f"Placements CSV not found: {placements_csv}")
+    if not Path(packmol_pdb).exists():
+        raise FileNotFoundError(f"Packmol mixture PDB not found: {packmol_pdb}")
+
+    # Read centroids
+    rows = _read_centroids_csv(placements_csv)
+
+    # Filter by resname and by MD box
+    half = 0.5 * float(box_size_nm)
+    wanted = set(r.upper() for r in resname_list)
+    kept = [r for r in rows
+            if (r["resname"] in wanted
+                and (-half <= r["x_nm"] <= half)
+                and (-half <= r["y_nm"] <= half)
+                and (-half <= r["z_nm"] <= half))]
+
+    if len(kept) == 0:
+        print("⚠️  No probes fall inside the requested MD box; continuing without probes.")
+        return 0
+
+    # OFF molecules and SMIRNOFF registration
+    unique_res = sorted(set(r["resname"] for r in kept))
+    off_mols = _make_off_molecules(unique_res)
+    smirnoff = SMIRNOFFTemplateGenerator(molecules=list(off_mols.values()))
+    forcefield.registerTemplateGenerator(smirnoff.generator)
+
+    # Add each instance
+    added = 0
+    for r in kept:
+        res = r["resname"]
+        off = off_mols[res]
+        top = OFFTopology.from_molecules([off]).to_openmm()
+        pos = _positions_for_centroid(off, (r["x_nm"], r["y_nm"], r["z_nm"]))
+        modeller.add(top, pos)
+        added += 1
+
+    print(f"✅ Imported {added} probe instances from Packmol (kept inside ±{half:.2f} nm).")
+    return added
+
+# ---------------------------
+# CLI
+# ---------------------------
+parser = argparse.ArgumentParser(description="Run OpenMM MD (RNA, protein, ligand, no-ligand, MixMD-from-Packmol).")
 parser.add_argument("--rna", action="store_true", help="Enable RNA forcefield and logic")
 parser.add_argument("--no-ligand", action="store_true", help="Run without ligand (receptor only)")
 parser.add_argument("--input-receptor", type=str, default="receptor_cleaned.pdb", help="Input receptor PDB")
 parser.add_argument("--input-ligand", type=str, default="ligand.sdf", help="Input ligand SDF")
-parser.add_argument("--n-steps", type=int, default=1000000, help="Production steps (default: 1,000,000 ≈ 2 ns)")
+parser.add_argument("--n-steps", type=int, default=1000000, help="Number of steps for production MD (default: 1,000,000)")
 parser.add_argument("--seed", type=int, default=13579, help="Random seed for barostat/integrator/velocities")
 
-# new: Packmol/MixMD mode
+# MixMD-from-Packmol options
 parser.add_argument("--mixmd-from-packmol", action="store_true",
-                    help="Add Packmol probes before solvation (implies --no-ligand by default).")
-parser.add_argument("--packmol-prefix", type=str, default=None,
-                    help="Prefix to Packmol outputs (default: build/<receptor_stem>_mixmd)")
-parser.add_argument("--probe-smiles", type=str, default="ipa=CC(C)O,acn=CC#N,imd=c1[nH]cnc1,aceam=CC(=O)N,phol=c1ccc(cc1)O,acoh=CC(=O)O",
-                    help="Comma list key=SMILES for probes (keys must match resnames in 3c: IPA,ACN,IMD,ACEA,PHOL,ACOH).")
+                    help="Import cosolvent probes from Packmol (3c output). Implies --no-ligand.")
+parser.add_argument("--mixmd-packmol-pdb", type=str, default=None,
+                    help="Path to Packmol mixture PDB (default: build/<stem>_mixmd.pdb).")
+parser.add_argument("--mixmd-placements-csv", type=str, default=None,
+                    help="Path to placements CSV (default: build/<stem>_mixmd_placements.csv).")
+parser.add_argument("--mixmd-box-size-nm", type=float, default=7.0,
+                    help="MD cubic box edge length; probes outside this cube are dropped (default 7.0 nm).")
+parser.add_argument("--mixmd-resnames", type=str, default="IPA,ACN,IMD,ACEA,PHOL,ACOH",
+                    help="Comma-separated probe residue names to import (default: all).")
 
 args = parser.parse_args()
+receptor_path = Path(args.input_receptor)
 
-# In MixMD mode, we run apo unless the user explicitly wants a ligand
+# MixMD implies apo
 if args.mixmd_from_packmol:
-    if not args.no_ligand:
-        print("ℹ️  --mixmd-from-packmol requested → running APO (imply --no-ligand).")
-        args.no_ligand = True
+    print("ℹ️  --mixmd-from-packmol requested → running APO (implies --no-ligand).")
+    args.no_ligand = True
 
 suffix = "_no_ligand" if args.no_ligand else ""
 
-# ---- Helpers ----------------------------------------------------------------
-def _default_packmol_paths(receptor_path: Path, tag: str = "mixmd"):
-    """
-    Given receptor_cleaned.pdb -> defaults to:
-      build/receptor_cleaned_mixmd.pdb
-      build/receptor_cleaned_mixmd_placements.csv
-    """
-    build = Path("build")
-    prefix = build / f"{Path(receptor_path).stem}_{tag}"
+# ---------------------------
+# Load receptor
+# ---------------------------
+receptor_pdb = PDBFile(args.input_receptor)
 
-    packmol_pdb = prefix.with_suffix(".pdb")                     # OK: real suffix
-    placements_csv = prefix.with_name(prefix.name + "_placements.csv")  # tail via with_name
-    return packmol_pdb, placements_csv
-
-# Resolve defaults if flags are not set
-if args.mixmd_packmol_pdb is None or args.mixmd_placements_csv is None:
-    packmol_pdb, packmol_csv = _default_packmol_paths(receptor_path)
-else:
-    packmol_pdb = Path(args.mixmd_packmol_pdb)
-    packmol_csv = Path(args.mixmd_placements_csv)
-
-# Helpful diagnostics
-print(f"ℹ️  MixMD inputs: PDB={packmol_pdb} | CSV={packmol_csv}")
-
-if not packmol_pdb.exists() or not packmol_csv.exists():
-    raise FileNotFoundError(
-        "Packmol outputs not found.\n"
-        f"  Expected PDB: {packmol_pdb}\n"
-        f"  Expected CSV: {packmol_csv}\n"
-        "Tip: 3c writes into the ./build/ folder by default. Run 3c in the SAME project "
-        "directory as 5, or pass explicit paths with:\n"
-        "  --mixmd-packmol-pdb build/<stem>_mixmd.pdb "
-        "--mixmd-placements-csv build/<stem>_mixmd_placements.csv"
-    )
-
-
-def _parse_cryst1_box_nm(pdb_path: Path):
-    """Return cubic box length (nm) from CRYST1 if present; else None."""
-    try:
-        with open(pdb_path, "r") as fh:
-            for line in fh:
-                if line.startswith("CRYST1") and len(line) >= 54:
-                    # CRYST1 a b c alpha beta gamma
-                    aA = float(line[6:15]); bA = float(line[15:24]); cA = float(line[24:33])
-                    # Use the max edge to ensure everything fits; convert Å→nm
-                    L_nm = max(aA, bA, cA) * 0.1
-                    return L_nm
-    except Exception:
-        pass
-    return None
-
-def _load_packmol_centroids(csv_path: Path):
-    """Read centroids CSV produced by 3c (resname,resid,x_nm,y_nm,z_nm)."""
-    centroids = []  # list of dicts
-    with open(csv_path, "r", newline="") as fp:
-        rdr = csv.DictReader(fp)
-        for row in rdr:
-            centroids.append({
-                "resname": row["resname"].strip().upper(),
-                "resid": int(row["resid"]),
-                "x": float(row["x_nm"]),
-                "y": float(row["y_nm"]),
-                "z": float(row["z_nm"]),
-            })
-    if not centroids:
-        raise RuntimeError(f"No centroids parsed from {csv_path}")
-    return centroids
-
-def _parse_probe_smiles_map(s: str):
-    """
-    'ipa=CC(C)O,acn=CC#N,...' → dict:
-      {'IPA': 'CC(C)O', 'ACN': 'CC#N', ... }
-    Resnames we use in 3c: IPA, ACN, IMD, ACEA, PHOL, ACOH
-    """
-    m = {}
-    for tok in s.split(","):
-        if not tok.strip():
-            continue
-        k, smi = tok.split("=", 1)
-        k = k.strip().lower()
-        smi = smi.strip()
-        # map key -> resname used by 3c
-        key_to_res = {
-            "ipa": "IPA", "acn": "ACN", "imd": "IMD",
-            "aceam": "ACEA", "phol": "PHOL", "acoh": "ACOH"
-        }
-        if k not in key_to_res:
-            raise ValueError(f"Unknown probe key '{k}' in --probe-smiles")
-        m[key_to_res[k]] = smi
-    return m
-
-def _build_probe_prototypes(resname_to_smiles: dict):
-    """
-    For each resname used in Packmol, create an OpenFF Molecule with 1 conformer,
-    centered at origin. Return dict resname -> dict(off, top, centered_nm).
-    """
-    out = {}
-    for resname, smi in resname_to_smiles.items():
-        off = Molecule.from_smiles(smi, allow_undefined_stereo=True)
-        off.generate_conformers(n_conformers=1)
-        off.name = resname
-        top = OFFTopology.from_molecules([off]).to_openmm()
-        # center conformer to its centroid (Å→nm)
-        conf = off.conformers[0]  # Quantities in Å
-        coordsA = conf.value_in_unit(angstrom)  # ndarray (n,3)
-        cx, cy, cz = coordsA.mean(axis=0)
-        centered_nm = (coordsA - [cx, cy, cz]) * 0.1  # nm
-        out[resname] = {"off": off, "top": top, "centered_nm": centered_nm}
-    return out
-
-def _add_packmol_probes_to_modeller(modeller: Modeller,
-                                    prototypes: dict,
-                                    centroids: list):
-    """
-    Add one instance per centroid: translate prototype coords to centroid (nm),
-    convert to Vec3 (nm), then modeller.add().
-    """
-    # Build once: SMIRNOFFTemplateGenerator will parametrize any residues
-    # matching these molecules at createSystem().
-    # (Registration is done in the main body, before createSystem.)
-    # Here we only add positions/topologies.
-    added = 0
-    for c in centroids:
-        resname = c["resname"]
-        if resname not in prototypes:
-            # skip centroids whose resname was not requested in --probe-smiles
-            continue
-        proto = prototypes[resname]
-        base = proto["centered_nm"]  # (n,3) nm
-        tx, ty, tz = float(c["x"]), float(c["y"]), float(c["z"])
-        placed = [mm.Vec3(float(x + tx), float(y + ty), float(z + tz)) for x, y, z in base]
-        modeller.add(proto["top"], placed * nanometer)
-        added += 1
-    print(f"✅ Added {added} Packmol probe instances to modeller.")
-
-# ---- Load receptor & forcefield ---------------------------------------------
-receptor_path = Path(args.input_receptor)
-receptor_pdb = PDBFile(receptor_path.as_posix())
-
+# ---------------------------
+# Force fields
+# ---------------------------
 if args.rna:
     print("🧬 [RNA MODE] Using amber14/RNA.OL3 + TIP3P-FB")
     forcefield = ForceField("amber14/RNA.OL3.xml", "amber14/tip3pfb.xml")
@@ -192,101 +199,68 @@ else:
     print("🧬 [Protein MODE] Using amber14-all + TIP3P-FB")
     forcefield = ForceField("amber14-all.xml", "amber14/tip3pfb.xml")
 
-# ---- Optional ligand (unchanged behavior) -----------------------------------
+# We may add SMIRNOFF later if probes (or a ligand) are present.
 unique_off_mols = []
+
+# ---------------------------
+# Build modeller (ligand or apo)
+# ---------------------------
 if not args.no_ligand:
     ligand = Molecule.from_file(args.input_ligand)
-    unique_off_mols.append(ligand)
-
-# ---- Optional Packmol probes (new) ------------------------------------------
-packmol_pdb = None
-packmol_csv = None
-box_from_packmol_nm = None
-prototypes = None
-
-if args.mixmd_from_packmol:
-    # Resolve default Packmol outputs for this receptor
-    if args.packmol_prefix is None:
-        packmol_pdb, packmol_csv = _default_packmol_paths(receptor_path)
-    else:
-        pfx = Path(args.packmol_prefix)
-        packmol_pdb = pfx.with_suffix(".pdb")
-        # placements CSV name follows our 3c script convention
-        if pfx.suffix:
-            # if user passed already ending with .pdb or .inp, derive stem
-            stem = pfx.with_suffix("").name
-            packmol_csv = pfx.with_suffix("").with_name(stem + "_placements.csv")
-        else:
-            packmol_csv = pfx.with_name(pfx.name + "_placements.csv")
-
-    if not packmol_pdb.exists():
-        raise FileNotFoundError(f"Packmol PDB not found: {packmol_pdb}")
-    if not packmol_csv.exists():
-        raise FileNotFoundError(f"Packmol placements CSV not found: {packmol_csv}")
-
-    # parse box
-    box_from_packmol_nm = _parse_cryst1_box_nm(packmol_pdb)
-    if box_from_packmol_nm is None:
-        print("⚠️  No CRYST1 found in Packmol PDB; will fall back to 7.0 nm box.")
-
-    # which probes to parameterize
-    res_to_smi = _parse_probe_smiles_map(args.probe_smiles)
-    prototypes = _build_probe_prototypes(res_to_smi)
-    unique_off_mols.extend([p["off"] for p in prototypes.values()])
-
-# Register a single SMIRNOFF generator that knows about all nonstandard molecules
-if unique_off_mols:
-    smirnoff = SMIRNOFFTemplateGenerator(molecules=unique_off_mols)
-    forcefield.registerTemplateGenerator(smirnoff.generator)
-
-# ---- Build modeller ----------------------------------------------------------
-if not args.no_ligand:
-    # Holo: add receptor + ligand as in your original script
     ligand_positions = to_openmm(ligand.conformers[0])
     ligand_top = OFFTopology.from_molecules([ligand]).to_openmm()
+    smirnoff = SMIRNOFFTemplateGenerator(molecules=[ligand])
+    forcefield.registerTemplateGenerator(smirnoff.generator)
     modeller = Modeller(receptor_pdb.topology, receptor_pdb.positions)
     modeller.add(ligand_top, ligand_positions)
     print("✅ Ligand merged")
 else:
     modeller = Modeller(receptor_pdb.topology, receptor_pdb.positions)
-    print("✅ Apo: receptor only (so far)")
+    print("✅ No ligand: Running receptor-only (apo) setup")
 
-# NEW: add Packmol probes before solvation
+# If Packmol probes are requested, add them now (before solvation)
 if args.mixmd_from_packmol:
-    centroids = _load_packmol_centroids(packmol_csv)
-    _add_packmol_probes_to_modeller(modeller, prototypes, centroids)
+    resnames = [s.strip().upper() for s in args.mixmd_resnames.split(",") if s.strip()]
+    added = _add_probes_from_packmol(
+        modeller=modeller,
+        forcefield=forcefield,
+        receptor_path=receptor_path,
+        packmol_pdb=Path(args.mixmd_packmol_pdb) if args.mixmd_packmol_pdb else None,
+        placements_csv=Path(args.mixmd_placements_csv) if args.mixmd_placements_csv else None,
+        box_size_nm=float(args.mixmd_box_size_nm),
+        resname_list=resnames
+    )
+    print(f"🧪 MixMD: added {added} probe instances.")
 
-# Hydrogens (proteins/RNA; probes already have explicit H from OpenFF)
+# Hydrogens after all non‑water molecules are present
 modeller.addHydrogens(forcefield)
 
-# Write pre-solvation combined structure (same filename convention)
 with open(f"combined_receptor_ligand{suffix}.pdb", "w") as f:
     PDBFile.writeFile(modeller.topology, modeller.positions, f)
 print(f"✅ System ready for solvation ({'apo' if args.no_ligand else 'holo'})")
 
-# Solvate (box from Packmol if available; else 7.0 nm as before)
-if box_from_packmol_nm is not None:
-    L = float(box_from_packmol_nm)
-    box_vec = (L, L, L) * nanometer
-else:
-    box_vec = (7.0, 7.0, 7.0) * nanometer
-
+# ---------------------------
+# Solvate in the requested MD box (default 7.0 nm)
+# ---------------------------
+box_edge = float(args.mixmd_box_size_nm if args.mixmd_from_packmol else 7.0)
 modeller.addSolvent(
     forcefield,
     model="tip3p",
-    boxSize=box_vec,
+    boxSize=(box_edge, box_edge, box_edge) * nanometer,
     ionicStrength=0.15 * molar,
     neutralize=True
 )
 with open(f"solvated_receptor_ligand{suffix}.pdb", "w") as f:
     PDBFile.writeFile(modeller.topology, modeller.positions, f)
-print("✅ Solvated system ready.")
+print(f"✅ Solvated system ready. Box = {box_edge:.2f} nm")
 
-# ---- System & Simulation (unchanged) ----------------------------------------
+# ---------------------------
+# Create System
+# ---------------------------
 system = forcefield.createSystem(
     modeller.topology,
     nonbondedMethod=PME,
-    nonbondedCutoff=1 * nanometer,
+    nonbondedCutoff=1.0 * nanometer,
     constraints=HBonds
 )
 
@@ -301,6 +275,9 @@ integrator.setRandomNumberSeed(seed)
 simulation = Simulation(modeller.topology, system, integrator)
 simulation.context.setPositions(modeller.positions)
 
+# ---------------------------
+# Run
+# ---------------------------
 print("🔹 Energy Minimization...")
 simulation.minimizeEnergy()
 simulation.reporters.append(PDBReporter(f"minimized{suffix}.pdb", 100))
@@ -308,7 +285,7 @@ simulation.reporters.append(PDBReporter(f"minimized{suffix}.pdb", 100))
 print("🔹 NVT Equilibration (1 ps)...")
 simulation.context.setVelocitiesToTemperature(300 * kelvin, seed)
 simulation.reporters.append(PDBReporter(f"nvt_equilibrated{suffix}.pdb", 100))
-simulation.reporters.append(StateDataReporter(sys.stdout, 100, step=True, potentialEnergy=True, temperature=True))
+simulation.reporters.append(StateDataReporter(stdout, 100, step=True, potentialEnergy=True, temperature=True))
 simulation.step(500)  # 1 ps
 
 print("🔹 NPT Equilibration (5 ps)...")
