@@ -119,9 +119,9 @@ def write_packmol_input(inp_path: Path,
                         receptor_pdb: Path,
                         probe_pdbs: dict,
                         counts: dict,
-                        box,                # float in nm OR Box-like with .side_nm
+                        box_side_nm: float,   # <— now a plain float in nm
                         tol_A: float,
-                        out_pdb: Path):
+                        out_pdb: Path) -> None:
     """
     Emit a Packmol input file that:
       - fixes the receptor at the box center,
@@ -130,21 +130,7 @@ def write_packmol_input(inp_path: Path,
 
     Units: Packmol expects Å. We convert nm -> Å where needed.
     """
-
-    # --- robust extraction of box side length in nm ---
-    if isinstance(box, (int, float)):
-        side_nm = float(box)
-    elif hasattr(box, "side_nm"):
-        side_nm = float(getattr(box, "side_nm"))
-    elif isinstance(box, dict) and "side_nm" in box:
-        side_nm = float(box["side_nm"])
-    else:
-        raise TypeError(
-            f"write_packmol_input: 'box' must be a float (nm) or an object/dict with .side_nm; got {type(box)}"
-        )
-    # ---------------------------------------------------
-
-    side_A = side_nm * 10.0    # nm -> Å
+    side_A = float(box_side_nm) * 10.0    # nm -> Å
     half_A = side_A * 0.5
     lo, hi = -half_A, half_A
 
@@ -152,7 +138,7 @@ def write_packmol_input(inp_path: Path,
     # Global header
     lines.append(f"tolerance {float(tol_A):.3f}")  # Å
     lines.append("filetype pdb")
-    lines.append("add_box_sides")
+    lines.append("add_box_sides")                  # remove if your Packmol build doesn't recognize it
     lines.append(f"output {out_pdb.as_posix()}")
 
     # Receptor fixed at the box center
@@ -174,6 +160,7 @@ def write_packmol_input(inp_path: Path,
         lines.append("end structure")
 
     inp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
 
 
 
@@ -285,7 +272,14 @@ def main():
     root = f"{receptor_pdb.stem}_{tag}"
     out_pdb = build / f"{root}.pdb"
     inp = build / f"{root}.packmol.inp"
-    write_packmol_input(inp, receptor_pdb, probe_pdbs, counts, box, args.tolerance_A, out_pdb)
+    write_packmol_input(
+    inp,
+    receptor_pdb,
+    probe_pdbs,
+    counts,
+    float(box.side_nm),           # <— pass a numeric side length (nm)
+    args.tolerance_A,
+    out_pdb)
 
     print(f"[3c] Running: packmol < {inp}")
     run_packmol(inp)
