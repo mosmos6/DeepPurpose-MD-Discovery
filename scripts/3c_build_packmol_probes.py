@@ -23,9 +23,9 @@ PROBES: Dict[str, Tuple[str, str]] = {
     "ipa":   ("IPA",  "CC(C)O"),        # isopropanol
     "acn":   ("ACN",  "CC#N"),          # acetonitrile
     "imd":   ("IMD",  "c1[nH]cnc1"),    # imidazole (neutral, N1 protonated)
-    "aceam": ("ACEA", "CC(=O)N"),       # acetamide
-    "phol":  ("PHOL", "c1ccc(cc1)O"),   # phenol
-    "acoh":  ("ACOH", "CC(=O)O"),       # acetic acid
+    "aceam": ("ACM", "CC(=O)N"),       # acetamide
+    "phol":  ("PHO", "c1ccc(cc1)O"),   # phenol
+    "acoh":  ("HAC", "CC(=O)O"),       # acetic acid
 }
 
 # ---- Single box type (nm) ----------------------------------------------------
@@ -72,53 +72,82 @@ def parse_kv_fracs(s: str) -> Dict[str, float]:
 
 def rdkit_centered_pdb(mol: Chem.Mol, resname: str) -> str:
     """
-    Build a tiny PDB block for one small molecule, centered at its centroid,
-    with residue name = resname. Coordinates: Å.
+    Return a PDB block with atoms centered at the centroid and a PDB-safe 3-char residue name.
+    Columns follow PDB fixed-width conventions so Packmol's Fortran parser can read coords.
     """
+    # Ensure 3D conformer
     mol = Chem.AddHs(mol)
     if mol.GetNumConformers() == 0:
         AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
         AllChem.UFFOptimizeMolecule(mol, maxIters=200)
-
     conf = mol.GetConformer()
     n = mol.GetNumAtoms()
+
+    # centroid (Å)
+    xs = ys = zs = 0.0
     coords = []
-    cx = cy = cz = 0.0
     for i in range(n):
-        pos = conf.GetAtomPosition(i)  # RDKit Point3D (Å)
-        x, y, z = float(pos.x), float(pos.y), float(pos.z)
-        coords.append((x, y, z))
-        cx += x; cy += y; cz += z
-    cx /= n; cy /= n; cz /= n
+        p = conf.GetAtomPosition(i)
+        coords.append((p.x, p.y, p.z))
+        xs += p.x; ys += p.y; zs += p.z
+    cx = xs / n; cy = ys / n; cz = zs / n
+
+    # PDB-safe fields
+    res3 = (resname.upper()[:3])  # hard truncate to 3 chars
+    chain = "Z"
+    resid = 1
 
     lines = []
-    serial = 1
-    for i, (x, y, z) in enumerate(coords):
-        atom = mol.GetAtomWithIdx(i)
-        elem = atom.GetSymbol().rjust(2)
-        name = (elem + "  ").ljust(4)[:4]
+    for idx, (x, y, z) in enumerate(coords, start=1):
         x0 = x - cx; y0 = y - cy; z0 = z - cz
-        # HETATM serial, atom name, resname, chain/resid, x y z, occ, b, element
-        lines.append(f"HETATM{serial:5d} {name} {resname:>3s} Z{1:4d}    "
-                     f"{x0:8.3f}{y0:8.3f}{z0:8.3f}  1.00  0.00          {elem:>2s}")
-        serial += 1
+        atom = mol.GetAtomWithIdx(idx - 1)
+        elem = atom.GetSymbol().strip().upper()
+        # atom name (cols 13–16). Simple, element-based 4-char left-justified.
+        atname = (elem + "   ")[:4]
+
+        # Build fixed-width HETATM line (PDB v3 style)
+        #  1-6  "HETATM"
+        #  7-11 serial (5)
+        # 12    space
+        # 13-16 atom name (4)
+        # 17    altLoc (blank)
+        # 18-20 resName (3)
+        # 21    space
+        # 22    chainID (1)
+        # 23-26 resSeq (4)
+        # 27    iCode (blank)
+        # 31-38 x (8.3)
+        # 39-46 y (8.3)
+        # 47-54 z (8.3)
+        # 55-60 occupancy (6.2)
+        # 61-66 tempFactor (6.2)
+        # 77-78 element (2)
+        line = (
+            f"HETATM{idx:5d} {atname:<4s} {res3:>3s} {chain:s}{resid:4d}    "
+            f"{x0:8.3f}{y0:8.3f}{z0:8.3f}"
+            f"{1.00:6.2f}{0.00:6.2f}          {elem:>2s}"
+        )
+        lines.append(line)
+
     lines.append("TER")
     lines.append("END")
     return "\n".join(lines) + "\n"
 
+
 def write_probe_templates(out_dir: Path) -> Dict[str, Path]:
-    """Create one centered PDB per probe in out_dir and return key->path."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    out: Dict[str, Path] = {}
+    out = {}
     for key, (resname, smi) in PROBES.items():
         mol = Chem.MolFromSmiles(smi)
         if mol is None:
             raise RuntimeError(f"SMILES parse failed for {key}: {smi}")
-        pdb_block = rdkit_centered_pdb(mol, resname)
-        p = out_dir / f"{resname}.pdb"
-        p.write_text(pdb_block, encoding="utf-8")
-        out[key] = p
+        res3 = resname.upper()[:3]
+        pdb_block = rdkit_centered_pdb(mol, res3)
+        path = out_dir / f"{res3}.pdb"
+        path.write_text(pdb_block, encoding="utf-8")
+        out[key] = path
     return out
+
 
 def auto_box_from_receptor(receptor_pdb: Path, padding_nm: float) -> CubicBox:
     """
