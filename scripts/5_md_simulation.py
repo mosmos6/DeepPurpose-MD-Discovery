@@ -221,8 +221,7 @@ parser.add_argument("--n-steps", type=int, default=1000000, help="Number of step
 parser.add_argument("--seed", type=int, default=13579, help="Random seed for barostat/integrator/velocities")
 
 # MixMD-from-Packmol options
-parser.add_argument("--mixmd-from-packmol", action="store_true",
-                    help="Import cosolvent probes from Packmol (3c output). Implies --no-ligand.")
+
 parser.add_argument("--mixmd-packmol-pdb", type=str, default=None,
                     help="Path to Packmol mixture PDB (default: build/<stem>_mixmd.pdb).")
 parser.add_argument("--mixmd-placements-csv", type=str, default=None,
