@@ -13,7 +13,7 @@ import argparse, csv
 from pathlib import Path
 from sys import stdout
 
-import numpy as _np
+#import numpy as _np
 import openmm as mm
 from openmm.app import *
 from openmm import MonteCarloBarostat, LangevinMiddleIntegrator
