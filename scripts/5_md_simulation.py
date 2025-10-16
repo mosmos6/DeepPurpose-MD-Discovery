@@ -30,26 +30,41 @@ class ProbeHotspotReporter:
     """
     Write probe residue centroids (nm) every 'reportInterval' steps to CSV.
     Columns: step,resname,resid,x_nm,y_nm,z_nm
+
+    Auto-detects probe residues present in the provided topology by intersecting
+    residue names with PROBE_NAME_SET (accepts 3-letter canonical and 4-letter aliases).
     """
-    def __init__(self, file_path, reportInterval, topology, probe_resnames):
+    def __init__(self, file_path, reportInterval, topology, probe_resnames=None):
         self.file = open(file_path, "w")
         self.reportInterval = int(reportInterval)
-        self.topology = topology
-        self.probe_res = {r.upper().strip() for r in probe_resnames}
-        # build index groups once
+
+        # Build the set of names to track: auto-discover ∩ optional user list
+        present = { (res.name or "").upper().strip() for res in topology.residues() }
+        auto_names = present & PROBE_NAME_SET
+
+        if probe_resnames:
+            user_names = { s.upper().strip() for s in probe_resnames }
+            self.probe_res = auto_names | (user_names & PROBE_NAME_SET)
+        else:
+            self.probe_res = auto_names
+
+        # Build index groups once
         groups = []
-        resid_map = []  # (resname, resid) in PDB-style numbering
+        resid_map = []  # (resname, resid)
         for res in topology.residues():
             rn = (res.name or "").upper().strip()
             if rn in self.probe_res:
                 idxs = [a.index for a in res.atoms()]
                 if idxs:
                     groups.append(idxs)
-                    # res.id is a string or None; keep it readable
-                    resid_map.append((rn, int(res.id) if getattr(res, "id", None) else 0))
+                    # PDB-like residue id if available; otherwise 0
+                    resid_map.append((rn, int(res.id) if res.id is not None else 0))
+
         self.groups = groups
         self.resid_map = resid_map
-        # header
+
+        # header + quick diagnostic in the CSV (as a comment)
+        self.file.write("# tracking_resnames=" + ";".join(sorted(self.probe_res)) + "\n")
         self.file.write("step,resname,resid,x_nm,y_nm,z_nm\n")
         self.file.flush()
 
@@ -58,13 +73,16 @@ class ProbeHotspotReporter:
         return (self.reportInterval, True, False, False, False, True)
 
     def report(self, simulation, state):
-        pos = state.getPositions(asNumpy=False)  # list of Vec3 (nm)
+        pos = state.getPositions(asNumpy=False)  # Vec3 with nm units
+        # obtain current step (cheap extra query)
         step = simulation.context.getState(getStep=True).getStepCount()
+
+        # If no groups (name mismatch), nothing to write—file still has header.
         for (idxs, (resname, resid)) in zip(self.groups, self.resid_map):
             sx = sy = sz = 0.0
             n = 0
             for i in idxs:
-                v = pos[i]
+                v = pos[i]  # Vec3 (nm)
                 sx += float(v.x); sy += float(v.y); sz += float(v.z)
                 n += 1
             if n > 0:
@@ -72,22 +90,27 @@ class ProbeHotspotReporter:
         self.file.flush()
 
     def __del__(self):
-        try:
-            self.file.close()
-        except Exception:
-            pass
+        try: self.file.close()
+        except Exception: pass
 
-# ---------------------------
-# MixMD libraries/helpers
-# ---------------------------
+
+# --- MixMD-from-Packmol helpers (pure OpenMM, no NumPy) -----------------------
+# Canonical 3-letter names used by 3c/Packmol, plus 4-letter aliases so 5 accepts both.
 PROBE_LIBRARY = {
-    "IPA":  "CC(C)O",          # isopropanol
-    "ACN":  "CC#N",            # acetonitrile
-    "IMD":  "c1[nH]cnc1",      # imidazole (neutral N1-H)
-    "ACEA": "CC(=O)N",         # acetamide
-    "PHOL": "c1ccc(cc1)O",     # phenol
-    "ACOH": "CC(=O)O",         # acetic acid
+    # canonical 3-letter → SMILES
+    "IPA":  "CC(C)O",           # isopropanol
+    "ACN":  "CC#N",             # acetonitrile
+    "IMD":  "c1[nH]cnc1",       # imidazole (neutral, N1–H)
+    "ACM":  "CC(=O)N",          # acetamide
+    "PHO":  "c1ccc(cc1)O",      # phenol
+    "HAC":  "CC(=O)O",          # acetic acid
+    # aliases (legacy 4-letter spellings that may appear in older runs/docs)
+    "ACEA": "CC(=O)N",          # acetamide (alias of ACM)
+    "PHOL": "c1ccc(cc1)O",      # phenol   (alias of PHO)
+    "ACOH": "CC(=O)O",          # acetic acid (alias of HAC)
 }
+PROBE_NAME_SET = set(PROBE_LIBRARY.keys())
+
 
 def _default_packmol_paths(receptor_path: Path):
     root = f"{receptor_path.stem}_mixmd"
@@ -377,17 +400,25 @@ simulation.context.setPositions(modeller.positions)
 
 # --- Hotspot reporter (only if MixMD) ---
 if args.mixmd_from_packmol:
-    # use the same set you imported; they are now properly renamed in the topology
+    # Let the reporter auto-discover present probe residue names; still pass user list as hints.
     probe_resnames = [s.strip().upper() for s in args.mixmd_resnames.split(",") if s.strip()]
     hotspot_csv = args.hotspot_csv or f"mixmd_hotspots{suffix}.csv"
-    simulation.reporters.append(
-        ProbeHotspotReporter(
-            hotspot_csv,
-            reportInterval=int(args.hotspot_stride),
-            topology=simulation.topology,
-            probe_resnames=probe_resnames
-        )
+
+    # Create reporter
+    hrep = ProbeHotspotReporter(
+        hotspot_csv,
+        reportInterval=int(args.hotspot_stride),
+        topology=simulation.topology,
+        probe_resnames=probe_resnames
     )
+
+    # Force an initial snapshot at step 0 so the CSV is never empty
+    state0 = simulation.context.getState(getPositions=True, enforcePeriodicBox=True)
+    hrep.report(simulation, state0)
+
+    # Now add it to the reporting chain for the run
+    simulation.reporters.append(hrep)
+
 
 # ---------------------------
 # Run
