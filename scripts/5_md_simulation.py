@@ -23,6 +23,57 @@ from openmmforcefields.generators import SMIRNOFFTemplateGenerator
 from openff.toolkit.topology import Molecule, Topology as OFFTopology
 from openff.units.openmm import to_openmm
 
+class ProbeHotspotReporter:
+    """
+    Write probe residue centroids (nm) every 'reportInterval' steps to CSV.
+    Columns: step,resname,resid,x_nm,y_nm,z_nm
+    """
+    def __init__(self, file_path, reportInterval, topology, probe_resnames):
+        self.file = open(file_path, "w")
+        self.reportInterval = int(reportInterval)
+        self.topology = topology
+        self.probe_res = {r.upper().strip() for r in probe_resnames}
+        # build index groups once
+        groups = []
+        resid_map = []  # (resname, resid) in PDB-style numbering
+        for res in topology.residues():
+            rn = (res.name or "").upper().strip()
+            if rn in self.probe_res:
+                idxs = [a.index for a in res.atoms()]
+                if idxs:
+                    groups.append(idxs)
+                    resid_map.append((rn, int(res.id) if res.id is not None else 0))
+        self.groups = groups
+        self.resid_map = resid_map
+        # header
+        self.file.write("step,resname,resid,x_nm,y_nm,z_nm\n")
+        self.file.flush()
+
+    def describeNextReport(self, simulation):
+        # (steps, positions, velocities, forces, energies, enforcePeriodicBox)
+        return (self.reportInterval, True, False, False, False, True)
+
+    def report(self, simulation, state):
+        pos = state.getPositions(asNumpy=False)  # list of Vec3 with nm units
+        step = simulation.context.getState(getStep=True).getStepCount()
+        # write centroids
+        for (idxs, (resname, resid)) in zip(self.groups, self.resid_map):
+            sx = sy = sz = 0.0
+            n = 0
+            for i in idxs:
+                v = pos[i]  # Vec3 (in nm)
+                sx += float(v.x); sy += float(v.y); sz += float(v.z)
+                n += 1
+            if n > 0:
+                self.file.write(f"{step},{resname},{resid},{sx/n:.5f},{sy/n:.5f},{sz/n:.5f}\n")
+        self.file.flush()
+
+    def __del__(self):
+        try:
+            self.file.close()
+        except Exception:
+            pass
+
 # --- MixMD-from-Packmol helpers (pure OpenMM, no NumPy) -----------------------
 
 PROBE_LIBRARY = {
@@ -211,6 +262,10 @@ parser.add_argument("--mixmd-placements-csv", type=str, default=None,
     help="Override path to placements CSV written by 3c (default: build/<receptor>_mixmd_placements.csv).")
 parser.add_argument("--mixmd-edge-margin-nm", type=float, default=0.15,
     help="Safety margin from box edge when filtering centroids (default 0.15 nm).")
+parser.add_argument("--hotspot-csv", type=str, default=None,
+    help="If set and --mixmd-from-packmol, write probe centroids every --hotspot-stride to this CSV (default: mixmd_hotspots_no_ligand.csv).")
+parser.add_argument("--hotspot-stride", type=int, default=1000,
+    help="Stride (steps) for hotspot centroid logging.")
 
 
 args = parser.parse_args()
@@ -309,6 +364,21 @@ integrator.setRandomNumberSeed(seed)
 
 simulation = Simulation(modeller.topology, system, integrator)
 simulation.context.setPositions(modeller.positions)
+
+# --- Hotspot reporter (only if MixMD) ---
+if args.mixmd_from_packmol:
+    # which probe resnames were actually used? use keys from PROBE_LIBRARY
+    probe_resnames = [s.strip().upper() for s in args.mixmd_resnames.split(",") if s.strip()]
+    hotspot_csv = args.hotspot_csv or f"mixmd_hotspots{suffix}.csv"
+    simulation.reporters.append(
+        ProbeHotspotReporter(
+            hotspot_csv,
+            reportInterval=int(args.hotspot_stride),
+            topology=simulation.topology,
+            probe_resnames=probe_resnames
+        )
+    )
+
 
 # ---------------------------
 # Run
