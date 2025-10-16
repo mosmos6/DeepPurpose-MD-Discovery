@@ -1,19 +1,19 @@
 # 5_md_simulation.py
 # Author: Iori Mochizuki
-# Updated: 2025-10-15
+# Updated: 2025-10-16
 # Description: OpenMM 2 ns MD (protein/RNA/ligand) with optional MixMD-from-Packmol import.
-# - Keeps original behavior and file names.
 # - When --mixmd-from-packmol is supplied:
 #     * implies --no-ligand
-#     * reads build/<receptor_stem>_mixmd.pdb and ..._mixmd_placements.csv (or user-provided paths)
-#     * filters probe placements to a user-sized MD box (default 7.0 nm)
-#     * parametrizes probes via OpenFF/SMIRNOFF and adds them before solvation.
+#     * reads build/<receptor_stem>_mixmd_placements.csv (or user-provided path)
+#     * filters probe placements to a user-sized MD box (default 7.0–8.0 nm)
+#     * parametrizes probes via OpenFF/SMIRNOFF and adds them before solvation
+#     * RENAMES added residues to probe resnames (IPA/ACN/IMD/ACEA/PHOL/ACOH)
+#     * logs probe centroids during MD to a CSV (hotspot reporter)
 
 import argparse, csv
 from pathlib import Path
 from sys import stdout
 
-#import numpy as _np
 import openmm as mm
 from openmm.app import *
 from openmm import MonteCarloBarostat, LangevinMiddleIntegrator
@@ -23,6 +23,9 @@ from openmmforcefields.generators import SMIRNOFFTemplateGenerator
 from openff.toolkit.topology import Molecule, Topology as OFFTopology
 from openff.units.openmm import to_openmm
 
+# ---------------------------
+# Hotspot reporter
+# ---------------------------
 class ProbeHotspotReporter:
     """
     Write probe residue centroids (nm) every 'reportInterval' steps to CSV.
@@ -42,7 +45,8 @@ class ProbeHotspotReporter:
                 idxs = [a.index for a in res.atoms()]
                 if idxs:
                     groups.append(idxs)
-                    resid_map.append((rn, int(res.id) if res.id is not None else 0))
+                    # res.id is a string or None; keep it readable
+                    resid_map.append((rn, int(res.id) if getattr(res, "id", None) else 0))
         self.groups = groups
         self.resid_map = resid_map
         # header
@@ -54,14 +58,13 @@ class ProbeHotspotReporter:
         return (self.reportInterval, True, False, False, False, True)
 
     def report(self, simulation, state):
-        pos = state.getPositions(asNumpy=False)  # list of Vec3 with nm units
+        pos = state.getPositions(asNumpy=False)  # list of Vec3 (nm)
         step = simulation.context.getState(getStep=True).getStepCount()
-        # write centroids
         for (idxs, (resname, resid)) in zip(self.groups, self.resid_map):
             sx = sy = sz = 0.0
             n = 0
             for i in idxs:
-                v = pos[i]  # Vec3 (in nm)
+                v = pos[i]
                 sx += float(v.x); sy += float(v.y); sz += float(v.z)
                 n += 1
             if n > 0:
@@ -74,8 +77,9 @@ class ProbeHotspotReporter:
         except Exception:
             pass
 
-# --- MixMD-from-Packmol helpers (pure OpenMM, no NumPy) -----------------------
-
+# ---------------------------
+# MixMD libraries/helpers
+# ---------------------------
 PROBE_LIBRARY = {
     "IPA":  "CC(C)O",          # isopropanol
     "ACN":  "CC#N",            # acetonitrile
@@ -87,28 +91,23 @@ PROBE_LIBRARY = {
 
 def _default_packmol_paths(receptor_path: Path):
     root = f"{receptor_path.stem}_mixmd"
-    packmol_pdb = Path("build") / f"{root}.pdb"
     placements  = Path("build") / f"{root}_placements.csv"
-    return packmol_pdb, placements
+    return placements
 
 def _openff_conf_to_angstrom_list(off_mol):
     """
     Return a list of (x,y,z) floats in Å from an OpenFF Molecule conformer.
-    Pure Python loops; no NumPy. Works with Pint-backed OpenFF units.
+    Pure Python loops; works with Pint-backed units.
     """
-    conf = off_mol.conformers[0]  # OpenFF Quantity with units (usually Å)
-
-    # Preferred path: ask Pint to give Å magnitudes directly
+    conf = off_mol.conformers[0]  # OpenFF quantity w/ units
+    # Preferred path: Pint → Å magnitudes
     try:
-        arr = conf.to("angstrom").m  # N×3 plain numeric (no units)
-        out = []
-        for row in arr:
-            out.append((float(row[0]), float(row[1]), float(row[2])))
+        arr = conf.to("angstrom").m  # N×3 numeric
+        out = [(float(r[0]), float(r[1]), float(r[2])) for r in arr]
         return out
     except Exception:
-        # Fallback path: convert via OpenMM’s unit system
-        from openff.units.openmm import to_openmm
-        q = to_openmm(conf)  # Quantity(list(Vec3), angstrom) in OpenMM units
+        # Fallback via OpenMM units
+        q = to_openmm(conf)  # Quantity(list(Vec3), angstrom)
         out = []
         for v in q.value_in_unit(angstrom):
             out.append((float(v[0]), float(v[1]), float(v[2])))
@@ -116,19 +115,18 @@ def _openff_conf_to_angstrom_list(off_mol):
 
 def _positions_for_centroid_nm(off_mol, centroid_nm_tuple):
     """
-    Build OpenMM positions (Quantity of list[Vec3] in nanometer) for `off_mol`
-    centered on centroid_nm_tuple (x,y,z in nm). Pure Python, no NumPy/JAX.
-    Avoids OpenMM's unit-aware sum() by using explicit accumulators.
+    Build OpenMM positions (list[Vec3]*nanometer) for `off_mol`
+    centered on centroid_nm_tuple (x,y,z in nm). Pure Python math.
     """
     coords_A = _openff_conf_to_angstrom_list(off_mol)   # list of (x,y,z) in Å
     n = len(coords_A)
     if n == 0:
         raise ValueError("OFF molecule has no coordinates.")
 
-    # centroid in Å using plain floats
+    # centroid in Å (plain floats)
     sx = sy = sz = 0.0
     for xA, yA, zA in coords_A:
-        sx += float(xA); sy += float(yA); sz += float(zA)
+        sx += xA; sy += yA; sz += zA
     cx = sx / n; cy = sy / n; cz = sz / n
 
     tx, ty, tz = (float(centroid_nm_tuple[0]),
@@ -137,14 +135,11 @@ def _positions_for_centroid_nm(off_mol, centroid_nm_tuple):
 
     placed = []
     for xA, yA, zA in coords_A:
-        # shift to own centroid (Å), convert Å→nm (×0.1), then translate to target centroid (nm)
-        xnm = (float(xA) - cx) * 0.1 + tx
-        ynm = (float(yA) - cy) * 0.1 + ty
-        znm = (float(zA) - cz) * 0.1 + tz
+        xnm = (xA - cx) * 0.1 + tx   # Å→nm + translate
+        ynm = (yA - cy) * 0.1 + ty
+        znm = (zA - cz) * 0.1 + tz
         placed.append(mm.Vec3(xnm, ynm, znm))
-
     return [p * nanometer for p in placed]
-
 
 def _read_centroids_csv(csv_path: Path):
     """Read placements CSV written by 3c; returns list of dicts."""
@@ -170,17 +165,15 @@ def _add_probes_from_packmol(modeller,
                              resname_list: list[str] | None = None) -> int:
     """
     Add probes at Packmol centroids cropped to the intended MD box.
-    - `placements_csv`: optional override; default is build/<receptor>_mixmd_placements.csv
-    - `resname_list`: optional whitelist of probe residue names (e.g., ["IPA","ACN"])
+    Critically: rename the newly added residues to the probe resname
+    so downstream reporters can find them.
     Returns: number of probes actually added.
     """
-    # Resolve default paths (we only need the CSV to place centroids)
+    # Resolve CSV path
     if placements_csv is None:
-        _, default_csv = _default_packmol_paths(receptor_path)
-        placements_csv = default_csv
+        placements_csv = _default_packmol_paths(receptor_path)
 
     print(f"ℹ️  MixMD inputs: CSV={placements_csv}")
-
     if not placements_csv.exists():
         raise FileNotFoundError(f"Placements CSV not found: {placements_csv}")
 
@@ -189,35 +182,33 @@ def _add_probes_from_packmol(modeller,
     keep_lo = - (half - float(edge_margin_nm))
     keep_hi = + (half - float(edge_margin_nm))
 
-    # Optional resname whitelist
-    whitelist = None
-    if resname_list:
-        whitelist = {r.upper().strip() for r in resname_list}
+    # Resname whitelist
+    whitelist = {r.upper().strip() for r in resname_list} if resname_list else None
 
-    # Parse rows and crop to the MD box
+    # Collect rows inside the MD cube
     rows = []
     for rec in _read_centroids_csv(placements_csv):
         resname = rec["resname"]
         if resname not in PROBE_LIBRARY:
             continue
-        if whitelist is not None and resname not in whitelist:
+        if whitelist and resname not in whitelist:
             continue
-        x = rec["x_nm"]; y = rec["y_nm"]; z = rec["z_nm"]
+        x, y, z = rec["x_nm"], rec["y_nm"], rec["z_nm"]
         if (keep_lo <= x <= keep_hi) and (keep_lo <= y <= keep_hi) and (keep_lo <= z <= keep_hi):
-            rows.append((resname, (x, y, z)))
+            rows.append((resname, rec["resid"], (x, y, z)))
 
     if not rows:
         print("⚠️  No probe centroids inside the target box; continuing with receptor-only.")
         return 0
 
     # Prepare OFF molecules and register SMIRNOFF once
-    used_res = sorted({res for (res, _) in rows})
+    used_res = sorted({res for (res, _, _) in rows})
     off_mols = []
     for res in used_res:
         smi = PROBE_LIBRARY[res]
         off = Molecule.from_smiles(smi, allow_undefined_stereo=True)
         off.generate_conformers(n_conformers=1)
-        off.name = res  # readability only
+        off.name = res
         off_mols.append(off)
     smirnoff = SMIRNOFFTemplateGenerator(molecules=off_mols)
     forcefield.registerTemplateGenerator(smirnoff.generator)
@@ -225,13 +216,34 @@ def _add_probes_from_packmol(modeller,
     top_cache = {m.name: OFFTopology.from_molecules([m]).to_openmm() for m in off_mols}
     mol_cache = {m.name: m for m in off_mols}
 
-    # Place probes
+    # Place probes and RENAME newly added residues
+    def _res_list():
+        return list(modeller.topology.residues())
+
     added = 0
-    for (resname, cen_nm) in rows:
+    for (resname, pack_resid, cen_nm) in rows:
         top = top_cache[resname]
         off = mol_cache[resname]
-        pos = _positions_for_centroid_nm(off, cen_nm)  # list of Vec3*nm
+        pos = _positions_for_centroid_nm(off, cen_nm)
+
+        # remember residues before add
+        before_res = len(_res_list())
         modeller.add(top, pos)
+        after = _res_list()
+
+        # newly added residues are the tail slice
+        new_res = after[before_res:]
+        for res in new_res:
+            try:
+                res.name = resname
+            except Exception:
+                pass
+            # keep Packmol resid if possible (purely cosmetic / useful for logs)
+            try:
+                res.id = str(pack_resid)
+            except Exception:
+                pass
+
         added += 1
 
     print(f"✅ Placed {added} probe molecules (cropped to {sim_box_nm:.1f} nm box).")
@@ -249,24 +261,20 @@ parser.add_argument("--n-steps", type=int, default=1000000, help="Number of step
 parser.add_argument("--seed", type=int, default=13579, help="Random seed for barostat/integrator/velocities")
 
 # MixMD-from-Packmol options
-
 parser.add_argument("--mixmd-box-size-nm", type=float, default=7.0,
-                    help="MD cubic box edge length; probes outside this cube are dropped (default 7.0 nm).")
+                    help="MD cubic box edge length; probes outside this cube are dropped.")
 parser.add_argument("--mixmd-resnames", type=str, default="IPA,ACN,IMD,ACEA,PHOL,ACOH",
-                    help="Comma-separated probe residue names to import (default: all).")
+                    help="Comma-separated probe residue names to import.")
 parser.add_argument("--mixmd-from-packmol", action="store_true",
-    help="Read Packmol mixture (build/<receptor>_mixmd*.{pdb,csv}) and place probes before solvation (implies --no-ligand).")
-parser.add_argument("--mixmd-packmol-pdb", type=str, default=None,
-    help="Override path to Packmol mixture PDB (default: build/<receptor>_mixmd.pdb).")
+    help="Read placements CSV (build/<receptor>_mixmd_placements.csv) and place probes before solvation (implies --no-ligand).")
 parser.add_argument("--mixmd-placements-csv", type=str, default=None,
-    help="Override path to placements CSV written by 3c (default: build/<receptor>_mixmd_placements.csv).")
+    help="Override path to placements CSV (default: build/<receptor>_mixmd_placements.csv).")
 parser.add_argument("--mixmd-edge-margin-nm", type=float, default=0.15,
-    help="Safety margin from box edge when filtering centroids (default 0.15 nm).")
+    help="Safety margin from box edge when filtering centroids.")
 parser.add_argument("--hotspot-csv", type=str, default=None,
-    help="If set and --mixmd-from-packmol, write probe centroids every --hotspot-stride to this CSV (default: mixmd_hotspots_no_ligand.csv).")
+    help="If set with --mixmd-from-packmol, write probe centroids every --hotspot-stride to this CSV (default: mixmd_hotspots_no_ligand.csv).")
 parser.add_argument("--hotspot-stride", type=int, default=1000,
     help="Stride (steps) for hotspot centroid logging.")
-
 
 args = parser.parse_args()
 receptor_path = Path(args.input_receptor)
@@ -292,9 +300,6 @@ else:
     print("🧬 [Protein MODE] Using amber14-all + TIP3P-FB")
     forcefield = ForceField("amber14-all.xml", "amber14/tip3pfb.xml")
 
-# We may add SMIRNOFF later if probes (or a ligand) are present.
-unique_off_mols = []
-
 # ---------------------------
 # Build modeller (ligand or apo)
 # ---------------------------
@@ -311,14 +316,19 @@ else:
     modeller = Modeller(receptor_pdb.topology, receptor_pdb.positions)
     print("✅ No ligand: Running receptor-only (apo) setup")
 
+# ---------------------------
 # If Packmol probes are requested, add them now (before solvation)
+# ---------------------------
 if args.mixmd_from_packmol:
+    resnames = [s.strip().upper() for s in args.mixmd_resnames.split(",") if s.strip()]
     added = _add_probes_from_packmol(
         modeller=modeller,
         forcefield=forcefield,
-        receptor_path=Path(args.input_receptor),
-        sim_box_nm=float(args.mixmd_box_size_nm),
+        receptor_path=receptor_path,
+        sim_box_nm=float(args.mixmd_box_size_n m := args.mixmd_box_size_nm),
         edge_margin_nm=float(args.mixmd_edge_margin_nm),
+        placements_csv=(Path(args.mixmd_placements_csv) if args.mixmd_placements_csv else None),
+        resname_list=resnames
     )
     print(f"🧪 MixMD: added {added} probe instances.")
 
@@ -330,7 +340,7 @@ with open(f"combined_receptor_ligand{suffix}.pdb", "w") as f:
 print(f"✅ System ready for solvation ({'apo' if args.no_ligand else 'holo'})")
 
 # ---------------------------
-# Solvate in the requested MD box (default 7.0 nm)
+# Solvate in the requested MD box
 # ---------------------------
 box_edge = float(args.mixmd_box_size_nm if args.mixmd_from_packmol else 7.0)
 modeller.addSolvent(
@@ -367,7 +377,7 @@ simulation.context.setPositions(modeller.positions)
 
 # --- Hotspot reporter (only if MixMD) ---
 if args.mixmd_from_packmol:
-    # which probe resnames were actually used? use keys from PROBE_LIBRARY
+    # use the same set you imported; they are now properly renamed in the topology
     probe_resnames = [s.strip().upper() for s in args.mixmd_resnames.split(",") if s.strip()]
     hotspot_csv = args.hotspot_csv or f"mixmd_hotspots{suffix}.csv"
     simulation.reporters.append(
@@ -378,7 +388,6 @@ if args.mixmd_from_packmol:
             probe_resnames=probe_resnames
         )
     )
-
 
 # ---------------------------
 # Run
