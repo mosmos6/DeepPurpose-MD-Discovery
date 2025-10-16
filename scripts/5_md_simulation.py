@@ -66,23 +66,34 @@ def _openff_conf_to_angstrom_list(off_mol):
 def _positions_for_centroid_nm(off_mol, centroid_nm_tuple):
     """
     Build OpenMM positions (Quantity of list[Vec3] in nanometer) for `off_mol`
-    centered on centroid_nm_tuple (x,y,z in nm). Pure Python, no NumPy.
+    centered on centroid_nm_tuple (x,y,z in nm). Pure Python, no NumPy/JAX.
+    Avoids OpenMM's unit-aware sum() by using explicit accumulators.
     """
-    coords_A = _openff_conf_to_angstrom_list(off_mol)   # [(x,y,z)_Å]
+    coords_A = _openff_conf_to_angstrom_list(off_mol)   # list of (x,y,z) in Å
     n = len(coords_A)
-    cx = sum(p[0] for p in coords_A) / n
-    cy = sum(p[1] for p in coords_A) / n
-    cz = sum(p[2] for p in coords_A) / n
+    if n == 0:
+        raise ValueError("OFF molecule has no coordinates.")
+
+    # centroid in Å using plain floats
+    sx = sy = sz = 0.0
+    for xA, yA, zA in coords_A:
+        sx += float(xA); sy += float(yA); sz += float(zA)
+    cx = sx / n; cy = sy / n; cz = sz / n
+
     tx, ty, tz = (float(centroid_nm_tuple[0]),
                   float(centroid_nm_tuple[1]),
                   float(centroid_nm_tuple[2]))
+
     placed = []
-    for (xA, yA, zA) in coords_A:
-        xnm = (xA - cx) * 0.1 + tx   # Å→nm and translate
-        ynm = (yA - cy) * 0.1 + ty
-        znm = (zA - cz) * 0.1 + tz
+    for xA, yA, zA in coords_A:
+        # shift to own centroid (Å), convert Å→nm (×0.1), then translate to target centroid (nm)
+        xnm = (float(xA) - cx) * 0.1 + tx
+        ynm = (float(yA) - cy) * 0.1 + ty
+        znm = (float(zA) - cz) * 0.1 + tz
         placed.append(mm.Vec3(xnm, ynm, znm))
+
     return [p * nanometer for p in placed]
+
 
 def _read_centroids_csv(csv_path: Path):
     """Read placements CSV written by 3c; returns list of dicts."""
