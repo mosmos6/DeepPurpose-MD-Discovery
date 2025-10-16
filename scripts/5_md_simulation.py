@@ -25,7 +25,6 @@ from openff.units.openmm import to_openmm
 
 # --- MixMD-from-Packmol helpers (pure OpenMM, no NumPy) -----------------------
 
-# Map Packmol resnames -> SMILES (for OFF topology) and back
 PROBE_LIBRARY = {
     "IPA":  "CC(C)O",          # isopropanol
     "ACN":  "CC#N",            # acetonitrile
@@ -36,28 +35,23 @@ PROBE_LIBRARY = {
 }
 
 def _default_packmol_paths(receptor_path: Path):
-    """Derive build/ paths used by 3c for convenience."""
     root = f"{receptor_path.stem}_mixmd"
     packmol_pdb = Path("build") / f"{root}.pdb"
     placements  = Path("build") / f"{root}_placements.csv"
     return packmol_pdb, placements
 
 def _openff_conf_to_angstrom_list(off_mol):
-    """
-    Return a list of (x,y,z) floats in Å from an OpenFF Molecule conformer,
-    using only Python loops (no NumPy), robust to different unit backends.
-    """
+    """Return a list of (x,y,z) floats in Å from an OpenFF Molecule conformer using plain Python loops."""
     conf = off_mol.conformers[0]
-    # Try OpenMM units first
+    # Try OpenMM-unit path first
     try:
-        arr = conf.value_in_unit(angstrom)  # N×3 array-like
+        arr = conf.value_in_unit(angstrom)  # N×3
         out = []
         for row in arr:
-            # row is a 3-length sequence of numbers
             out.append((float(row[0]), float(row[1]), float(row[2])))
         return out
     except Exception:
-        # Fallback: assume it's already a nested sequence of numbers
+        # Fallback: assume nested sequences
         out = []
         for row in conf:
             out.append((float(row[0]), float(row[1]), float(row[2])))
@@ -65,10 +59,10 @@ def _openff_conf_to_angstrom_list(off_mol):
 
 def _positions_for_centroid_nm(off_mol, centroid_nm_tuple):
     """
-    Build OpenMM positions (list[Vec3]*nanometer) for `off_mol`,
-    centered on `centroid_nm_tuple` (x,y,z in nm). No NumPy.
+    Build OpenMM positions (Quantity of list[Vec3] in nanometer) for `off_mol`
+    centered on centroid_nm_tuple (x,y,z in nm). Pure Python, no NumPy.
     """
-    coords_A = _openff_conf_to_angstrom_list(off_mol)   # list of (x,y,z) in Å
+    coords_A = _openff_conf_to_angstrom_list(off_mol)   # [(x,y,z)_Å]
     n = len(coords_A)
     cx = sum(p[0] for p in coords_A) / n
     cy = sum(p[1] for p in coords_A) / n
@@ -78,14 +72,11 @@ def _positions_for_centroid_nm(off_mol, centroid_nm_tuple):
                   float(centroid_nm_tuple[2]))
     placed = []
     for (xA, yA, zA) in coords_A:
-        # shift to own centroid, convert Å->nm, translate to target centroid
-        xnm = (xA - cx) * 0.1 + tx
+        xnm = (xA - cx) * 0.1 + tx   # Å→nm and translate
         ynm = (yA - cy) * 0.1 + ty
         znm = (zA - cz) * 0.1 + tz
         placed.append(mm.Vec3(xnm, ynm, znm))
     return [p * nanometer for p in placed]
-# -------------------------------------------------------------------------------
-
 
 def _read_centroids_csv(csv_path: Path):
     """Read placements CSV written by 3c; returns list of dicts."""
@@ -102,107 +93,76 @@ def _read_centroids_csv(csv_path: Path):
             })
     return rows
 
-def _make_off_molecules(resnames):
-    """Build OFF Molecule objects (with 1 conformer) for the requested probe resnames."""
-    off = {}
-    for res in resnames:
-        if res not in PROBE_MAP:
-            raise ValueError(f"Unknown probe resname '{res}'. Allowed: {list(PROBE_MAP.keys())}")
-        m = Molecule.from_smiles(PROBE_MAP[res], allow_undefined_stereo=True)
-        m.generate_conformers(n_conformers=1)
-        # keep a readable name; residue name in topology may still appear as MOL/UNL, which is fine
-        m.name = res
-        off[res] = m
-    return off
-
-def _positions_for_centroid(off_mol: Molecule, centroid_nm):
+def _add_probes_from_packmol(modeller,
+                             forcefield,
+                             receptor_path: Path,
+                             sim_box_nm: float,
+                             edge_margin_nm: float,
+                             placements_csv: Path | None = None,
+                             resname_list: list[str] | None = None) -> int:
     """
-    Create OpenMM positions for 'off_mol' centered at 'centroid_nm' (x,y,z in nm).
-    Returns a unit.Quantity(list(Vec3), nanometer).
+    Add probes at Packmol centroids cropped to the intended MD box.
+    - `placements_csv`: optional override; default is build/<receptor>_mixmd_placements.csv
+    - `resname_list`: optional whitelist of probe residue names (e.g., ["IPA","ACN"])
+    Returns: number of probes actually added.
     """
-    # OFF conformer coordinates come with units (Å) via to_openmm
-    conf_angs = to_openmm(off_mol.conformers[0])  # Quantity(list(Vec3), angstrom)
-    # Convert to plain float array in Å
-    arr_A = _np.asarray([[v.x, v.y, v.z] for v in conf_angs.value_in_unit(angstrom)], dtype=float)
-    # Center molecule at its own centroid
-    arr_A -= arr_A.mean(axis=0, keepdims=True)
-    # Convert Å -> nm
-    arr_nm = arr_A * 0.1
-    # Translate to centroid
-    tx, ty, tz = centroid_nm
-    arr_nm[:, 0] += tx
-    arr_nm[:, 1] += ty
-    arr_nm[:, 2] += tz
-    # Wrap back to Vec3 and attach units
-    vecs = [mm.Vec3(float(x), float(y), float(z)) for x, y, z in arr_nm]
-    return Quantity(vecs, nanometer)
+    # Resolve default paths (we only need the CSV to place centroids)
+    if placements_csv is None:
+        _, default_csv = _default_packmol_paths(receptor_path)
+        placements_csv = default_csv
 
-def _add_probes_from_packmol(modeller, forcefield, receptor_path: Path, sim_box_nm: float, edge_margin_nm: float):
-    """
-    Read build/<receptor>_mixmd_placements.csv and add probes at those centroids,
-    keeping only those inside the intended simulation box (±(L/2 - margin)).
-    Registers SMIRNOFF templates for all probe types that actually appear.
-    """
-    # Resolve default input paths if not provided via CLI
-    if args.mixmd_packmol_pdb is None or args.mixmd_placements_csv is None:
-        packmol_pdb, packmol_csv = _default_packmol_paths(receptor_path)
-    else:
-        packmol_pdb = Path(args.mixmd_packmol_pdb)
-        packmol_csv = Path(args.mixmd_placements_csv)
+    print(f"ℹ️  MixMD inputs: CSV={placements_csv}")
 
-    print(f"ℹ️  MixMD inputs: PDB={packmol_pdb} | CSV={packmol_csv}")
-
-    if not packmol_csv.exists():
-        raise FileNotFoundError(f"Placements CSV not found: {packmol_csv}")
+    if not placements_csv.exists():
+        raise FileNotFoundError(f"Placements CSV not found: {placements_csv}")
 
     # Half-box for filtering
     half = 0.5 * float(sim_box_nm)
     keep_lo = - (half - float(edge_margin_nm))
     keep_hi = + (half - float(edge_margin_nm))
 
-    # Parse CSV rows
+    # Optional resname whitelist
+    whitelist = None
+    if resname_list:
+        whitelist = {r.upper().strip() for r in resname_list}
+
+    # Parse rows and crop to the MD box
     rows = []
-    with open(packmol_csv, "r", newline="") as fp:
-        r = csv.DictReader(fp)
-        for rec in r:
-            resname = rec["resname"].strip().upper()
-            if resname not in PROBE_LIBRARY:
-                continue
-            x = float(rec["x_nm"]); y = float(rec["y_nm"]); z = float(rec["z_nm"])
-            # keep only inside the box (with margin)
-            if (keep_lo <= x <= keep_hi) and (keep_lo <= y <= keep_hi) and (keep_lo <= z <= keep_hi):
-                rows.append((resname, (x, y, z)))
+    for rec in _read_centroids_csv(placements_csv):
+        resname = rec["resname"]
+        if resname not in PROBE_LIBRARY:
+            continue
+        if whitelist is not None and resname not in whitelist:
+            continue
+        x = rec["x_nm"]; y = rec["y_nm"]; z = rec["z_nm"]
+        if (keep_lo <= x <= keep_hi) and (keep_lo <= y <= keep_hi) and (keep_lo <= z <= keep_hi):
+            rows.append((resname, (x, y, z)))
 
     if not rows:
         print("⚠️  No probe centroids inside the target box; continuing with receptor-only.")
         return 0
 
-    # Build OFF molecules for the **used** resnames and register SMIRNOFF once
+    # Prepare OFF molecules and register SMIRNOFF once
     used_res = sorted({res for (res, _) in rows})
     off_mols = []
     for res in used_res:
         smi = PROBE_LIBRARY[res]
         off = Molecule.from_smiles(smi, allow_undefined_stereo=True)
         off.generate_conformers(n_conformers=1)
-        off.name = res
+        off.name = res  # readability only
         off_mols.append(off)
     smirnoff = SMIRNOFFTemplateGenerator(molecules=off_mols)
     forcefield.registerTemplateGenerator(smirnoff.generator)
 
-    # Cache OFF topologies and conformers
-    top_cache = {}
-    for off in off_mols:
-        top_cache[off.name] = {
-            "off": off,
-            "top": OFFTopology.from_molecules([off]).to_openmm()
-        }
+    top_cache = {m.name: OFFTopology.from_molecules([m]).to_openmm() for m in off_mols}
+    mol_cache = {m.name: m for m in off_mols}
 
     # Place probes
     added = 0
     for (resname, cen_nm) in rows:
-        off = top_cache[resname]["off"]
-        top = top_cache[resname]["top"]
-        pos = _positions_for_centroid_nm(off, cen_nm)  # list of Vec3*nm, no NumPy
+        top = top_cache[resname]
+        off = mol_cache[resname]
+        pos = _positions_for_centroid_nm(off, cen_nm)  # list of Vec3*nm
         modeller.add(top, pos)
         added += 1
 
