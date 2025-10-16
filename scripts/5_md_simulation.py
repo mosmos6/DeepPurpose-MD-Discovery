@@ -246,9 +246,9 @@ if args.mixmd_from_packmol:
         modeller=modeller,
         forcefield=forcefield,
         receptor_path=receptor_path,
-        packmol_pdb=Path(args.mixmd_packmol_pdb) if args.mixmd_packmol_pdb else None,
-        placements_csv=Path(args.mixmd_placements_csv) if args.mixmd_placements_csv else None,
-        box_size_nm=float(args.mixmd_box_size_nm),
+        sim_box_nm=float(args.mixmd_box_size_nm),
+        edge_margin_nm=float(args.mixmd_edge_margin_nm),
+        placements_csv=(Path(args.mixmd_placements_csv) if args.mixmd_placements_csv else None),
         resname_list=resnames
     )
     print(f"🧪 MixMD: added {added} probe instances.")
@@ -259,21 +259,6 @@ modeller.addHydrogens(forcefield)
 with open(f"combined_receptor_ligand{suffix}.pdb", "w") as f:
     PDBFile.writeFile(modeller.topology, modeller.positions, f)
 print(f"✅ System ready for solvation ({'apo' if args.no_ligand else 'holo'})")
-
-# If requested, add Packmol probes now (before solvation)
-if getattr(args, "mixmd_from_packmol", False):
-    print("🧪 [MixMD-from-Packmol] Using placements CSV to add probes (apo).")
-    receptor_path = Path(args.input_receptor)
-    # Use the same box length you will pass to addSolvent (7.0 nm in your script)
-    SIM_BOX_NM = 7.0
-    _add_probes_from_packmol(
-        modeller,
-        forcefield,
-        receptor_path,
-        sim_box_nm=SIM_BOX_NM,
-        edge_margin_nm=float(getattr(args, "mixmd_edge_margin_nm", 0.15))
-    )
-
 
 # ---------------------------
 # Solvate in the requested MD box (default 7.0 nm)
