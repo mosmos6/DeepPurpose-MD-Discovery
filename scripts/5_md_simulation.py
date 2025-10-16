@@ -41,20 +41,26 @@ def _default_packmol_paths(receptor_path: Path):
     return packmol_pdb, placements
 
 def _openff_conf_to_angstrom_list(off_mol):
-    """Return a list of (x,y,z) floats in Å from an OpenFF Molecule conformer using plain Python loops."""
-    conf = off_mol.conformers[0]
-    # Try OpenMM-unit path first
+    """
+    Return a list of (x,y,z) floats in Å from an OpenFF Molecule conformer.
+    Pure Python loops; no NumPy. Works with Pint-backed OpenFF units.
+    """
+    conf = off_mol.conformers[0]  # OpenFF Quantity with units (usually Å)
+
+    # Preferred path: ask Pint to give Å magnitudes directly
     try:
-        arr = conf.value_in_unit(angstrom)  # N×3
+        arr = conf.to("angstrom").m  # N×3 plain numeric (no units)
         out = []
         for row in arr:
             out.append((float(row[0]), float(row[1]), float(row[2])))
         return out
     except Exception:
-        # Fallback: assume nested sequences
+        # Fallback path: convert via OpenMM’s unit system
+        from openff.units.openmm import to_openmm
+        q = to_openmm(conf)  # Quantity(list(Vec3), angstrom) in OpenMM units
         out = []
-        for row in conf:
-            out.append((float(row[0]), float(row[1]), float(row[2])))
+        for v in q.value_in_unit(angstrom):
+            out.append((float(v[0]), float(v[1]), float(v[2])))
         return out
 
 def _positions_for_centroid_nm(off_mol, centroid_nm_tuple):
@@ -241,15 +247,12 @@ else:
 
 # If Packmol probes are requested, add them now (before solvation)
 if args.mixmd_from_packmol:
-    resnames = [s.strip().upper() for s in args.mixmd_resnames.split(",") if s.strip()]
     added = _add_probes_from_packmol(
         modeller=modeller,
         forcefield=forcefield,
-        receptor_path=receptor_path,
+        receptor_path=Path(args.input_receptor),
         sim_box_nm=float(args.mixmd_box_size_nm),
         edge_margin_nm=float(args.mixmd_edge_margin_nm),
-        placements_csv=(Path(args.mixmd_placements_csv) if args.mixmd_placements_csv else None),
-        resname_list=resnames
     )
     print(f"🧪 MixMD: added {added} probe instances.")
 
