@@ -304,9 +304,9 @@ def main():
     write_vina_boxes(out_txt, clusters_by_probe, size_A=float(args.vina_size_A), top_k=args.top_k or None, min_members=args.min_members)
 
     # Small console summary
-    print(f"[6] Wrote clusters → {out_csv}")
-    print(f"[6] Centers PDB    → {out_pdb}")
-    print(f"[6] Vina boxes     → {out_txt}")
+    print(f"[5c] Wrote clusters → {out_csv}")
+    print(f"[5c] Centers PDB    → {out_pdb}")
+    print(f"[5c] Vina boxes     → {out_txt}")
 
 if __name__ == "__main__":
     main()
