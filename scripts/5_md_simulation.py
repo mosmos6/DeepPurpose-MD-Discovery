@@ -24,13 +24,12 @@ from openff.toolkit.topology import Molecule, Topology as OFFTopology
 from openff.units.openmm import to_openmm
 
 # ---------------------------
-# Hotspot reporter
+# Hotspot reporter (robust scheduling)
 # ---------------------------
 class ProbeHotspotReporter:
     """
     Write probe residue centroids (nm) every 'reportInterval' steps to CSV.
     Columns: step,resname,resid,x_nm,y_nm,z_nm
-
     Auto-detects probe residues present in the provided topology by intersecting
     residue names with PROBE_NAME_SET (accepts 3-letter canonical and 4-letter aliases).
     """
@@ -38,61 +37,64 @@ class ProbeHotspotReporter:
         self.file = open(file_path, "w")
         self.reportInterval = int(reportInterval)
 
-        # Build the set of names to track: auto-discover ∩ optional user list
-        present = { (res.name or "").upper().strip() for res in topology.residues() }
+        # build tracking set (auto-discover ∩ optional user list)
+        present = {(res.name or "").upper().strip() for res in topology.residues()}
         auto_names = present & PROBE_NAME_SET
-
         if probe_resnames:
-            user_names = { s.upper().strip() for s in probe_resnames }
+            user_names = {s.upper().strip() for s in probe_resnames}
             self.probe_res = auto_names | (user_names & PROBE_NAME_SET)
         else:
             self.probe_res = auto_names
 
-        # Build index groups once
-        groups = []
-        resid_map = []  # (resname, resid)
+        # cache atom indices per residue
+        groups, resid_map = [], []
         for res in topology.residues():
             rn = (res.name or "").upper().strip()
             if rn in self.probe_res:
                 idxs = [a.index for a in res.atoms()]
                 if idxs:
                     groups.append(idxs)
-                    # PDB-like residue id if available; otherwise 0
                     resid_map.append((rn, int(res.id) if res.id is not None else 0))
-
         self.groups = groups
         self.resid_map = resid_map
 
-        # header + quick diagnostic in the CSV (as a comment)
+        # header + diagnostic comment
         self.file.write("# tracking_resnames=" + ";".join(sorted(self.probe_res)) + "\n")
         self.file.write("step,resname,resid,x_nm,y_nm,z_nm\n")
         self.file.flush()
 
+    # --- helpers ----------------------------------------------------------
+    @staticmethod
+    def _current_step(simulation) -> int:
+        # robust step retrieval across OpenMM versions
+        try:
+            return int(simulation.currentStep)          # OpenMM ≥ 7.5
+        except Exception:
+            try:
+                t  = simulation.context.getState(getTime=True).getTime()
+                dt = simulation.integrator.getStepSize()
+                return int(round((t/dt)))               # fall back to time / stepsize
+            except Exception:
+                return -1
+
+    # OpenMM asks: how many steps until your *next* report?
     def describeNextReport(self, simulation):
-        # (steps, positions, velocities, forces, energies, enforcePeriodicBox)
-        return (self.reportInterval, True, False, False, False, True)
+        stride = self.reportInterval
+        cur = max(0, self._current_step(simulation))
+        # schedule the next multiple of 'stride' strictly *after* 'cur'
+        next_multiple = ((cur // stride) + 1) * stride
+        steps_until = max(1, next_multiple - cur)
+        # (steps, needPositions, needVelocities, needForces, needEnergy, enforcePBC)
+        return (steps_until, True, False, False, False, True)
 
     def report(self, simulation, state):
         pos = state.getPositions(asNumpy=False)  # list of Vec3 (nm)
-
-        # --- robust step retrieval across OpenMM versions ---
-        try:
-            step = int(simulation.currentStep)      # OpenMM ≥ 7.5+
-        except Exception:
-            # Fallback: derive from time/stepsize with units
-            try:
-                t  = state.getTime()                           # has units
-                dt = simulation.integrator.getStepSize()       # has units
-                step = int(round((t / dt)))
-            except Exception:
-                step = -1  # last resort; still log coordinates
-        # -----------------------------------------------------
-
+        step = self._current_step(simulation)
         for (idxs, (resname, resid)) in zip(self.groups, self.resid_map):
             sx = sy = sz = 0.0
             n = 0
             for i in idxs:
-                v = pos[i]  # Vec3 (nm units)
+                v = pos[i]
                 sx += float(v.x); sy += float(v.y); sz += float(v.z)
                 n += 1
             if n > 0:
@@ -102,7 +104,6 @@ class ProbeHotspotReporter:
     def __del__(self):
         try: self.file.close()
         except Exception: pass
-
 
 # --- MixMD-from-Packmol helpers (pure OpenMM, no NumPy) -----------------------
 # Canonical 3-letter names used by 3c/Packmol, plus 4-letter aliases so 5 accepts both.
