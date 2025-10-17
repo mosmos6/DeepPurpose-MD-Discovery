@@ -1,312 +1,306 @@
-# -*- coding: utf-8 -*-
-"""
-Greedy hotspot clustering for MixMD probe centroids (dependency‑free).
+# 5c_mixmd_hotspot_cluster.py
+# Greedy clustering of MixMD probe hotspots (dependency-free).
+# Reads centroids CSV from 5_md_simulation.py's ProbeHotspotReporter.
 
-Input  : CSV from ProbeHotspotReporter (columns: step,resname,resid,x_nm,y_nm,z_nm)
-Method : For each probe type separately:
-           1) time‑average (x,y,z) per unique probe instance (resname,resid)
-           2) greedy clustering with merge radius R (nm) on the averaged points
-           3) rank clusters by occupancy (unique instances captured)
-Outputs:
-  - build/hotspots_<stem>_r{R}nm.csv     (ranked cluster table)
-  - build/hotspots_<stem>_r{R}nm.pdb     (one pseudo‑atom per cluster center)
-  - build/hotspots_<stem>_r{R}nm.vina.txt  (optional docking box hints)
-
-Usage example:
-  python scripts/5c_mixmd_hotspot_cluster.py \
-      --input mixmd_hotspots_no_ligand.csv \
-      --radius-nm 0.35 \
-      --min-members 3 \
-      --top-k 3
-"""
-
-import argparse, csv, math
+import argparse, csv, math, sys
+from collections import defaultdict, Counter
 from pathlib import Path
 
-# --- Resname handling (accept both 3‑letter canonical and 4‑letter aliases) ---
-CANONICAL = {
-    "IPA": "IPA", "ACN": "ACN", "IMD": "IMD",
-    "ACM": "ACM", "PHO": "PHO", "HAC": "HAC",
-    # aliases accepted in the CSV (will be canonicalized below)
-    "ACEA": "ACM", "PHOL": "PHO", "ACOH": "HAC"
+# ---------- canonical names & aliases ----------
+ALIASES_TO_CANON = {
+    # canonical (3-letter)
+    "IPA": "IPA", "ACN": "ACN", "IMD": "IMD", "ACM": "ACM", "PHO": "PHO", "HAC": "HAC",
+    # legacy aliases used in older notes/CLIs
+    "ACEA": "ACM", "PHOL": "PHO", "ACOH": "HAC",
 }
-# Pick a consistent order for output
-PROBE_ORDER = ["IPA", "ACN", "IMD", "ACM", "PHO", "HAC"]
+CANON_SET = {"IPA","ACN","IMD","ACM","PHO","HAC"}
 
-def canon_name(s: str) -> str:
-    s = (s or "").strip().upper()
-    return CANONICAL.get(s, s)
+# nice, distinct chain IDs per type (single char; viewer-friendly)
+CHAIN_ID = {"IPA":"I","ACN":"A","IMD":"M","ACM":"C","PHO":"P","HAC":"H"}
 
-# --- Small geometry helpers (no NumPy) ---
-def d2(a, b) -> float:
-    """Squared distance in nm^2 between 3‑tuples a and b."""
-    dx = a[0]-b[0]; dy = a[1]-b[1]; dz = a[2]-b[2]
-    return dx*dx + dy*dy + dz*dz
+# ---------- I/O helpers ----------
+def _unify_resname(name: str) -> str | None:
+    if not name:
+        return None
+    key = name.strip().upper()
+    return ALIASES_TO_CANON.get(key, None)
 
-def mean_of(points):
-    """Plain average of 3‑tuples."""
-    n = len(points)
-    sx = sy = sz = 0.0
-    for (x,y,z) in points:
-        sx += x; sy += y; sz += z
-    return (sx/n, sy/n, sz/n)
-
-# --- Core: greedy clustering on averaged instance positions ---
-def greedy_clusters(points, radius_nm: float, refine_iters: int = 1):
+def _iter_hotspot_rows(csv_path: Path):
     """
-    points: list[(x,y,z)] in nm (already time‑averaged per instance)
-    radius_nm: merge radius (nm)
-    refine_iters: optional small center‑recompute passes
-    Returns list of dicts: {"center":(x,y,z),"members":[indices]}
+    Yield (step:int, resname:canonical, resid:int, x:float, y:float, z:float)
+    Skips comments (lines starting with '#').
+    Accepts headers with x_nm/y_nm/z_nm (preferred) or x/y/z.
     """
-    R2 = radius_nm * radius_nm
-    n = len(points)
-    unassigned = [True]*n
+    with open(csv_path, "r", newline="") as f:
+        rows = [ln for ln in f if ln.strip() and not ln.lstrip().startswith("#")]
+    if not rows:
+        return
 
-    # precompute neighbor counts to start with densest point
-    neighbor_counts = [0]*n
-    for i in range(n):
-        pi = points[i]
-        c = 0
-        for j in range(n):
-            if d2(pi, points[j]) <= R2:
-                c += 1
-        neighbor_counts[i] = c
+    rdr = csv.DictReader(rows)
 
-    clusters = []
-    remaining = sum(unassigned)
-    while remaining > 0:
-        # pick densest remaining
-        seed = -1
-        best = -1
-        for i in range(n):
-            if unassigned[i] and neighbor_counts[i] > best:
-                best = neighbor_counts[i]; seed = i
-        if seed < 0:
-            break
+    def _get(row, *keys, default=None):
+        for k in keys:
+            if k in row:
+                return row[k]
+        # lowercase fallback
+        low = {k.lower(): v for k, v in row.items()}
+        for k in keys:
+            if k.lower() in low:
+                return low[k.lower()]
+        return default
 
-        # initial membership from seed
-        center = points[seed]
-        members = []
-        for i in range(n):
-            if unassigned[i] and d2(points[i], center) <= R2:
-                members.append(i)
+    for row in rdr:
+        rn_raw = _get(row, "resname")
+        rn = _unify_resname(rn_raw)
+        if rn is None:
+            continue
+        try:
+            step  = int(float(_get(row, "step", default="0")))
+            resid = int(float(_get(row, "resid", default="0")))
+            x = float(_get(row, "x_nm", "x"))
+            y = float(_get(row, "y_nm", "y"))
+            z = float(_get(row, "z_nm", "z"))
+        except Exception:
+            continue
+        yield step, rn, resid, x, y, z
 
-        # refine center/membership a few times
-        for _ in range(refine_iters):
-            if not members:
-                break
-            center = mean_of([points[i] for i in members])
-            new_members = []
-            for i in range(n):
-                if unassigned[i] and d2(points[i], center) <= R2:
-                    new_members.append(i)
-            if set(new_members) == set(members):
-                break
-            members = new_members
-
-            # safety: if refinement drifted, keep it bounded
-            if not members:
-                members = [seed]; center = points[seed]; break
-
-        # finalize this cluster
-        clusters.append({"center": center, "members": members})
-        for i in members:
-            unassigned[i] = False
-        remaining = sum(unassigned)
-
-    # sort by descending size
-    clusters.sort(key=lambda c: len(c["members"]), reverse=True)
-    return clusters
-
-# --- I/O helpers ---
-def read_hotspot_csv(path: Path):
-    """Return rows = list[{step:int,resname:str,resid:int,x_nm:float,y_nm:float,z_nm:float}]"""
-    rows = []
-    with open(path, newline="") as f:
-        # skip commented diagnostics/header lines (starting with '#')
-        first = f.readline()
-        if not first.startswith("#"):
-            # rewind if first line already header
-            f.seek(0)
-        r = csv.DictReader(f)
-        for rec in r:
-            try:
-                rows.append({
-                    "step":   int(rec["step"]),
-                    "resname": canon_name(rec["resname"]),
-                    "resid":  int(rec["resid"]),
-                    "x_nm":   float(rec["x_nm"]),
-                    "y_nm":   float(rec["y_nm"]),
-                    "z_nm":   float(rec["z_nm"]),
-                })
-            except Exception:
-                # tolerate incomplete rows
-                continue
-    return rows
-
-def time_average_by_instance(rows):
+# ---------- core logic ----------
+def _time_average_by_instance(rows, min_frames: int):
     """
-    Group by (resname,resid) and return per‑probe:
-      dict[probe] = list of {"avg":(x,y,z), "count":n, "key":(resname,resid)}
+    rows: iterable of (step, rn, resid, x,y,z)
+    Return dict[(rn,resid)] -> (rn, resid, n_frames, x̄,ȳ,ż)
     """
-    acc = {}  # (resname,resid) -> [n, sx, sy, sz]
-    for r in rows:
-        k = (r["resname"], r["resid"])
-        e = acc.get(k)
-        if e is None:
-            acc[k] = [0, 0.0, 0.0, 0.0]
-            e = acc[k]
-        e[0] += 1; e[1] += r["x_nm"]; e[2] += r["y_nm"]; e[3] += r["z_nm"]
+    acc = {}
+    for _, rn, resid, x, y, z in rows:
+        key = (rn, resid)
+        if key not in acc:
+            acc[key] = [0.0, 0.0, 0.0, 0]  # sx, sy, sz, n
+        acc[key][0] += x
+        acc[key][1] += y
+        acc[key][2] += z
+        acc[key][3] += 1
 
     out = {}
-    for (resname, resid), (n, sx, sy, sz) in acc.items():
-        if n <= 0:
-            continue
-        avg = (sx/n, sy/n, sz/n)
-        out.setdefault(resname, []).append({"avg": avg, "count": n, "key": (resname, resid)})
+    for (rn, resid), (sx, sy, sz, n) in acc.items():
+        if n >= min_frames:
+            out[(rn, resid)] = (rn, resid, n, sx/n, sy/n, sz/n)
     return out
 
-def ensure_build_dir():
-    b = Path("build"); b.mkdir(exist_ok=True, parents=True); return b
+def _dist(a, b):
+    dx = a[0]-b[0]; dy = a[1]-b[1]; dz = a[2]-b[2]
+    return math.sqrt(dx*dx + dy*dy + dz*dz)
 
-def write_clusters_csv(out_csv: Path, clusters_by_probe, radius_nm, top_k=None, min_members=1):
+def _greedy_cluster(points, radius_nm):
     """
-    clusters_by_probe: dict[probe] = list of {"center":(x,y,z),"members":[idx], "instances":[(resname,resid),...]}
-    Writes one table with Å & nm coordinates and occupancy.
+    points: list of (rn, resid, n_frames, x, y, z) FOR A SINGLE rn (type)
+    Returns list of clusters:
+      { 'type': rn, 'centroid': (x,y,z), 'members': [(resid,n_frames), ...] }
+    Ranking: by number of distinct members (occupancy).
     """
-    with open(out_csv, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow([
-            "probe","cluster_rank","count",
-            "x_nm","y_nm","z_nm",
-            "x_A","y_A","z_A"
-        ])
-        for probe in PROBE_ORDER:
-            clusters = clusters_by_probe.get(probe, [])
-            # occupancy max for normalization (for PDB occupancy later)
-            # but here we just output centers
-            kept = 0
-            for rank, c in enumerate(clusters, start=1):
-                cnt = len(c["members"])
-                if cnt < min_members:
-                    continue
-                x,y,z = c["center"]
-                w.writerow([probe, rank, cnt, f"{x:.5f}", f"{y:.5f}", f"{z:.5f}",
-                            f"{x*10:.3f}", f"{y*10:.3f}", f"{z*10:.3f}"])
-                kept += 1
-                if top_k and kept >= top_k:
-                    break
-
-def write_clusters_pdb(out_pdb: Path, clusters_by_probe, top_k=None, min_members=1):
-    """
-    Write one pseudo‑atom per cluster:
-      - resname = probe
-      - occupancy = count / max_count_for_that_probe
-      - B‑factor  = count (raw)
-    """
-    lines = []
-    serial = 1
-    # fixed chain map for readability
-    chain_for = {"IPA":"I","ACN":"N","IMD":"M","ACM":"A","PHO":"P","HAC":"H"}
-    for probe in PROBE_ORDER:
-        clusters = clusters_by_probe.get(probe, [])
-        if not clusters:
-            continue
-        maxcnt = max(len(c["members"]) for c in clusters) if clusters else 1
-
-        kept = 0
-        for rank, c in enumerate(clusters, start=1):
-            cnt = len(c["members"])
-            if cnt < min_members:
-                continue
-            x,y,z = c["center"]
-            xA,yA,zA = x*10.0, y*10.0, z*10.0
-            occ = min(1.0, cnt / float(maxcnt))
-            bfac = float(cnt)
-
-            atom_name = "HSP "  # generic pseudo atom name
-            resname = probe[:3].rjust(3)
-            chain = chain_for.get(probe, "X")
-            resid = rank  # rank within that probe
-
-            lines.append(
-                f"HETATM{serial:5d} {atom_name:4s}{resname:>4s}{chain}{resid:4d}    "
-                f"{xA:8.3f}{yA:8.3f}{zA:8.3f}{occ:6.2f}{bfac:6.2f}          {'X':>2s}"
-            )
-            serial += 1
-            kept += 1
-            if top_k and kept >= top_k:
+    clusters = []
+    for rn, resid, nfr, x, y, z in points:
+        p = (x, y, z)
+        assigned = False
+        for cl in clusters:
+            if _dist(p, cl['centroid']) <= radius_nm:
+                m = len(cl['members'])
+                cx, cy, cz = cl['centroid']
+                cl['centroid'] = ((cx*m + x)/(m+1), (cy*m + y)/(m+1), (cz*m + z)/(m+1))
+                cl['members'].append((resid, nfr))
+                assigned = True
                 break
+        if not assigned:
+            clusters.append({'type': rn, 'centroid': p, 'members': [(resid, nfr)]})
+    clusters.sort(key=lambda c: len(c['members']), reverse=True)
+    return clusters
 
-    lines.append("END\n")
-    out_pdb.write_text("\n".join(lines), encoding="utf-8")
-
-def write_vina_boxes(out_txt: Path, clusters_by_probe, size_A=24.0, top_k=3, min_members=1):
+# ---------- PDB writer ----------
+def _write_pdb(base_path: Path, clusters_all, append_to_pdb: Path | None = None):
     """
-    Small helper: one line per cluster usable as Vina box snippet.
-    center_(x|y|z) in Å; size_(x|y|z) = size_A (cubic).
+    Write hotspots as pseudo-atoms (HETATM) at cluster centroids.
+    Coordinates are in Å (input is nm → ×10).
+    If append_to_pdb is provided, copy that file first and then append hotspots.
     """
-    with open(out_txt, "w") as f:
-        f.write("# AutoDock Vina box suggestions (Å)\n")
-        f.write("# columns: probe  rank  count  center_x  center_y  center_z  size\n")
-        for probe in PROBE_ORDER:
-            clusters = clusters_by_probe.get(probe, [])
-            kept = 0
-            for rank, c in enumerate(clusters, start=1):
-                cnt = len(c["members"])
-                if cnt < min_members:
-                    continue
-                xA,yA,zA = (c["center"][0]*10.0, c["center"][1]*10.0, c["center"][2]*10.0)
-                f.write(f"{probe:>4s}  {rank:2d}  {cnt:4d}  {xA:8.3f} {yA:8.3f} {zA:8.3f}  {size_A:.1f}\n")
-                kept += 1
-                if top_k and kept >= top_k:
-                    break
+    pdb_path = base_path.with_suffix(".pdb")
+    nm_to_A = 10.0
 
+    # If appending to an existing PDB, copy content first
+    lines = []
+    if append_to_pdb:
+        src = Path(append_to_pdb)
+        if not src.exists():
+            raise SystemExit(f"--append-to-pdb file not found: {src}")
+        lines = src.read_text().splitlines()
+
+        # Strip possible trailing END/ENDMDL to safely append
+        while lines and lines[-1].strip() in {"END", "ENDMDL"}:
+            lines.pop()
+
+    # Prepare new HETATM records
+    het_lines = []
+    serial = 1
+    last_chain = None
+    for idx, (rn, local_rank, cl) in enumerate(clusters_all, start=1):
+        cx, cy, cz = cl['centroid']
+        xA, yA, zA = cx*nm_to_A, cy*nm_to_A, cz*nm_to_A
+        count = len(cl['members'])
+        resname = rn                 # IPA/ACN/… (3-letter)
+        chain  = CHAIN_ID.get(rn, "X")
+        resseq = int(local_rank)     # 1..K within that type
+
+        # Insert TER when chain changes (helps viewers)
+        if last_chain is not None and chain != last_chain:
+            het_lines.append("TER".ljust(80))
+        last_chain = chain
+
+        # HETATM format (PDB v3). B-factor stores occupancy count for quick visualization.
+        # Columns:  1-6 'HETATM', 7-11 serial, 13-16 atom, 17 alt, 18-20 resName,
+        #           22 chain, 23-26 resSeq, 31-38 x, 39-46 y, 47-54 z, 55-60 occ, 61-66 temp, 77-78 element
+        het = (
+            f"HETATM{serial:5d}  CEN {resname:>3s} {chain:1s}"
+            f"{resseq:4d}    "
+            f"{xA:8.3f}{yA:8.3f}{zA:8.3f}"
+            f"{1.00:6.2f}{min(99.99,float(count)):6.2f}"
+            f"          C "
+        )
+        het_lines.append(het.ljust(80))
+        serial += 1
+
+    het_lines.append("TER".ljust(80))
+    het_lines.append("END".ljust(80))
+
+    # Write final
+    with open(pdb_path, "w") as f:
+        if lines:
+            for ln in lines:
+                f.write(ln.rstrip() + "\n")
+        # header remarks for the hotspot block
+        f.write(f"REMARK 500 HOTSPOT CENTROIDS (per-probe clusters)\n")
+        f.write(f"REMARK 500 B-FACTOR FIELD = number of probe instances in cluster\n")
+        for ln in het_lines:
+            f.write(ln + "\n")
+
+    print(f"✅ Wrote: {pdb_path}")
+
+# ---------- CLI & pipeline ----------
 def main():
-    ap = argparse.ArgumentParser(description="Greedy hotspot clustering for MixMD probe centroids.")
-    ap.add_argument("--input", required=True, help="Hotspot CSV from 5_md_simulation.py reporter.")
-    ap.add_argument("--radius-nm", type=float, default=0.35, help="Merge radius (nm). ~0.30–0.40 nm works well.")
-    ap.add_argument("--refine-iters", type=int, default=1, help="Center refinement passes per cluster.")
-    ap.add_argument("--min-members", type=int, default=2, help="Keep clusters with at least this many distinct instances.")
-    ap.add_argument("--top-k", type=int, default=3, help="Write only top‑K clusters per probe to PDB/boxes (0 = all).")
-    ap.add_argument("--vina-size-A", type=float, default=24.0, help="Suggested cubic box edge for Vina (Å).")
+    ap = argparse.ArgumentParser(
+        description="Cluster MixMD probe hotspots (greedy, dependency-free)."
+    )
+    ap.add_argument("--input", required=True,
+                    help="ProbeHotspotReporter CSV, e.g., mixmd_hotspots_no_ligand.csv")
+    ap.add_argument("--radius-nm", type=float, default=0.40,
+                    help="Merge radius in nm (default 0.40)")
+    ap.add_argument("--min-members", type=int, default=3,
+                    help="Min frames per probe instance to keep (default 3)")
+    ap.add_argument("--top-k", type=int, default=3,
+                    help="Top K clusters per probe type to export (default 3)")
+    ap.add_argument("--types", type=str, default=None,
+                    help="Comma-separated probe types to include (accepts aliases). Default: all present.")
+    ap.add_argument("--list-names", action="store_true",
+                    help="Print residue names found in CSV and exit.")
+    ap.add_argument("--append-to-pdb", type=str, default=None,
+                    help="If provided, append hotspot pseudo-atoms to this PDB (useful for quick overlay).")
     args = ap.parse_args()
 
-    inp = Path(args.input)
-    rows = read_hotspot_csv(inp)
-    if not rows:
-        raise SystemExit(f"No rows parsed from {inp}")
+    in_path = Path(args.input)
+    if not in_path.exists():
+        raise SystemExit(f"Input CSV not found: {in_path}")
 
-    # 1) time‑average per (resname,resid)
-    by_probe = time_average_by_instance(rows)
+    # Load once for diagnostics
+    all_rows = list(_iter_hotspot_rows(in_path))
 
-    # 2) greedy clustering per probe
-    clusters_by_probe = {}
-    for probe in PROBE_ORDER:
-        instances = by_probe.get(probe, [])
-        if not instances:
+    if args.list_names:
+        cnt = Counter(rn for _, rn, _, _, _, _ in all_rows)
+        if not cnt:
+            print("No recognizable probe residues found. Names seen in file may not match expected set.")
+        else:
+            print("Residue names found (canonicalized):")
+            for rn, n in cnt.most_common():
+                print(f"  {rn}: {n} rows")
+        return
+
+    if not all_rows:
+        raise SystemExit(
+            f"No rows parsed from {in_path}.\n"
+            f"Tip: run with --list-names to see which residue names are present."
+        )
+
+    # Optional type filter
+    type_filter = None
+    if args.types:
+        user = {t.strip().upper() for t in args.types.split(",") if t.strip()}
+        type_filter = {ALIASES_TO_CANON.get(t, t) for t in user} & set(ALIASES_TO_CANON.values())
+        if not type_filter:
+            print(f"Warning: none of the specified types matched known set {sorted(CANON_SET)}; using all types.")
+            type_filter = None
+
+    # Time-average per probe instance
+    per_inst = _time_average_by_instance(all_rows, min_frames=max(1, args.min_members))
+
+    # Split points by type
+    points_by_type = defaultdict(list)
+    for (rn, resid), (rn_, resid_, nfr, x, y, z) in per_inst.items():
+        if type_filter and rn_ not in type_filter:
             continue
-        pts = [rec["avg"] for rec in instances]
-        cls = greedy_clusters(pts, radius_nm=args.radius_nm, refine_iters=args.refine_iters)
-        clusters_by_probe[probe] = cls
+        points_by_type[rn_].append((rn_, resid_, nfr, x, y, z))
 
-    # 3) outputs
-    build = ensure_build_dir()
-    stem = inp.stem  # e.g., mixmd_hotspots_no_ligand
-    tag = f"{stem}_r{args.radius_nm:.2f}nm".replace(".", "p")
-    out_csv = build / f"hotspots_{tag}.csv"
-    out_pdb = build / f"hotspots_{tag}.pdb"
-    out_txt = build / f"hotspots_{tag}.vina.txt"
+    if not any(points_by_type.values()):
+        cnt = Counter(rn for _, rn, _, _, _, _ in all_rows)
+        raise SystemExit(
+            "No rows survived filtering.\n"
+            f"  • Present names (counts): {dict(cnt)}\n"
+            f"  • Filter types: {sorted(type_filter) if type_filter else 'None (using all)'}\n"
+            "  • Check that your CSV uses IPA/ACN/IMD/ACM/PHO/HAC (aliases ACEA/PHOL/ACOH also accepted).\n"
+            "  • Or try a smaller --min-members."
+        )
 
-    write_clusters_csv(out_csv, clusters_by_probe, args.radius_nm, top_k=args.top_k or None, min_members=args.min_members)
-    write_clusters_pdb(out_pdb, clusters_by_probe, top_k=args.top_k or None, min_members=args.min_members)
-    write_vina_boxes(out_txt, clusters_by_probe, size_A=float(args.vina_size_A), top_k=args.top_k or None, min_members=args.min_members)
+    # Cluster each type
+    clusters_all = []
+    for rn, pts in points_by_type.items():
+        if not pts:
+            continue
+        clusters = _greedy_cluster(pts, radius_nm=float(args.radius_nm))
+        # keep top-k for this rn
+        clusters_all.extend([(rn, i+1, c) for i, c in enumerate(clusters[:max(1, args.top_k)])])
 
-    # Small console summary
-    print(f"[5c] Wrote clusters → {out_csv}")
-    print(f"[5c] Centers PDB    → {out_pdb}")
-    print(f"[5c] Vina boxes     → {out_txt}")
+    if not clusters_all:
+        raise SystemExit("No clusters were formed. Try a larger --radius-nm or smaller --min-members.")
+
+    # Write outputs
+    base = f"hotspots_{in_path.stem}_r{float(args.radius_nm):.2f}nm"
+    csv_out = Path(f"{base}.csv")
+    vina_out = Path(f"{base}.vina.txt")
+
+    with open(csv_out, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["rank","type","count","x_nm","y_nm","z_nm","member_resids","member_frames_sum"])
+        rank_global = 1
+        for rn, _, cl in clusters_all:
+            mem = cl['members']
+            count = len(mem)
+            cx, cy, cz = cl['centroid']
+            member_resids = ";".join(str(rid) for rid, _ in mem)
+            frames_sum = sum(nfr for _, nfr in mem)
+            w.writerow([rank_global, rn, count,
+                        f"{cx:.3f}", f"{cy:.3f}", f"{cz:.3f}",
+                        member_resids, frames_sum])
+            rank_global += 1
+
+    with open(vina_out, "w") as f:
+        f.write("# AutoDock Vina boxes (center in nm; convert to Å by ×10 if needed)\n")
+        for idx, (rn, _, cl) in enumerate(clusters_all, start=1):
+            cx, cy, cz = cl['centroid']
+            f.write(f"name=HOTSPOT_{rn}_{idx}\n")
+            f.write(f"center_x_nm={cx:.4f}\ncenter_y_nm={cy:.4f}\ncenter_z_nm={cz:.4f}\n")
+            f.write("size_x_A=30\nsize_y_A=30\nsize_z_A=30\n\n")
+
+    print(f"✅ Wrote: {csv_out}")
+    print(f"✅ Wrote: {vina_out}")
+
+    # --- NEW: PDB with pseudo-atoms at cluster centroids ---
+    _write_pdb(Path(base), clusters_all,
+               append_to_pdb=(Path(args.append_to_pdb) if args.append_to_pdb else None))
 
 if __name__ == "__main__":
     main()
