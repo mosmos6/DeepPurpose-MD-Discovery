@@ -73,16 +73,26 @@ class ProbeHotspotReporter:
         return (self.reportInterval, True, False, False, False, True)
 
     def report(self, simulation, state):
-        pos = state.getPositions(asNumpy=False)  # Vec3 with nm units
-        # obtain current step (cheap extra query)
-        step = simulation.context.getState(getStep=True).getStepCount()
+        pos = state.getPositions(asNumpy=False)  # list of Vec3 (nm)
 
-        # If no groups (name mismatch), nothing to write—file still has header.
+        # --- robust step retrieval across OpenMM versions ---
+        try:
+            step = int(simulation.currentStep)      # OpenMM ≥ 7.5+
+        except Exception:
+            # Fallback: derive from time/stepsize with units
+            try:
+                t  = state.getTime()                           # has units
+                dt = simulation.integrator.getStepSize()       # has units
+                step = int(round((t / dt)))
+            except Exception:
+                step = -1  # last resort; still log coordinates
+        # -----------------------------------------------------
+
         for (idxs, (resname, resid)) in zip(self.groups, self.resid_map):
             sx = sy = sz = 0.0
             n = 0
             for i in idxs:
-                v = pos[i]  # Vec3 (nm)
+                v = pos[i]  # Vec3 (nm units)
                 sx += float(v.x); sy += float(v.y); sz += float(v.z)
                 n += 1
             if n > 0:
