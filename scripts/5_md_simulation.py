@@ -30,14 +30,19 @@ class ProbeHotspotReporter:
     """
     Write probe residue centroids (nm) every 'reportInterval' steps to CSV.
     Columns: step,resname,resid,x_nm,y_nm,z_nm
-    Auto-detects probe residues present in the provided topology by intersecting
-    residue names with PROBE_NAME_SET (accepts 3-letter canonical and 4-letter aliases).
+
+    This version logs in a receptor-centered frame:
+      centroid' = centroid - COM_protein(t) + COM_protein(0),
+    where COM_protein uses protein Cα atoms (fallback: all protein heavy atoms).
     """
-    def __init__(self, file_path, reportInterval, topology, probe_resnames=None):
+    def __init__(self, file_path, reportInterval, topology, probe_resnames=None, center_mode="protein-com"):
         self.file = open(file_path, "w")
         self.reportInterval = int(reportInterval)
+        self.center_mode = center_mode
+        self._have_ref_com = False
+        self._ref_com = (0.0, 0.0, 0.0)
 
-        # build tracking set (auto-discover ∩ optional user list)
+        # --- discover probe residue names present in topology ---
         present = {(res.name or "").upper().strip() for res in topology.residues()}
         auto_names = present & PROBE_NAME_SET
         if probe_resnames:
@@ -46,64 +51,108 @@ class ProbeHotspotReporter:
         else:
             self.probe_res = auto_names
 
-        # cache atom indices per residue
+        # --- index groups to average probe centroids per residue ---
         groups, resid_map = [], []
+        protein_resname_set = {
+            "ALA","ARG","ASN","ASP","CYS","GLN","GLU","GLY","HIS","ILE",
+            "LEU","LYS","MET","PHE","PRO","SER","THR","TRP","TYR","VAL"
+        }
+        self._protein_anchor_indices = []
         for res in topology.residues():
             rn = (res.name or "").upper().strip()
+
+            # Track probe residues
             if rn in self.probe_res:
                 idxs = [a.index for a in res.atoms()]
                 if idxs:
                     groups.append(idxs)
                     resid_map.append((rn, int(res.id) if res.id is not None else 0))
+
+            # Collect anchor indices (protein CA preferred)
+            if rn in protein_resname_set:
+                for a in res.atoms():
+                    nm = (a.name or "").upper()
+                    if nm == "CA":  # alpha carbon
+                        self._protein_anchor_indices.append(a.index)
+
+        # Fallback: if no CA (rare), use all non‑H protein atoms
+        if not self._protein_anchor_indices:
+            for res in topology.residues():
+                rn = (res.name or "").upper().strip()
+                if rn in protein_resname_set:
+                    for a in res.atoms():
+                        if a.element is None or a.element.symbol == "H":
+                            continue
+                        self._protein_anchor_indices.append(a.index)
+
         self.groups = groups
         self.resid_map = resid_map
 
-        # header + diagnostic comment
+        # header + diagnostic
         self.file.write("# tracking_resnames=" + ";".join(sorted(self.probe_res)) + "\n")
+        self.file.write("# center_mode=" + str(self.center_mode) + "\n")
         self.file.write("step,resname,resid,x_nm,y_nm,z_nm\n")
         self.file.flush()
 
-    # --- helpers ----------------------------------------------------------
-    @staticmethod
-    def _current_step(simulation) -> int:
-        # robust step retrieval across OpenMM versions
-        try:
-            return int(simulation.currentStep)          # OpenMM ≥ 7.5
-        except Exception:
-            try:
-                t  = simulation.context.getState(getTime=True).getTime()
-                dt = simulation.integrator.getStepSize()
-                return int(round((t/dt)))               # fall back to time / stepsize
-            except Exception:
-                return -1
-
-    # OpenMM asks: how many steps until your *next* report?
     def describeNextReport(self, simulation):
-        stride = self.reportInterval
-        cur = max(0, self._current_step(simulation))
-        # schedule the next multiple of 'stride' strictly *after* 'cur'
-        next_multiple = ((cur // stride) + 1) * stride
-        steps_until = max(1, next_multiple - cur)
-        # (steps, needPositions, needVelocities, needForces, needEnergy, enforcePBC)
-        return (steps_until, True, False, False, False, True)
+        # (steps, positions, velocities, forces, energies, enforcePeriodicBox)
+        return (self.reportInterval, True, False, False, False, True)
+
+    @staticmethod
+    def _com_of_indices(positions, idxs):
+        sx = sy = sz = 0.0
+        n = 0
+        for i in idxs:
+            v = positions[i]
+            sx += float(v.x); sy += float(v.y); sz += float(v.z)
+            n += 1
+        if n == 0:
+            return (0.0, 0.0, 0.0)
+        return (sx/n, sy/n, sz/n)
 
     def report(self, simulation, state):
         pos = state.getPositions(asNumpy=False)  # list of Vec3 (nm)
-        step = self._current_step(simulation)
+
+        # Determine step robustly
+        try:
+            step = int(simulation.currentStep)
+        except Exception:
+            try:
+                t  = state.getTime()
+                dt = simulation.integrator.getStepSize()
+                step = int(round((t/dt)))
+            except Exception:
+                step = -1
+
+        # receptor-centered recentering
+        if self.center_mode == "protein-com" and self._protein_anchor_indices:
+            com_now = self._com_of_indices(pos, self._protein_anchor_indices)
+            if not self._have_ref_com:
+                self._ref_com = com_now
+                self._have_ref_com = True
+            dx = self._ref_com[0] - com_now[0]
+            dy = self._ref_com[1] - com_now[1]
+            dz = self._ref_com[2] - com_now[2]
+        else:
+            dx = dy = dz = 0.0
+
+        # write centroids
         for (idxs, (resname, resid)) in zip(self.groups, self.resid_map):
             sx = sy = sz = 0.0
             n = 0
             for i in idxs:
-                v = pos[i]
+                v = pos[i]  # Vec3 (nm)
                 sx += float(v.x); sy += float(v.y); sz += float(v.z)
                 n += 1
             if n > 0:
-                self.file.write(f"{step},{resname},{resid},{sx/n:.5f},{sy/n:.5f},{sz/n:.5f}\n")
+                self.file.write(f"{step},{resname},{resid},{sx/n+dx:.5f},{sy/n+dy:.5f},{sz/n+dz:.5f}\n")
         self.file.flush()
 
     def __del__(self):
-        try: self.file.close()
-        except Exception: pass
+        try:
+            self.file.close()
+        except Exception:
+            pass
 
 # --- MixMD-from-Packmol helpers (pure OpenMM, no NumPy) -----------------------
 # Canonical 3-letter names used by 3c/Packmol, plus 4-letter aliases so 5 accepts both.
