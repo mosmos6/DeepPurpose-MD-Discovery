@@ -15,27 +15,58 @@ import numpy as np
 # -----------------------------
 
 def read_hotspot_csv(path: Path):
+    """
+    Read hotspots CSV written by 5 (ProbeHotspotReporter).
+    - Skips initial comment lines (e.g., '# tracking_resnames=...').
+    - Accepts slight header variations: x_nm|x, y_nm|y, z_nm|z, resid|res_id|id, resname|probe|name
+    - step is optional; defaults to 0 if absent.
+    Returns: list of dicts with keys: step,resname,resid,x,y,z (nm floats).
+    """
     rows = []
-    with open(path, newline="") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            if row.get("step") is None:
-                # allow files that don't record step (legacy)
-                step = 0
-            else:
-                try:
-                    step = int(row["step"])
-                except Exception:
-                    step = 0
-            rows.append({
-                "step": step,
-                "resname": row["resname"].strip().upper(),
-                "resid":   int(row["resid"]),
-                "x": float(row["x_nm"]),
-                "y": float(row["y_nm"]),
-                "z": float(row["z_nm"]),
-            })
+
+    # Read with BOM handling and strip comments/blanks
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        clean_lines = [ln for ln in f if ln.strip() and not ln.lstrip().startswith("#")]
+
+    if not clean_lines:
+        return rows  # nothing to parse
+
+    # Use the first non-comment line as the header
+    reader = csv.DictReader(clean_lines)
+
+    for rec in reader:
+        # Case/space-normalize header keys
+        lower = { (k or "").strip().lower(): (v or "").strip() for k, v in rec.items() }
+
+        def pick(*names, default=None):
+            for n in names:
+                if n in lower and lower[n] != "":
+                    return lower[n]
+            return default
+
+        # Required-ish columns with aliases
+        resname = (pick("resname", "probe", "name", default="")).upper()
+        x_s = pick("x_nm", "x")
+        y_s = pick("y_nm", "y")
+        z_s = pick("z_nm", "z")
+        resid_s = pick("resid", "res_id", "id", default="0")
+        step_s  = pick("step", default="0")
+
+        # Skip malformed rows gracefully
+        if not (resname and x_s is not None and y_s is not None and z_s is not None):
+            continue
+
+        try:
+            x = float(x_s); y = float(y_s); z = float(z_s)
+            resid = int(float(resid_s))  # tolerate "12.0"
+            step = int(float(step_s))
+        except Exception:
+            continue
+
+        rows.append({"step": step, "resname": resname, "resid": resid, "x": x, "y": y, "z": z})
+
     return rows
+
 
 def group_time_averages(rows):
     # average each (resname,resid) trajectory → one time-avg point
