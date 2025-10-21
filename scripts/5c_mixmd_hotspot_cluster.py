@@ -164,7 +164,7 @@ def write_hotspot_pdb_trajframe(out_path: Path, per_probe_clusters, title_remark
 # -----------------------------
 
 def _parse_ca_coords(pdb_path: Path):
-    """Return Nx3 array of CA atom coordinates (Å) in file order."""
+    """Return Nx3 array of CA coordinates (Å) in file order (kept for legacy)."""
     coords = []
     with open(pdb_path, "r") as f:
         for line in f:
@@ -176,89 +176,130 @@ def _parse_ca_coords(pdb_path: Path):
                     pass
     return np.array(coords, dtype=float)
 
+def _parse_ca_indexed(pdb_path: Path):
+    """
+    Map (chainID, resSeq, iCode) -> 3D coordinate (Å).
+    This makes the CA pairing robust to reordering and missing residues.
+    """
+    out = {}
+    with open(pdb_path, "r") as f:
+        for line in f:
+            if line.startswith("ATOM") and line[12:16].strip() == "CA":
+                try:
+                    chain = line[21:22]
+                    resSeq = int(line[22:26])
+                    iCode  = line[26:27]  # insertion code
+                    x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])
+                except Exception:
+                    continue
+                out[(chain, resSeq, iCode)] = np.array([x, y, z], dtype=float)
+    return out
+
 def _kabsch(P, Q):
-    """Find rotation R, translation t such that P*R + t ≈ Q (both Nx3)."""
-    # centroids
-    cP = P.mean(axis=0)
-    cQ = Q.mean(axis=0)
-    P0 = P - cP
-    Q0 = Q - cQ
+    """
+    Find rotation R and translation t that best superpose P onto Q (both Nx3).
+    Returns R (3x3), t (3,), and RMSD after the fit.
+    """
+    P = np.asarray(P, float); Q = np.asarray(Q, float)
+    cP = P.mean(axis=0); cQ = Q.mean(axis=0)
+    P0 = P - cP; Q0 = Q - cQ
     H = P0.T @ Q0
     U, S, Vt = np.linalg.svd(H)
     R = Vt.T @ U.T
-    # ensure right-handed
     if np.linalg.det(R) < 0:
         Vt[-1, :] *= -1
         R = Vt.T @ U.T
     t = cQ - cP @ R
-    return R, t
+    P_fit = P @ R + t
+    rmsd = np.sqrt(((P_fit - Q)**2).sum(axis=1).mean())
+    return R, t, rmsd
+# ---------------------------------------------------------------------------
 
 def write_hotspot_pdb_on_reference(prefix: Path,
                                    per_probe_clusters,
                                    trajframe_pdb: Path,
                                    reference_pdb: Path):
     """
-    Align trajframe Cα → reference Cα and merge centroids onto reference.
-    Outputs <prefix>_on_<reference-stem>.pdb
+    Align trajframe receptor to reference using CA pairs matched by (chain,resSeq,iCode),
+    then merge centroids onto the reference. Falls back to translation-only if the
+    rotational fit looks unreliable.
     """
-    # CA sets (Å)
-    P = _parse_ca_coords(trajframe_pdb)
-    Q = _parse_ca_coords(reference_pdb)
-    n = min(len(P), len(Q))
-    if n < 5:
-        print("⚠️  Not enough matching CA atoms to align; skip merged PDB.")
+    # 1) build indexed CA maps
+    src_map = _parse_ca_indexed(trajframe_pdb)
+    ref_map = _parse_ca_indexed(reference_pdb)
+    shared_keys = sorted(set(src_map.keys()) & set(ref_map.keys()),
+                         key=lambda k: (k[0], k[1], k[2]))
+    if len(shared_keys) < 5:
+        print(f"⚠️  Alignment skipped: only {len(shared_keys)} matched CA pairs.")
         return None
-    R, t = _kabsch(P[:n], Q[:n])
 
-    # transform centroids (Å)
+    P = np.vstack([src_map[k] for k in shared_keys])
+    Q = np.vstack([ref_map[k] for k in shared_keys])
+
+    # 2) fit & sanity-check
+    R, t, rmsd = _kabsch(P, Q)
+    # conservative guard: if RMSD is huge, rotation is probably wrong
+    use_rotation = rmsd <= 5.0  # Å threshold; tweak if needed
+
+    if use_rotation:
+        print(f"[5c] Kabsch CA pairs: {len(shared_keys)} ; post-fit RMSD = {rmsd:.2f} Å")
+    else:
+        print(f"⚠️  Post-fit RMSD is high ({rmsd:.1f} Å). Falling back to translation-only.")
+        # translation-only from CA centroids
+        t = Q.mean(axis=0) - P.mean(axis=0)
+
+    # 3) transform centroids from nm to Å and apply transform
     per_probe_A = {}
     for resn, clusters in per_probe_clusters.items():
-        out = []
+        transformed = []
         for cen_nm, members in clusters:
-            vA = cen_nm * 10.0  # nm→Å
-            vA = vA @ R + t
-            out.append((vA, members))
-        per_probe_A[resn] = out
+            vA = cen_nm * 10.0  # nm → Å
+            vA = (vA @ R + t) if use_rotation else (vA + t)
+            transformed.append((vA, members))
+        per_probe_A[resn] = transformed
 
-    # read reference PDB to copy atoms
+    # 4) read reference PDB and append CEN atoms
     ref_lines = []
     with open(reference_pdb, "r") as f:
         for line in f:
-            if line.startswith(("ATOM", "HETATM", "TER", "MODEL", "ENDMDL", "REMARK", "HEADER", "TITLE", "COMPND", "SOURCE", "KEYWDS", "EXPDTA")):
+            if line.startswith(("ATOM", "HETATM", "TER", "MODEL", "ENDMDL", "REMARK", "HEADER",
+                                "TITLE", "COMPND", "SOURCE", "KEYWDS", "EXPDTA")):
                 ref_lines.append(line)
-    # determine next serial
     max_serial = 0
     for line in ref_lines:
-        if line.startswith(("ATOM","HETATM")):
+        if line.startswith(("ATOM", "HETATM")):
             try:
-                s = int(line[6:11])
-                if s > max_serial: max_serial = s
+                s = int(line[6:11]); max_serial = max(max_serial, s)
             except Exception:
                 pass
     serial = max_serial + 1
+
+    PROBE_TO_CHAIN = ["I","A","M","C","P","H","U","V","W","X","Y","Z"]
+    def _fmt_pdb_atom(serial, name, resn, chain, resid, xA, yA, zA, bfac=1.0, occ=1.0):
+        # altLoc left blank; name 'CEN ' to avoid altLoc interpretation
+        return (f"HETATM{serial:5d} {name:<4s}{resn:>3s} {chain:1s}"
+                f"{resid:>4d}    {xA:8.3f}{yA:8.3f}{zA:8.3f}{occ:6.2f}{bfac:6.2f}          C  \n")
 
     out_path = prefix.with_name(f"{prefix.name}_on_{Path(reference_pdb).stem}.pdb")
     with open(out_path, "w") as f:
         f.write(f"REMARK 500 HOTSPOT CENTROIDS merged onto reference: {Path(reference_pdb).name}\n")
         f.write("REMARK 500 B-FACTOR FIELD = number of probe instances in cluster\n")
-        # write reference first
         for line in ref_lines:
-            if not line.startswith("END"):  # avoid duplicate END
+            if not line.startswith("END"):
                 f.write(line)
-        # append centroids
-        chain_map = {}
-        for idx, resn in enumerate(per_probe_A.keys()):
-            chain_map[resn] = PROBE_TO_CHAIN[idx % len(PROBE_TO_CHAIN)]
+        chain_map = {resn: PROBE_TO_CHAIN[i % len(PROBE_TO_CHAIN)]
+                     for i, resn in enumerate(per_probe_A.keys())}
         for resn, items in per_probe_A.items():
             chain = chain_map[resn]
             for rank, (vA, members) in enumerate(items, start=1):
                 xA, yA, zA = vA.tolist()
-                f.write(_fmt_pdb_atom(serial, "CEN", resn, chain, rank, xA, yA, zA,
-                                      bfac=float(len(members)), occ=1.00))
+                f.write(_fmt_pdb_atom(serial, "CEN ", resn, chain, rank,
+                                      xA, yA, zA, bfac=float(len(members)), occ=1.00))
                 serial += 1
             f.write("TER\n")
         f.write("END\n")
     return out_path
+
 
 # -----------------------------
 # Main
