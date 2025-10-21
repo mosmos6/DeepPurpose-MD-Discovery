@@ -1,306 +1,343 @@
 # 5c_mixmd_hotspot_cluster.py
-# Greedy clustering of MixMD probe hotspots (dependency-free).
-# Reads centroids CSV from 5_md_simulation.py's ProbeHotspotReporter.
+# Greedy clustering of MixMD probe centroids with optional Kabsch alignment
+# Author: Iori Mochizuki (pipeline)
+# Updated: 2025-10-17
 
-import argparse, csv, math, sys
-from collections import defaultdict, Counter
+import argparse, csv, os, math
 from pathlib import Path
+from collections import defaultdict
 
-# ---------- canonical names & aliases ----------
-ALIASES_TO_CANON = {
-    # canonical (3-letter)
-    "IPA": "IPA", "ACN": "ACN", "IMD": "IMD", "ACM": "ACM", "PHO": "PHO", "HAC": "HAC",
-    # legacy aliases used in older notes/CLIs
-    "ACEA": "ACM", "PHOL": "PHO", "ACOH": "HAC",
-}
-CANON_SET = {"IPA","ACN","IMD","ACM","PHO","HAC"}
+# numpy is used only here (post-processing, no OpenMM units); safe & fast
+import numpy as np
 
-# nice, distinct chain IDs per type (single char; viewer-friendly)
-CHAIN_ID = {"IPA":"I","ACN":"A","IMD":"M","ACM":"C","PHO":"P","HAC":"H"}
+# -----------------------------
+# I/O helpers
+# -----------------------------
 
-# ---------- I/O helpers ----------
-def _unify_resname(name: str) -> str | None:
-    if not name:
-        return None
-    key = name.strip().upper()
-    return ALIASES_TO_CANON.get(key, None)
+def read_hotspot_csv(path: Path):
+    rows = []
+    with open(path, newline="") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            if row.get("step") is None:
+                # allow files that don't record step (legacy)
+                step = 0
+            else:
+                try:
+                    step = int(row["step"])
+                except Exception:
+                    step = 0
+            rows.append({
+                "step": step,
+                "resname": row["resname"].strip().upper(),
+                "resid":   int(row["resid"]),
+                "x": float(row["x_nm"]),
+                "y": float(row["y_nm"]),
+                "z": float(row["z_nm"]),
+            })
+    return rows
 
-def _iter_hotspot_rows(csv_path: Path):
-    """
-    Yield (step:int, resname:canonical, resid:int, x:float, y:float, z:float)
-    Skips comments (lines starting with '#').
-    Accepts headers with x_nm/y_nm/z_nm (preferred) or x/y/z.
-    """
-    with open(csv_path, "r", newline="") as f:
-        rows = [ln for ln in f if ln.strip() and not ln.lstrip().startswith("#")]
-    if not rows:
-        return
-
-    rdr = csv.DictReader(rows)
-
-    def _get(row, *keys, default=None):
-        for k in keys:
-            if k in row:
-                return row[k]
-        # lowercase fallback
-        low = {k.lower(): v for k, v in row.items()}
-        for k in keys:
-            if k.lower() in low:
-                return low[k.lower()]
-        return default
-
-    for row in rdr:
-        rn_raw = _get(row, "resname")
-        rn = _unify_resname(rn_raw)
-        if rn is None:
-            continue
-        try:
-            step  = int(float(_get(row, "step", default="0")))
-            resid = int(float(_get(row, "resid", default="0")))
-            x = float(_get(row, "x_nm", "x"))
-            y = float(_get(row, "y_nm", "y"))
-            z = float(_get(row, "z_nm", "z"))
-        except Exception:
-            continue
-        yield step, rn, resid, x, y, z
-
-# ---------- core logic ----------
-def _time_average_by_instance(rows, min_frames: int):
-    """
-    rows: iterable of (step, rn, resid, x,y,z)
-    Return dict[(rn,resid)] -> (rn, resid, n_frames, x̄,ȳ,ż)
-    """
+def group_time_averages(rows):
+    # average each (resname,resid) trajectory → one time-avg point
     acc = {}
-    for _, rn, resid, x, y, z in rows:
-        key = (rn, resid)
+    cnt = {}
+    for r in rows:
+        key = (r["resname"], r["resid"])
         if key not in acc:
-            acc[key] = [0.0, 0.0, 0.0, 0]  # sx, sy, sz, n
-        acc[key][0] += x
-        acc[key][1] += y
-        acc[key][2] += z
-        acc[key][3] += 1
+            acc[key] = np.zeros(3, dtype=float)
+            cnt[key] = 0
+        acc[key] += np.array([r["x"], r["y"], r["z"]], dtype=float)
+        cnt[key] += 1
+    out = defaultdict(list)  # resname -> [point_nm]
+    for (resname, resid), v in acc.items():
+        if cnt[(resname, resid)] > 0:
+            out[resname].append(v / cnt[(resname, resid)])
+    return out  # dict: name -> [points_nm]
 
-    out = {}
-    for (rn, resid), (sx, sy, sz, n) in acc.items():
-        if n >= min_frames:
-            out[(rn, resid)] = (rn, resid, n, sx/n, sy/n, sz/n)
-    return out
+# -----------------------------
+# Greedy clustering (dependency-free core)
+# -----------------------------
 
-def _dist(a, b):
-    dx = a[0]-b[0]; dy = a[1]-b[1]; dz = a[2]-b[2]
-    return math.sqrt(dx*dx + dy*dy + dz*dz)
-
-def _greedy_cluster(points, radius_nm):
-    """
-    points: list of (rn, resid, n_frames, x, y, z) FOR A SINGLE rn (type)
-    Returns list of clusters:
-      { 'type': rn, 'centroid': (x,y,z), 'members': [(resid,n_frames), ...] }
-    Ranking: by number of distinct members (occupancy).
-    """
+def greedy_cluster(points_nm, radius_nm):
+    """Return clusters as list of (centroid_nm, member_indices)."""
+    if not points_nm:
+        return []
+    pts = np.array(points_nm, dtype=float)  # (N,3)
+    used = np.zeros(len(pts), dtype=bool)
     clusters = []
-    for rn, resid, nfr, x, y, z in points:
-        p = (x, y, z)
-        assigned = False
-        for cl in clusters:
-            if _dist(p, cl['centroid']) <= radius_nm:
-                m = len(cl['members'])
-                cx, cy, cz = cl['centroid']
-                cl['centroid'] = ((cx*m + x)/(m+1), (cy*m + y)/(m+1), (cz*m + z)/(m+1))
-                cl['members'].append((resid, nfr))
-                assigned = True
-                break
-        if not assigned:
-            clusters.append({'type': rn, 'centroid': p, 'members': [(resid, nfr)]})
-    clusters.sort(key=lambda c: len(c['members']), reverse=True)
+    r2 = float(radius_nm) ** 2
+
+    for i in range(len(pts)):
+        if used[i]:
+            continue
+        # seed a new cluster
+        center = pts[i].copy()
+        members = [i]
+        used[i] = True
+
+        # single-pass greedy merge
+        changed = True
+        while changed:
+            changed = False
+            for j in range(len(pts)):
+                if used[j]:
+                    continue
+                # distance to current center
+                d2 = np.sum((pts[j] - center) ** 2)
+                if d2 <= r2:
+                    members.append(j)
+                    used[j] = True
+                    # update centroid
+                    center = (center * (len(members) - 1) + pts[j]) / len(members)
+                    changed = True
+
+        clusters.append((center, members))
+    # sort by size (desc)
+    clusters.sort(key=lambda c: len(c[1]), reverse=True)
     return clusters
 
-# ---------- PDB writer ----------
-def _write_pdb(base_path: Path, clusters_all, append_to_pdb: Path | None = None):
-    """
-    Write hotspots as pseudo-atoms (HETATM) at cluster centroids.
-    Coordinates are in Å (input is nm → ×10).
-    If append_to_pdb is provided, copy that file first and then append hotspots.
-    """
-    pdb_path = base_path.with_suffix(".pdb")
-    nm_to_A = 10.0
+# -----------------------------
+# PDB writing
+# -----------------------------
 
-    # If appending to an existing PDB, copy content first
-    lines = []
-    if append_to_pdb:
-        src = Path(append_to_pdb)
-        if not src.exists():
-            raise SystemExit(f"--append-to-pdb file not found: {src}")
-        lines = src.read_text().splitlines()
+PROBE_TO_CHAIN = ["I","A","M","C","P","H","U","V","W","X","Y","Z"]  # enough variety
 
-        # Strip possible trailing END/ENDMDL to safely append
-        while lines and lines[-1].strip() in {"END", "ENDMDL"}:
-            lines.pop()
+def _fmt_pdb_atom(serial, name, resn, chain, resid, xA, yA, zA, bfac=1.0, occ=1.0):
+    # name: 4 chars right/aligned (we use 'CEN ')
+    return (f"HETATM{serial:5d} {name:<4s}{resn:>3s} {chain:1s}"
+            f"{resid:>4d}    {xA:8.3f}{yA:8.3f}{zA:8.3f}{occ:6.2f}{bfac:6.2f}          C  \n")
 
-    # Prepare new HETATM records
-    het_lines = []
+def write_hotspot_pdb_trajframe(out_path: Path, per_probe_clusters, title_remark):
+    """Write centroids as standalone PDB in the *trajectory* frame (Å)."""
     serial = 1
-    last_chain = None
-    for idx, (rn, local_rank, cl) in enumerate(clusters_all, start=1):
-        cx, cy, cz = cl['centroid']
-        xA, yA, zA = cx*nm_to_A, cy*nm_to_A, cz*nm_to_A
-        count = len(cl['members'])
-        resname = rn                 # IPA/ACN/… (3-letter)
-        chain  = CHAIN_ID.get(rn, "X")
-        resseq = int(local_rank)     # 1..K within that type
+    with open(out_path, "w") as f:
+        f.write("REMARK 500 HOTSPOT CENTROIDS (trajectory frame)\n")
+        f.write("REMARK 500 B-FACTOR FIELD = number of probe instances in cluster\n")
+        if title_remark:
+            f.write(f"REMARK 500 {title_remark}\n")
+        chain_map = {}
+        for idx, resn in enumerate(per_probe_clusters.keys()):
+            chain_map[resn] = PROBE_TO_CHAIN[idx % len(PROBE_TO_CHAIN)]
+        for resn, clusters in per_probe_clusters.items():
+            chain = chain_map[resn]
+            for rank, (cen_nm, members) in enumerate(clusters, start=1):
+                xA, yA, zA = (cen_nm*10.0).tolist()  # nm → Å
+                f.write(_fmt_pdb_atom(serial, "CEN", resn, chain, rank, xA, yA, zA,
+                                      bfac=float(len(members)), occ=1.00))
+                serial += 1
+            f.write("TER\n")
+        f.write("END\n")
 
-        # Insert TER when chain changes (helps viewers)
-        if last_chain is not None and chain != last_chain:
-            het_lines.append("TER".ljust(80))
-        last_chain = chain
+# -----------------------------
+# Alignment & merged PDB
+# -----------------------------
 
-        # HETATM format (PDB v3). B-factor stores occupancy count for quick visualization.
-        # Columns:  1-6 'HETATM', 7-11 serial, 13-16 atom, 17 alt, 18-20 resName,
-        #           22 chain, 23-26 resSeq, 31-38 x, 39-46 y, 47-54 z, 55-60 occ, 61-66 temp, 77-78 element
-        het = (
-            f"HETATM{serial:5d}  CEN {resname:>3s} {chain:1s}"
-            f"{resseq:4d}    "
-            f"{xA:8.3f}{yA:8.3f}{zA:8.3f}"
-            f"{1.00:6.2f}{min(99.99,float(count)):6.2f}"
-            f"          C "
-        )
-        het_lines.append(het.ljust(80))
-        serial += 1
+def _parse_ca_coords(pdb_path: Path):
+    """Return Nx3 array of CA atom coordinates (Å) in file order."""
+    coords = []
+    with open(pdb_path, "r") as f:
+        for line in f:
+            if line.startswith("ATOM") and line[12:16].strip() == "CA":
+                try:
+                    x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])
+                    coords.append([x, y, z])
+                except Exception:
+                    pass
+    return np.array(coords, dtype=float)
 
-    het_lines.append("TER".ljust(80))
-    het_lines.append("END".ljust(80))
+def _kabsch(P, Q):
+    """Find rotation R, translation t such that P*R + t ≈ Q (both Nx3)."""
+    # centroids
+    cP = P.mean(axis=0)
+    cQ = Q.mean(axis=0)
+    P0 = P - cP
+    Q0 = Q - cQ
+    H = P0.T @ Q0
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    # ensure right-handed
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+    t = cQ - cP @ R
+    return R, t
 
-    # Write final
-    with open(pdb_path, "w") as f:
-        if lines:
-            for ln in lines:
-                f.write(ln.rstrip() + "\n")
-        # header remarks for the hotspot block
-        f.write(f"REMARK 500 HOTSPOT CENTROIDS (per-probe clusters)\n")
-        f.write(f"REMARK 500 B-FACTOR FIELD = number of probe instances in cluster\n")
-        for ln in het_lines:
-            f.write(ln + "\n")
+def write_hotspot_pdb_on_reference(prefix: Path,
+                                   per_probe_clusters,
+                                   trajframe_pdb: Path,
+                                   reference_pdb: Path):
+    """
+    Align trajframe Cα → reference Cα and merge centroids onto reference.
+    Outputs <prefix>_on_<reference-stem>.pdb
+    """
+    # CA sets (Å)
+    P = _parse_ca_coords(trajframe_pdb)
+    Q = _parse_ca_coords(reference_pdb)
+    n = min(len(P), len(Q))
+    if n < 5:
+        print("⚠️  Not enough matching CA atoms to align; skip merged PDB.")
+        return None
+    R, t = _kabsch(P[:n], Q[:n])
 
-    print(f"✅ Wrote: {pdb_path}")
+    # transform centroids (Å)
+    per_probe_A = {}
+    for resn, clusters in per_probe_clusters.items():
+        out = []
+        for cen_nm, members in clusters:
+            vA = cen_nm * 10.0  # nm→Å
+            vA = vA @ R + t
+            out.append((vA, members))
+        per_probe_A[resn] = out
 
-# ---------- CLI & pipeline ----------
+    # read reference PDB to copy atoms
+    ref_lines = []
+    with open(reference_pdb, "r") as f:
+        for line in f:
+            if line.startswith(("ATOM", "HETATM", "TER", "MODEL", "ENDMDL", "REMARK", "HEADER", "TITLE", "COMPND", "SOURCE", "KEYWDS", "EXPDTA")):
+                ref_lines.append(line)
+    # determine next serial
+    max_serial = 0
+    for line in ref_lines:
+        if line.startswith(("ATOM","HETATM")):
+            try:
+                s = int(line[6:11])
+                if s > max_serial: max_serial = s
+            except Exception:
+                pass
+    serial = max_serial + 1
+
+    out_path = prefix.with_name(f"{prefix.name}_on_{Path(reference_pdb).stem}.pdb")
+    with open(out_path, "w") as f:
+        f.write(f"REMARK 500 HOTSPOT CENTROIDS merged onto reference: {Path(reference_pdb).name}\n")
+        f.write("REMARK 500 B-FACTOR FIELD = number of probe instances in cluster\n")
+        # write reference first
+        for line in ref_lines:
+            if not line.startswith("END"):  # avoid duplicate END
+                f.write(line)
+        # append centroids
+        chain_map = {}
+        for idx, resn in enumerate(per_probe_A.keys()):
+            chain_map[resn] = PROBE_TO_CHAIN[idx % len(PROBE_TO_CHAIN)]
+        for resn, items in per_probe_A.items():
+            chain = chain_map[resn]
+            for rank, (vA, members) in enumerate(items, start=1):
+                xA, yA, zA = vA.tolist()
+                f.write(_fmt_pdb_atom(serial, "CEN", resn, chain, rank, xA, yA, zA,
+                                      bfac=float(len(members)), occ=1.00))
+                serial += 1
+            f.write("TER\n")
+        f.write("END\n")
+    return out_path
+
+# -----------------------------
+# Main
+# -----------------------------
+
 def main():
     ap = argparse.ArgumentParser(
-        description="Cluster MixMD probe hotspots (greedy, dependency-free)."
+        description="Greedy cluster MixMD probe centroids and write hotspots (CSV/PDB)."
     )
-    ap.add_argument("--input", required=True,
-                    help="ProbeHotspotReporter CSV, e.g., mixmd_hotspots_no_ligand.csv")
-    ap.add_argument("--radius-nm", type=float, default=0.40,
-                    help="Merge radius in nm (default 0.40)")
-    ap.add_argument("--min-members", type=int, default=3,
-                    help="Min frames per probe instance to keep (default 3)")
-    ap.add_argument("--top-k", type=int, default=3,
-                    help="Top K clusters per probe type to export (default 3)")
-    ap.add_argument("--types", type=str, default=None,
-                    help="Comma-separated probe types to include (accepts aliases). Default: all present.")
-    ap.add_argument("--list-names", action="store_true",
-                    help="Print residue names found in CSV and exit.")
-    ap.add_argument("--append-to-pdb", type=str, default=None,
-                    help="If provided, append hotspot pseudo-atoms to this PDB (useful for quick overlay).")
+    ap.add_argument("--input", required=True, help="mixmd_hotspots*.csv recorded by 5_md_simulation.py")
+    ap.add_argument("--radius-nm", type=float, default=0.40, help="merge radius (nm) for greedy clustering")
+    ap.add_argument("--min-members", type=int, default=3, help="minimum members to keep a cluster")
+    ap.add_argument("--top-k", type=int, default=3, help="top clusters per probe type to write")
+
+    # Alignment / merging options
+    ap.add_argument("--source-pdb", type=str, default=None,
+                    help="PDB in the trajectory frame (auto: final_structure*_no_ligand.pdb). Used for alignment.")
+    ap.add_argument("--reference-pdb", type=str, default=None,
+                    help="Reference receptor PDB to merge onto (auto: combined_receptor_ligand*_no_ligand.pdb, "
+                         "otherwise receptor_cleaned.pdb).")
+    ap.add_argument("--no-merge", action="store_true",
+                    help="Do not write the merged-on-reference PDB; only write the trajectory-frame PDB.")
+
     args = ap.parse_args()
+    in_csv = Path(args.input)
 
-    in_path = Path(args.input)
-    if not in_path.exists():
-        raise SystemExit(f"Input CSV not found: {in_path}")
+    rows = read_hotspot_csv(in_csv)
+    if not rows:
+        raise SystemExit(f"No rows parsed from {in_csv}")
 
-    # Load once for diagnostics
-    all_rows = list(_iter_hotspot_rows(in_path))
+    # time-averaged points per instance (per probe type)
+    per_probe_points = group_time_averages(rows)
 
-    if args.list_names:
-        cnt = Counter(rn for _, rn, _, _, _, _ in all_rows)
-        if not cnt:
-            print("No recognizable probe residues found. Names seen in file may not match expected set.")
+    # cluster per probe & collect top-K (by size)
+    per_probe_clusters = {}
+    vina_boxes = []  # for optional text summary
+    for resn, pts in per_probe_points.items():
+        clusters = greedy_cluster(pts, args.radius_nm)
+        # filter by min-members
+        clusters = [(c, m) for (c, m) in clusters if len(m) >= args.min_members]
+        if not clusters:
+            continue
+        # keep top-K
+        clusters = clusters[: args.top_k]
+        per_probe_clusters[resn] = clusters
+        # quick Vina boxes (Å): center, 22 Å default cube
+        for rank, (cen_nm, members) in enumerate(clusters, start=1):
+            xA, yA, zA = (cen_nm * 10.0).tolist()
+            vina_boxes.append((resn, rank, xA, yA, zA, len(members)))
+
+    if not per_probe_clusters:
+        raise SystemExit("No clusters survived filtering; try a larger --radius-nm or lower --min-members.")
+
+    # filenames
+    prefix = Path(f"hotspots_{in_csv.stem}_r{args.radius_nm:.2f}nm")
+
+    # 1) Trajectory-frame PDB (standalone)
+    write_hotspot_pdb_trajframe(
+        prefix.with_name(f"{prefix.name}_trajframe.pdb"),
+        per_probe_clusters,
+        title_remark=f"radius={args.radius_nm:.2f} nm; min_members={args.min_members}; top_k={args.top_k}"
+    )
+
+    # 2) (optional) merged onto reference receptor PDB
+    if not args.no_merge:
+        # infer defaults
+        src = Path(args.source_pdb) if args.source_pdb else None
+        ref = Path(args.reference_pdb) if args.reference_pdb else None
+
+        if src is None:
+            for cand in ["final_structure_no_ligand.pdb", "final_structure.pdb",
+                         "npt_equilibrated_no_ligand.pdb", "nvt_equilibrated_no_ligand.pdb"]:
+                if Path(cand).exists():
+                    src = Path(cand); break
+        if ref is None:
+            for cand in ["combined_receptor_ligand_no_ligand.pdb",
+                         "combined_receptor_ligand.pdb",
+                         "receptor_cleaned.pdb"]:
+                if Path(cand).exists():
+                    ref = Path(cand); break
+
+        if src and ref and src.exists() and ref.exists():
+            merged = write_hotspot_pdb_on_reference(prefix, per_probe_clusters, src, ref)
+            if merged:
+                print(f"✅ Wrote merged hotspots PDB → {merged}")
+            else:
+                print("⚠️  Merged PDB not written (alignment failed); see warnings above.")
         else:
-            print("Residue names found (canonicalized):")
-            for rn, n in cnt.most_common():
-                print(f"  {rn}: {n} rows")
-        return
+            print(f"⚠️  Missing source/ref PDB(s) for alignment (src={src}, ref={ref}); only trajframe PDB written.")
 
-    if not all_rows:
-        raise SystemExit(
-            f"No rows parsed from {in_path}.\n"
-            f"Tip: run with --list-names to see which residue names are present."
-        )
+    # 3) minimal AutoDock‑Vina boxes summary
+    with open(prefix.with_suffix(".vina.txt"), "w") as f:
+        f.write("# center_x  center_y  center_z  size_x  size_y  size_z  ;  resname  rank  members\n")
+        for resn, rank, xA, yA, zA, n in vina_boxes:
+            f.write(f"{xA:8.3f}  {yA:8.3f}  {zA:8.3f}   22.0  22.0  22.0  ;  {resn}  {rank}  {n}\n")
 
-    # Optional type filter
-    type_filter = None
-    if args.types:
-        user = {t.strip().upper() for t in args.types.split(",") if t.strip()}
-        type_filter = {ALIASES_TO_CANON.get(t, t) for t in user} & set(ALIASES_TO_CANON.values())
-        if not type_filter:
-            print(f"Warning: none of the specified types matched known set {sorted(CANON_SET)}; using all types.")
-            type_filter = None
-
-    # Time-average per probe instance
-    per_inst = _time_average_by_instance(all_rows, min_frames=max(1, args.min_members))
-
-    # Split points by type
-    points_by_type = defaultdict(list)
-    for (rn, resid), (rn_, resid_, nfr, x, y, z) in per_inst.items():
-        if type_filter and rn_ not in type_filter:
-            continue
-        points_by_type[rn_].append((rn_, resid_, nfr, x, y, z))
-
-    if not any(points_by_type.values()):
-        cnt = Counter(rn for _, rn, _, _, _, _ in all_rows)
-        raise SystemExit(
-            "No rows survived filtering.\n"
-            f"  • Present names (counts): {dict(cnt)}\n"
-            f"  • Filter types: {sorted(type_filter) if type_filter else 'None (using all)'}\n"
-            "  • Check that your CSV uses IPA/ACN/IMD/ACM/PHO/HAC (aliases ACEA/PHOL/ACOH also accepted).\n"
-            "  • Or try a smaller --min-members."
-        )
-
-    # Cluster each type
-    clusters_all = []
-    for rn, pts in points_by_type.items():
-        if not pts:
-            continue
-        clusters = _greedy_cluster(pts, radius_nm=float(args.radius_nm))
-        # keep top-k for this rn
-        clusters_all.extend([(rn, i+1, c) for i, c in enumerate(clusters[:max(1, args.top_k)])])
-
-    if not clusters_all:
-        raise SystemExit("No clusters were formed. Try a larger --radius-nm or smaller --min-members.")
-
-    # Write outputs
-    base = f"hotspots_{in_path.stem}_r{float(args.radius_nm):.2f}nm"
-    csv_out = Path(f"{base}.csv")
-    vina_out = Path(f"{base}.vina.txt")
-
-    with open(csv_out, "w", newline="") as f:
+    # 4) CSV summary (same as before)
+    out_csv = prefix.with_suffix(".csv")
+    with open(out_csv, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["rank","type","count","x_nm","y_nm","z_nm","member_resids","member_frames_sum"])
-        rank_global = 1
-        for rn, _, cl in clusters_all:
-            mem = cl['members']
-            count = len(mem)
-            cx, cy, cz = cl['centroid']
-            member_resids = ";".join(str(rid) for rid, _ in mem)
-            frames_sum = sum(nfr for _, nfr in mem)
-            w.writerow([rank_global, rn, count,
-                        f"{cx:.3f}", f"{cy:.3f}", f"{cz:.3f}",
-                        member_resids, frames_sum])
-            rank_global += 1
+        w.writerow(["probe", "rank", "members", "x_A", "y_A", "z_A"])
+        for resn, clusters in per_probe_clusters.items():
+            for rank, (cen_nm, members) in enumerate(clusters, start=1):
+                xA, yA, zA = (cen_nm * 10.0).tolist()
+                w.writerow([resn, rank, len(members), f"{xA:.3f}", f"{yA:.3f}", f"{zA:.3f}"])
 
-    with open(vina_out, "w") as f:
-        f.write("# AutoDock Vina boxes (center in nm; convert to Å by ×10 if needed)\n")
-        for idx, (rn, _, cl) in enumerate(clusters_all, start=1):
-            cx, cy, cz = cl['centroid']
-            f.write(f"name=HOTSPOT_{rn}_{idx}\n")
-            f.write(f"center_x_nm={cx:.4f}\ncenter_y_nm={cy:.4f}\ncenter_z_nm={cz:.4f}\n")
-            f.write("size_x_A=30\nsize_y_A=30\nsize_z_A=30\n\n")
-
-    print(f"✅ Wrote: {csv_out}")
-    print(f"✅ Wrote: {vina_out}")
-
-    # --- NEW: PDB with pseudo-atoms at cluster centroids ---
-    _write_pdb(Path(base), clusters_all,
-               append_to_pdb=(Path(args.append_to_pdb) if args.append_to_pdb else None))
+    print(f"✅ Hotspots CSV   → {out_csv}")
+    print(f"✅ Hotspots PDB   → {prefix.name}_trajframe.pdb")
+    if not args.no_merge and Path(f"{prefix.name}_on_{Path(ref).stem}.pdb").exists():
+        print(f"✅ Hotspots PDB   → {prefix.name}_on_{Path(ref).stem}.pdb (aligned & merged)")
 
 if __name__ == "__main__":
     main()
