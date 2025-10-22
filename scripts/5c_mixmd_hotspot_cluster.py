@@ -176,33 +176,88 @@ def _parse_ca_coords(pdb_path: Path):
                     pass
     return np.array(coords, dtype=float)
 
+# --- replace the simple CA parser & Kabsch block with this robust version ---
+
 def _parse_ca_indexed(pdb_path: Path):
     """
-    Map (chainID, resSeq, iCode) -> 3D coordinate (Å).
-    This makes the CA pairing robust to reordering and missing residues.
+    Parse Cα atoms from a PDB and return:
+      - a dict: {(chain, resSeq, iCode) -> np.array([x,y,z]) in Å}
+      - a list of coords in file order (for optional NN fallback)
+    Rules:
+      - altLoc must be blank or 'A'
+      - atom name exactly 'CA'
     """
-    out = {}
+    ca_dict = {}
+    ca_list = []
     with open(pdb_path, "r") as f:
         for line in f:
-            if line.startswith("ATOM") and line[12:16].strip() == "CA":
-                try:
-                    chain = line[21:22]
-                    resSeq = int(line[22:26])
-                    iCode  = line[26:27]  # insertion code
-                    x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])
-                except Exception:
-                    continue
-                out[(chain, resSeq, iCode)] = np.array([x, y, z], dtype=float)
-    return out
+            if not line.startswith("ATOM"):
+                continue
+            if line[12:16].strip() != "CA":
+                continue
+            altloc = line[16].strip()  # PDB col 17
+            if altloc not in ("", "A"):
+                continue
+            try:
+                chain = line[21].strip() or "_"
+                resseq = int(line[22:26])
+                icode  = line[26].strip() or ""
+                x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])
+            except Exception:
+                continue
+            key = (chain, resseq, icode)
+            v = np.array([x, y, z], dtype=float)
+            ca_dict[key] = v
+            ca_list.append(v)
+    return ca_dict, (np.vstack(ca_list) if ca_list else np.zeros((0,3), float))
+
+
+def _pair_ca_by_ids(src_dict, ref_dict):
+    """Return matched arrays P (src) and Q (ref) by intersecting residue IDs."""
+    keys = sorted(set(src_dict.keys()) & set(ref_dict.keys()),
+                  key=lambda k: (k[0], k[1], k[2]))
+    P = np.array([src_dict[k] for k in keys], dtype=float) if keys else np.zeros((0,3), float)
+    Q = np.array([ref_dict[k] for k in keys], dtype=float) if keys else np.zeros((0,3), float)
+    return P, Q
+
+
+def _pair_ca_by_nearest(src_all, ref_all, max_dist_A=5.0):
+    """
+    Greedy nearest-neighbor pairing (no SciPy). Returns paired P, Q.
+    max_dist_A: only accept pairs within this distance (Å).
+    """
+    if src_all.size == 0 or ref_all.size == 0:
+        return np.zeros((0,3), float), np.zeros((0,3), float)
+
+    # pairwise squared distances (N_src x N_ref)
+    # D_ij = ||s_i - r_j||^2
+    s2 = np.sum(src_all**2, axis=1)[:, None]
+    r2 = np.sum(ref_all**2, axis=1)[None, :]
+    D = s2 + r2 - 2.0 * (src_all @ ref_all.T)
+
+    used_ref = set()
+    pairs = []
+    for i in range(D.shape[0]):
+        j = int(np.argmin(D[i]))
+        d2 = float(D[i, j])
+        if j not in used_ref and d2 <= max_dist_A*max_dist_A:
+            pairs.append((i, j))
+            used_ref.add(j)
+
+    if not pairs:
+        return np.zeros((0,3), float), np.zeros((0,3), float)
+
+    P = np.array([src_all[i] for i, _ in pairs], dtype=float)
+    Q = np.array([ref_all[j] for _, j in pairs], dtype=float)
+    return P, Q
+
 
 def _kabsch(P, Q):
-    """
-    Find rotation R and translation t that best superpose P onto Q (both Nx3).
-    Returns R (3x3), t (3,), and RMSD after the fit.
-    """
-    P = np.asarray(P, float); Q = np.asarray(Q, float)
-    cP = P.mean(axis=0); cQ = Q.mean(axis=0)
-    P0 = P - cP; Q0 = Q - cQ
+    """Find R, t (row-vector form) such that P @ R + t ≈ Q."""
+    cP = P.mean(axis=0)
+    cQ = Q.mean(axis=0)
+    P0 = P - cP
+    Q0 = Q - cQ
     H = P0.T @ Q0
     U, S, Vt = np.linalg.svd(H)
     R = Vt.T @ U.T
@@ -210,55 +265,66 @@ def _kabsch(P, Q):
         Vt[-1, :] *= -1
         R = Vt.T @ U.T
     t = cQ - cP @ R
-    P_fit = P @ R + t
-    rmsd = np.sqrt(((P_fit - Q)**2).sum(axis=1).mean())
-    return R, t, rmsd
-# ---------------------------------------------------------------------------
+    return R, t
+
+
+def _align_pairs_iterative(P, Q, prune_A=3.0, iters=3):
+    """
+    Iterative Kabsch with outlier pruning.
+    Returns (R, t, rmsd_after, n_used).
+    """
+    if len(P) < 3 or len(Q) < 3:
+        return np.eye(3), np.zeros(3), np.inf, 0
+    mask = np.ones(len(P), dtype=bool)
+    R = np.eye(3); t = np.zeros(3)
+    for _ in range(iters):
+        if mask.sum() < 3:
+            break
+        R, t = _kabsch(P[mask], Q[mask])
+        P_aln = (P @ R) + t
+        d = np.linalg.norm(P_aln - Q, axis=1)
+        mask = d < prune_A
+    rmsd = float(np.sqrt(np.mean(((P @ R + t) - Q)**2)))
+    return R, t, rmsd, int(mask.sum())
+
 
 def write_hotspot_pdb_on_reference(prefix: Path,
                                    per_probe_clusters,
                                    trajframe_pdb: Path,
                                    reference_pdb: Path):
     """
-    Align trajframe receptor to reference using CA pairs matched by (chain,resSeq,iCode),
-    then merge centroids onto the reference. Falls back to translation-only if the
-    rotational fit looks unreliable.
+    Align Cα of trajframe (e.g., final_structure*.pdb) → reference (e.g., combined_receptor*.pdb)
+    using residue-ID matching, with NN/ICP fallback; then merge centroids onto the reference.
+    Output: <prefix>_on_<reference-stem>.pdb
     """
-    # 1) build indexed CA maps
-    src_map = _parse_ca_indexed(trajframe_pdb)
-    ref_map = _parse_ca_indexed(reference_pdb)
-    shared_keys = sorted(set(src_map.keys()) & set(ref_map.keys()),
-                         key=lambda k: (k[0], k[1], k[2]))
-    if len(shared_keys) < 5:
-        print(f"⚠️  Alignment skipped: only {len(shared_keys)} matched CA pairs.")
+    src_dict, src_all = _parse_ca_indexed(trajframe_pdb)
+    ref_dict, ref_all = _parse_ca_indexed(reference_pdb)
+
+    P, Q = _pair_ca_by_ids(src_dict, ref_dict)
+    mode = "id"
+    if len(P) < 5:  # not enough common IDs; fall back to NN pairing
+        P, Q = _pair_ca_by_nearest(src_all, ref_all, max_dist_A=5.0)
+        mode = "nn"
+
+    if len(P) < 5:
+        print(f"⚠️  Alignment failed: only {len(P)} CA pairs (mode={mode}). Skipping merged PDB.")
         return None
 
-    P = np.vstack([src_map[k] for k in shared_keys])
-    Q = np.vstack([ref_map[k] for k in shared_keys])
+    # report pre-RMSD
+    pre_rmsd = float(np.sqrt(np.mean((P - Q)**2)))
+    R, t, post_rmsd, n_used = _align_pairs_iterative(P, Q, prune_A=3.0, iters=3)
+    print(f"[align] mode={mode} pairs={len(P)} used={n_used}  RMSD_before={pre_rmsd:.2f} Å  RMSD_after={post_rmsd:.2f} Å")
 
-    # 2) fit & sanity-check
-    R, t, rmsd = _kabsch(P, Q)
-    # conservative guard: if RMSD is huge, rotation is probably wrong
-    use_rotation = rmsd <= 5.0  # Å threshold; tweak if needed
-
-    if use_rotation:
-        print(f"[5c] Kabsch CA pairs: {len(shared_keys)} ; post-fit RMSD = {rmsd:.2f} Å")
-    else:
-        print(f"⚠️  Post-fit RMSD is high ({rmsd:.1f} Å). Falling back to translation-only.")
-        # translation-only from CA centroids
-        t = Q.mean(axis=0) - P.mean(axis=0)
-
-    # 3) transform centroids from nm to Å and apply transform
+    # transform centroids (nm → Å) then apply R,t
     per_probe_A = {}
     for resn, clusters in per_probe_clusters.items():
-        transformed = []
+        out = []
         for cen_nm, members in clusters:
-            vA = cen_nm * 10.0  # nm → Å
-            vA = (vA @ R + t) if use_rotation else (vA + t)
-            transformed.append((vA, members))
-        per_probe_A[resn] = transformed
+            vA = (cen_nm * 10.0) @ R + t
+            out.append((vA, members))
+        per_probe_A[resn] = out
 
-    # 4) read reference PDB and append CEN atoms
+    # read reference PDB and determine next serial
     ref_lines = []
     with open(reference_pdb, "r") as f:
         for line in f:
@@ -269,37 +335,36 @@ def write_hotspot_pdb_on_reference(prefix: Path,
     for line in ref_lines:
         if line.startswith(("ATOM", "HETATM")):
             try:
-                s = int(line[6:11]); max_serial = max(max_serial, s)
+                max_serial = max(max_serial, int(line[6:11]))
             except Exception:
                 pass
     serial = max_serial + 1
 
-    PROBE_TO_CHAIN = ["I","A","M","C","P","H","U","V","W","X","Y","Z"]
-    def _fmt_pdb_atom(serial, name, resn, chain, resid, xA, yA, zA, bfac=1.0, occ=1.0):
-        # altLoc left blank; name 'CEN ' to avoid altLoc interpretation
-        return (f"HETATM{serial:5d} {name:<4s}{resn:>3s} {chain:1s}"
-                f"{resid:>4d}    {xA:8.3f}{yA:8.3f}{zA:8.3f}{occ:6.2f}{bfac:6.2f}          C  \n")
-
     out_path = prefix.with_name(f"{prefix.name}_on_{Path(reference_pdb).stem}.pdb")
+    PROBE_TO_CHAIN = ["I","A","M","C","P","H","U","V","W","X","Y","Z"]
+    chain_map = {}
+
     with open(out_path, "w") as f:
         f.write(f"REMARK 500 HOTSPOT CENTROIDS merged onto reference: {Path(reference_pdb).name}\n")
         f.write("REMARK 500 B-FACTOR FIELD = number of probe instances in cluster\n")
         for line in ref_lines:
             if not line.startswith("END"):
                 f.write(line)
-        chain_map = {resn: PROBE_TO_CHAIN[i % len(PROBE_TO_CHAIN)]
-                     for i, resn in enumerate(per_probe_A.keys())}
+        for idx, resn in enumerate(per_probe_A.keys()):
+            chain_map[resn] = PROBE_TO_CHAIN[idx % len(PROBE_TO_CHAIN)]
         for resn, items in per_probe_A.items():
             chain = chain_map[resn]
             for rank, (vA, members) in enumerate(items, start=1):
                 xA, yA, zA = vA.tolist()
-                f.write(_fmt_pdb_atom(serial, "CEN ", resn, chain, rank,
-                                      xA, yA, zA, bfac=float(len(members)), occ=1.00))
+                # HETATM record with proper column alignment; altLoc blank.
+                f.write(
+                    f"HETATM{serial:5d} {'CEN':<4s}{resn:>3s} {chain:1s}{rank:4d}    "
+                    f"{xA:8.3f}{yA:8.3f}{zA:8.3f}{1.00:6.2f}{float(len(members)):6.2f}          C  \n"
+                )
                 serial += 1
             f.write("TER\n")
         f.write("END\n")
     return out_path
-
 
 # -----------------------------
 # Main
