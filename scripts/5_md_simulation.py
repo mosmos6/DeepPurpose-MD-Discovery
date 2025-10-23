@@ -385,7 +385,7 @@ if args.mixmd_from_packmol:
         modeller=modeller,
         forcefield=forcefield,
         receptor_path=receptor_path,
-        sim_box_nm=float(args.mixmd_box_size_n m),  # <-- ensure no stray space in your editor
+        sim_box_nm=float(args.mixmd_box_size_nm),  
         edge_margin_nm=float(args.mixmd_edge_margin_nm),
         placements_csv=(Path(args.mixmd_placements_csv) if args.mixmd_placements_csv else None),
         resname_list=resnames
