@@ -495,7 +495,7 @@ print(f"✅ System ready for solvation ({'apo' if args.no_ligand else 'holo'})")
 # ---------------------------
 # Solvate
 # ---------------------------
-box_edge = float(args.mixmd_box_size_n m if args.mixmd_from_packmol else 7.0)
+box_edge = float(args.mixmd_box_size_nm if args.mixmd_from_packmol else 7.0)
 modeller.addSolvent(
     forcefield,
     model="tip3p",
