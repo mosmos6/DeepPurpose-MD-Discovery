@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # Author: Iori Mochizuki + patch
 # Updated: 2025-10-22
 # Description: Run docking with AutoDock Vina for one or many ligands.
