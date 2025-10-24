@@ -552,21 +552,7 @@ simulation.reporters.append(PDBReporter(f"npt_equilibrated{suffix}.pdb", 500))
 simulation.step(2500)  # 5 ps
 
 print(f"🔥 Production MD: {args.n_steps:,} steps")
-# --- DCD reference structure (write at the moment we start DCD) ---
-# This snapshot has exactly the same atom order/count ChimeraX will expect.
-prod_state = simulation.context.getState(getPositions=True, enforcePeriodicBox=True)
-ref_pdb = f"production_start_structure{suffix}.pdb"
-ref_cif = f"production_start_structure{suffix}.cif"
 
-with open(ref_pdb, "w") as f:
-    PDBFile.writeFile(simulation.topology, prod_state.getPositions(), f)
-
-# Keep mmCIF too (useful when atom serials exceed 99,999)
-with open(ref_cif, "w") as f:
-    PDBxFile.writeFile(simulation.topology, prod_state.getPositions(), f)
-
-print(f"📌 DCD reference written → {ref_pdb} (and {ref_cif})")
-# ------------------------------------------------------------------
 simulation.reporters.append(DCDReporter(f"production_md{suffix}.dcd", 1000))
 simulation.reporters.append(StateDataReporter(f"production_md{suffix}.log", 1000, step=True, potentialEnergy=True, temperature=True))
 simulation.step(args.n_steps)
