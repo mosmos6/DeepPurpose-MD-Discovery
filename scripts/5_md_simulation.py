@@ -264,7 +264,7 @@ def _com_of(positions, idxs):
     if n == 0: return (0.0, 0.0, 0.0)
     return (sx/n, sy/n, sz/n)
 
-def _append_hotspots_csv(fh, step, positions, groups, resid_map, recenter_dxdy dz):
+def _append_hotspots_csv(fh, step, positions, groups, resid_map, recenter_dxdy):
     dx, dy, dz = recenter_dxdy
     for (idxs, (resname, resid)) in zip(groups, resid_map):
         sx = sy = sz = 0.0
