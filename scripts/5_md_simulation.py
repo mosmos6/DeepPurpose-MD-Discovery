@@ -1,248 +1,118 @@
 # 5_md_simulation.py
-# Author: Iori Mochizuki + collaborator
-# Updated: 2025-10-24
-# Description: OpenMM MD (protein/RNA/multi‑ligand) with optional MixMD-from-Packmol import.
-# - MixMD: reads build/<receptor>_mixmd_placements.csv, crops to MD box, parametrizes probes (SMIRNOFF),
-#   adds them before solvation, logs probe centroids over time (receptor-centered) to CSV.
-# - Multi‑ligand: auto-detect ligand_*.sdf (or use --input-ligand), parametrizes & adds all ligands.
-# - Robust to OpenMM unit-math shadowing of Python builtins (uses plain loops / builtins explicitly).
-# - Writes both PDB snapshots and final mmCIF (avoids 5-digit PDB serial overflow).
-
-import argparse, csv, glob, builtins as _py
+# Author: Iori Mochizuki (pipeline owner) + collaborator patch
+# Updated: 2025-10-23
+#
+# OpenMM MD (protein/RNA/ligand) with:
+#  - Multi-ligand support (auto-discovers ligand_*.sdf; falls back to ligand.sdf)
+#  - MixMD-from-Packmol (adds cosolvent probes; logs probe centroids to CSV)
+#  - Robust hotspot logging (segmented stepping; no reporter scheduling pitfalls)
+#  - Auto mmCIF write for large systems (avoids PDB overflow warnings)
+#
+# File names remain as in your pipeline where possible:
+#   combined_receptor_ligand[_no_ligand].pdb/.cif
+#   solvated_receptor_ligand[_no_ligand].pdb/.cif
+#   minimized[_no_ligand].pdb       nvt_equilibrated[_no_ligand].pdb
+#   npt_equilibrated[_no_ligand].pdb production_md[_no_ligand].dcd/.log
+#   final_structure[_no_ligand].pdb/.cif
+#   mixmd_hotspots[_no_ligand].csv  (when --mixmd-from-packmol)
+#
+import argparse, csv, glob, os
 from pathlib import Path
 from sys import stdout
 
 import openmm as mm
 from openmm.app import *
 from openmm import MonteCarloBarostat, LangevinMiddleIntegrator
-import openmm.unit as u  # avoid wildcard; use u.nanometer, etc.
-
+from openmm.unit import *
 from openmmforcefields.generators import SMIRNOFFTemplateGenerator
 
 from openff.toolkit.topology import Molecule, Topology as OFFTopology
 from openff.units.openmm import to_openmm
 
 # ---------------------------
-# Utilities
-# ---------------------------
-
-def _count_atoms(top: Topology) -> int:
-    # Avoid OpenMM's unit-math sum() by using a plain loop
-    n = 0
-    for _ in top.atoms():
-        n += 1
-    return n
-
-def _list_residue_names(top: Topology):
-    names = []
-    for r in top.residues():
-        names.append((r.chain.id if hasattr(r, "chain") else "", (r.name or "").upper().strip()))
-    return names
-
-def _glob_ligands(default: str | None):
-    paths = []
-    if default:
-        p = Path(default)
-        if p.exists():
-            paths.append(p)
-    # auto-discover ligand_*.sdf
-    for p in sorted(Path(".").glob("ligand_*.sdf")):
-        if p not in paths:
-            paths.append(p)
-    # fallback to ligand.sdf if nothing else
-    if not paths and Path("ligand.sdf").exists():
-        paths.append(Path("ligand.sdf"))
-    return paths
-
-# ---------------------------
-# Hotspot reporter (receptor-centered)
+# MixMD probe library
 # ---------------------------
 PROBE_LIBRARY = {
-    "IPA":  "CC(C)O",
-    "ACN":  "CC#N",
-    "IMD":  "c1[nH]cnc1",
-    "ACM":  "CC(=O)N",
-    "PHO":  "c1ccc(cc1)O",
-    "HAC":  "CC(=O)O",
-    # Legacy aliases accepted elsewhere:
+    # canonical 3-letter → SMILES
+    "IPA":  "CC(C)O",           # isopropanol
+    "ACN":  "CC#N",             # acetonitrile
+    "IMD":  "c1[nH]cnc1",       # imidazole (neutral, N1–H)
+    "ACM":  "CC(=O)N",          # acetamide
+    "PHO":  "c1ccc(cc1)O",      # phenol
+    "HAC":  "CC(=O)O",          # acetic acid
+    # legacy aliases (accepted on CLI)
     "ACEA": "CC(=O)N",
     "PHOL": "c1ccc(cc1)O",
     "ACOH": "CC(=O)O",
 }
 PROBE_NAME_SET = set(PROBE_LIBRARY.keys())
 
-class ProbeHotspotReporter:
-    """
-    Write probe residue centroids (nm) every 'reportInterval' steps to CSV.
-    Columns: step,resname,resid,x_nm,y_nm,z_nm
-
-    Logs in a receptor-centered frame:
-      centroid' = centroid - COM_protein(t) + COM_protein(0),
-    where COM_protein uses protein Cα atoms (fallback: all protein heavy atoms).
-    """
-    def __init__(self, file_path, reportInterval, topology, probe_resnames=None, center_mode="protein-com"):
-        self.file = open(file_path, "w")
-        self.reportInterval = int(reportInterval)
-        self.center_mode = center_mode
-        self._have_ref_com = False
-        self._ref_com = (0.0, 0.0, 0.0)
-
-        # discover probe residue names present
-        present = {(res.name or "").upper().strip() for res in topology.residues()}
-        auto_names = present & PROBE_NAME_SET
-        if probe_resnames:
-            user_names = {s.upper().strip() for s in probe_resnames}
-            self.probe_res = auto_names | (user_names & PROBE_NAME_SET)
-        else:
-            self.probe_res = auto_names
-
-        # index groups to average probe centroids per residue
-        groups, resid_map = [], []
-        protein_resname_set = {
-            "ALA","ARG","ASN","ASP","CYS","GLN","GLU","GLY","HIS","ILE",
-            "LEU","LYS","MET","PHE","PRO","SER","THR","TRP","TYR","VAL"
-        }
-        self._protein_anchor_indices = []
-        for res in topology.residues():
-            rn = (res.name or "").upper().strip()
-
-            if rn in self.probe_res:
-                idxs = [a.index for a in res.atoms()]
-                if idxs:
-                    groups.append(idxs)
-                    resid_map.append((rn, int(res.id) if res.id is not None else 0))
-
-            # collect protein Cα as anchors
-            if rn in protein_resname_set:
-                for a in res.atoms():
-                    nm = (a.name or "").upper()
-                    if nm == "CA":
-                        self._protein_anchor_indices.append(a.index)
-
-        # Fallback: all non-H protein atoms if no CA found
-        if not self._protein_anchor_indices:
-            for res in topology.residues():
-                rn = (res.name or "").upper().strip()
-                if rn in protein_resname_set:
-                    for a in res.atoms():
-                        if a.element is None or a.element.symbol == "H":
-                            continue
-                        self._protein_anchor_indices.append(a.index)
-
-        self.groups = groups
-        self.resid_map = resid_map
-
-        # header + diagnostic
-        self.file.write("# tracking_resnames=" + ";".join(sorted(self.probe_res)) + "\n")
-        self.file.write("# center_mode=" + str(self.center_mode) + "\n")
-        self.file.write("step,resname,resid,x_nm,y_nm,z_nm\n")
-        self.file.flush()
-
-    def describeNextReport(self, simulation):
-        # (steps, positions, velocities, forces, energies, enforcePeriodicBox)
-        return (self.reportInterval, True, False, False, False, True)
-
-    @staticmethod
-    def _com_of_indices(positions, idxs):
-        sx = sy = sz = 0.0
-        n = 0
-        for i in idxs:
-            v = positions[i]
-            sx += float(v.x); sy += float(v.y); sz += float(v.z)
-            n += 1
-        if n == 0:
-            return (0.0, 0.0, 0.0)
-        return (sx/n, sy/n, sz/n)
-
-    def report(self, simulation, state):
-        pos = state.getPositions(asNumpy=False)  # list of Vec3 (nm)
-
-        # robust step retrieval
-        try:
-            step = int(simulation.currentStep)  # OpenMM ≥7.5
-        except Exception:
-            try:
-                t  = state.getTime()
-                dt = simulation.integrator.getStepSize()
-                step = int(round((t/dt)))
-            except Exception:
-                step = -1
-
-        # receptor-centered recentering
-        if self.center_mode == "protein-com" and self._protein_anchor_indices:
-            com_now = self._com_of_indices(pos, self._protein_anchor_indices)
-            if not self._have_ref_com:
-                self._ref_com = com_now
-                self._have_ref_com = True
-            dx = self._ref_com[0] - com_now[0]
-            dy = self._ref_com[1] - com_now[1]
-            dz = self._ref_com[2] - com_now[2]
-        else:
-            dx = dy = dz = 0.0
-
-        # write probe centroids
-        for (idxs, (resname, resid)) in zip(self.groups, self.resid_map):
-            sx = sy = sz = 0.0
-            n = 0
-            for i in idxs:
-                v = pos[i]  # Vec3 (nm)
-                sx += float(v.x); sy += float(v.y); sz += float(v.z)
-                n += 1
-            if n > 0:
-                self.file.write(f"{step},{resname},{resid},{sx/n+dx:.5f},{sy/n+dy:.5f},{sz/n+dz:.5f}\n")
-        self.file.flush()
-
-    def __del__(self):
-        try:
-            self.file.close()
-        except Exception:
-            pass
-
 # ---------------------------
-# Packmol placements → add probes
+# Small IO helpers
 # ---------------------------
-
-def _default_packmol_csv(receptor_path: Path):
+def _default_packmol_csv(receptor_path: Path) -> Path:
     root = f"{receptor_path.stem}_mixmd"
     return Path("build") / f"{root}_placements.csv"
 
-def _openff_conf_to_angstrom_list(off_mol: Molecule):
-    # Return list[(x,y,z)_Å] from OpenFF conformer without NumPy/JAX
-    conf = off_mol.conformers[0]
-    try:
-        arr = conf.to("angstrom").m
-        return [(float(r[0]), float(r[1]), float(r[2])) for r in arr]
-    except Exception:
-        q = to_openmm(conf)  # Quantity(list(Vec3), angstrom)
-        out = []
-        for v in q.value_in_unit(u.angstrom):
-            out.append((float(v[0]), float(v[1]), float(v[2])))
-        return out
+def _write_structure_auto(topology, positions, stem: str) -> str:
+    """
+    Write PDB for smaller systems; mmCIF for very large (to avoid PDB overflow).
+    Returns the written file path.
+    """
+    n_atoms = topology.getNumAtoms()
+    n_res   = sum(1 for _ in topology.residues())
+    # PDB column limits: 99999 atoms / 9999 residues
+    if n_atoms > 99999 or n_res > 9999:
+        out = f"{stem}.cif"
+        with open(out, "w") as fh:
+            PDBxFile.writeFile(topology, positions, fh)
+    else:
+        out = f"{stem}.pdb"
+        with open(out, "w") as fh:
+            PDBFile.writeFile(topology, positions, fh)
+    return out
 
-def _positions_for_centroid_nm(off_mol: Molecule, centroid_nm_tuple):
-    coords_A = _openff_conf_to_angstrom_list(off_mol)
-    n = len(coords_A)
-    if n == 0:
-        raise ValueError("OFF molecule has no coordinates.")
+# ---------------------------
+# Multi‑ligand discovery & merge
+# ---------------------------
+def _discover_ligand_sdfs() -> list[Path]:
+    # prefer enumerated set ligand_*.sdf; fallback to single ligand.sdf
+    paths = sorted(Path(".").glob("ligand_*.sdf"),
+                   key=lambda p: (len(p.stem), p.stem))
+    if paths:
+        return paths
+    if Path("ligand.sdf").exists():
+        return [Path("ligand.sdf")]
+    return []
 
-    # centroid in Å
-    sx = sy = sz = 0.0
-    for xA, yA, zA in coords_A:
-        sx += xA; sy += yA; sz += zA
-    cx = sx / n; cy = sy / n; cz = sz / n
+def _merge_ligands_into_modeller(modeller: Modeller, forcefield: ForceField, sdf_paths: list[Path]) -> int:
+    """
+    Parameterize all ligands (SMIRNOFF) and append to modeller with their conformer positions.
+    Returns number of ligands added.
+    """
+    if not sdf_paths:
+        return 0
+    off_mols = []
+    for sdf in sdf_paths:
+        m = Molecule.from_file(str(sdf))
+        if not m.conformers:
+            # ensure at least one conformer exists for placement
+            m.generate_conformers(n_conformers=1)
+        off_mols.append(m)
+    # register one SMIRNOFF generator for all ligands present
+    forcefield.registerTemplateGenerator(SMIRNOFFTemplateGenerator(molecules=off_mols).generator)
 
-    tx, ty, tz = (float(centroid_nm_tuple[0]),
-                  float(centroid_nm_tuple[1]),
-                  float(centroid_nm_tuple[2]))
+    added = 0
+    for m in off_mols:
+        top = OFFTopology.from_molecules([m]).to_openmm()
+        pos = to_openmm(m.conformers[0])
+        modeller.add(top, pos)
+        added += 1
+    return added
 
-    placed = []
-    for xA, yA, zA in coords_A:
-        xnm = (xA - cx) * 0.1 + tx
-        ynm = (yA - cy) * 0.1 + ty
-        znm = (zA - cz) * 0.1 + tz
-        placed.append(mm.Vec3(xnm, ynm, znm))
-    return [p * u.nanometer for p in placed]
-
+# ---------------------------
+# Packmol → add probes
+# ---------------------------
 def _read_centroids_csv(csv_path: Path):
     rows = []
     with open(csv_path, newline="") as f:
@@ -257,17 +127,38 @@ def _read_centroids_csv(csv_path: Path):
             })
     return rows
 
+def _openff_conf_to_angstrom_list(off_mol):
+    conf = off_mol.conformers[0]
+    try:
+        arr = conf.to("angstrom").m  # Pint path
+        return [(float(r[0]), float(r[1]), float(r[2])) for r in arr]
+    except Exception:
+        q = to_openmm(conf)  # OpenMM Quantity(list(Vec3), angstrom)
+        return [(float(v[0]), float(v[1]), float(v[2])) for v in q.value_in_unit(angstrom)]
+
+def _positions_for_centroid_nm(off_mol, centroid_nm_tuple):
+    coords_A = _openff_conf_to_angstrom_list(off_mol)
+    n = len(coords_A)
+    sx = sy = sz = 0.0
+    for xA, yA, zA in coords_A:
+        sx += xA; sy += yA; sz += zA
+    cx = sx / n; cy = sy / n; cz = sz / n
+    tx, ty, tz = float(centroid_nm_tuple[0]), float(centroid_nm_tuple[1]), float(centroid_nm_tuple[2])
+    placed = []
+    for xA, yA, zA in coords_A:
+        xnm = (xA - cx) * 0.1 + tx
+        ynm = (yA - cy) * 0.1 + ty
+        znm = (zA - cz) * 0.1 + tz
+        placed.append(mm.Vec3(xnm, ynm, znm))
+    return [p * nanometer for p in placed]
+
 def _add_probes_from_packmol(modeller: Modeller,
                              forcefield: ForceField,
                              receptor_path: Path,
                              sim_box_nm: float,
                              edge_margin_nm: float,
-                             placements_csv: Path | None = None,
-                             resname_list: list[str] | None = None) -> int:
-    """
-    Add probes at Packmol centroids cropped to the intended MD box.
-    Rename newly added residues to their probe resname (IPA/ACN/...).
-    """
+                             placements_csv: Path | None,
+                             resname_list: list[str] | None) -> int:
     if placements_csv is None:
         placements_csv = _default_packmol_csv(receptor_path)
     print(f"ℹ️  MixMD inputs: CSV={placements_csv}")
@@ -277,10 +168,9 @@ def _add_probes_from_packmol(modeller: Modeller,
     half = 0.5 * float(sim_box_nm)
     keep_lo = - (half - float(edge_margin_nm))
     keep_hi = + (half - float(edge_margin_nm))
-
     whitelist = {r.upper().strip() for r in resname_list} if resname_list else None
 
-    rows = []
+    kept = []
     for rec in _read_centroids_csv(placements_csv):
         resname = rec["resname"]
         if resname not in PROBE_LIBRARY:
@@ -289,48 +179,43 @@ def _add_probes_from_packmol(modeller: Modeller,
             continue
         x, y, z = rec["x_nm"], rec["y_nm"], rec["z_nm"]
         if (keep_lo <= x <= keep_hi) and (keep_lo <= y <= keep_hi) and (keep_lo <= z <= keep_hi):
-            rows.append((resname, rec["resid"], (x, y, z)))
+            kept.append((resname, rec["resid"], (x, y, z)))
 
-    if not rows:
-        print("⚠️  No probe centroids inside the target box; continuing with receptor-only.")
+    if not kept:
+        print("⚠️  No probe centroids inside the MD box; continuing with receptor-only.")
         return 0
 
-    used_res = sorted({res for (res, _, _) in rows})
+    used_res = sorted({res for (res, _, _) in kept})
     off_mols = []
     for res in used_res:
-        off = Molecule.from_smiles(PROBE_LIBRARY[res], allow_undefined_stereo=True)
-        off.generate_conformers(n_conformers=1)
-        off.name = res
-        off_mols.append(off)
-    smirnoff = SMIRNOFFTemplateGenerator(molecules=off_mols)
-    forcefield.registerTemplateGenerator(smirnoff.generator)
+        m = Molecule.from_smiles(PROBE_LIBRARY[res], allow_undefined_stereo=True)
+        m.generate_conformers(n_conformers=1)
+        m.name = res
+        off_mols.append(m)
+    forcefield.registerTemplateGenerator(SMIRNOFFTemplateGenerator(molecules=off_mols).generator)
 
     top_cache = {m.name: OFFTopology.from_molecules([m]).to_openmm() for m in off_mols}
     mol_cache = {m.name: m for m in off_mols}
 
+    # helper to see new residues for renaming
     def _res_list():
         return list(modeller.topology.residues())
 
     added = 0
-    for (resname, pack_resid, cen_nm) in rows:
+    for (resname, pack_resid, cen_nm) in kept:
         top = top_cache[resname]
         off = mol_cache[resname]
         pos = _positions_for_centroid_nm(off, cen_nm)
 
-        before_res = len(_res_list())
+        before = len(_res_list())
         modeller.add(top, pos)
-        after = _res_list()
+        tail = _res_list()[before:]
 
-        new_res = after[before_res:]
-        for res in new_res:
-            try:
-                res.name = resname
-            except Exception:
-                pass
-            try:
-                res.id = str(pack_resid)
-            except Exception:
-                pass
+        for res in tail:
+            try: res.name = resname
+            except Exception: pass
+            try: res.id = str(pack_resid)
+            except Exception: pass
 
         added += 1
 
@@ -338,30 +223,160 @@ def _add_probes_from_packmol(modeller: Modeller,
     return added
 
 # ---------------------------
+# Hotspot logging (no reporter scheduling)
+# ---------------------------
+def _build_probe_groups(topology, allowed_names: set[str]):
+    groups, resid_map = [], []
+    for res in topology.residues():
+        rn = (res.name or "").upper().strip()
+        if rn in allowed_names:
+            idxs = [a.index for a in res.atoms()]
+            if idxs:
+                groups.append(idxs)
+                resid_map.append((rn, int(res.id) if res.id is not None else 0))
+    return groups, resid_map
+
+def _protein_anchor_indices(topology):
+    aa = {
+        "ALA","ARG","ASN","ASP","CYS","GLN","GLU","GLY","HIS","ILE",
+        "LEU","LYS","MET","PHE","PRO","SER","THR","TRP","TYR","VAL"
+    }
+    ca = []
+    heavy = []
+    for res in topology.residues():
+        rn = (res.name or "").upper().strip()
+        if rn in aa:
+            for a in res.atoms():
+                nm = (a.name or "").upper()
+                if nm == "CA":
+                    ca.append(a.index)
+                if not (a.element and a.element.symbol == "H"):
+                    heavy.append(a.index)
+    return ca if ca else heavy
+
+def _com_of(positions, idxs):
+    sx = sy = sz = 0.0
+    n = 0
+    for i in idxs:
+        v = positions[i]
+        sx += float(v.x); sy += float(v.y); sz += float(v.z)
+        n += 1
+    if n == 0: return (0.0, 0.0, 0.0)
+    return (sx/n, sy/n, sz/n)
+
+def _append_hotspots_csv(fh, step, positions, groups, resid_map, recenter_dxdy dz):
+    dx, dy, dz = recenter_dxdy
+    for (idxs, (resname, resid)) in zip(groups, resid_map):
+        sx = sy = sz = 0.0
+        n = 0
+        for i in idxs:
+            v = positions[i]
+            sx += float(v.x); sy += float(v.y); sz += float(v.z)
+            n += 1
+        if n > 0:
+            fh.write(f"{step},{resname},{resid},{sx/n+dx:.5f},{sy/n+dy:.5f},{sz/n+dz:.5f}\n")
+
+def _run_segmented(simulation: Simulation,
+                   total_steps: int,
+                   stride: int,
+                   csv_path: Path | None,
+                   probe_names: set[str] | None):
+    """
+    If csv_path is provided, log probe centroids every 'stride' steps by:
+      - building groups once (from simulation.topology)
+      - computing receptor COM(0), then at each checkpoint shifting coordinates by
+        COM(0) - COM(t) (protein-centric frame).
+    Returns the final absolute step reached (int).
+    """
+    step_counter = 0
+    fh = None
+    groups = resid_map = None
+    anchor = None
+    ref_com = None
+    try:
+        if csv_path:
+            fh = open(csv_path, "w")
+            names = probe_names or set()
+            # autodiscover + user set
+            present = {(r.name or "").upper().strip() for r in simulation.topology.residues()}
+            allowed = (present & PROBE_NAME_SET) | (names & PROBE_NAME_SET)
+            fh.write("# tracking_resnames=" + ";".join(sorted(allowed)) + "\n")
+            fh.write("# center_mode=protein-com\n")
+            fh.write("step,resname,resid,x_nm,y_nm,z_nm\n")
+
+            groups, resid_map = _build_probe_groups(simulation.topology, allowed)
+            anchor = _protein_anchor_indices(simulation.topology)
+
+            # initial snapshot (step 0)
+            st0 = simulation.context.getState(getPositions=True, enforcePeriodicBox=True)
+            pos0 = st0.getPositions(asNumpy=False)
+            ref_com = _com_of(pos0, anchor)
+            _append_hotspots_csv(fh, 0, pos0, groups, resid_map, (0.0, 0.0, 0.0))
+            fh.flush()
+
+        if total_steps <= 0:
+            return 0
+
+        # segmented stepping
+        remaining = int(total_steps)
+        while remaining > 0:
+            chunk = min(int(stride), remaining) if stride and stride > 0 else remaining
+            simulation.step(chunk)
+            step_counter += chunk
+            remaining -= chunk
+
+            if fh:
+                st = simulation.context.getState(getPositions=True, enforcePeriodicBox=True)
+                pos = st.getPositions(asNumpy=False)
+                com_now = _com_of(pos, anchor) if anchor else (0.0, 0.0, 0.0)
+                dx = (ref_com[0] - com_now[0]) if ref_com else 0.0
+                dy = (ref_com[1] - com_now[1]) if ref_com else 0.0
+                dz = (ref_com[2] - com_now[2]) if ref_com else 0.0
+                _append_hotspots_csv(fh, step_counter, pos, groups, resid_map, (dx, dy, dz))
+                fh.flush()
+
+        return step_counter
+    finally:
+        if fh:
+            try: fh.close()
+            except Exception: pass
+
+# ---------------------------
 # CLI
 # ---------------------------
-
-parser = argparse.ArgumentParser(description="Run OpenMM MD (RNA, protein, multi‑ligand, MixMD-from-Packmol).")
+parser = argparse.ArgumentParser(
+    description="Run OpenMM MD (RNA, protein, ligand(s), MixMD-from-Packmol)."
+)
 parser.add_argument("--rna", action="store_true", help="Enable RNA forcefield and logic")
 parser.add_argument("--no-ligand", action="store_true", help="Run without ligand (receptor only)")
 parser.add_argument("--input-receptor", type=str, default="receptor_cleaned.pdb", help="Input receptor PDB")
-parser.add_argument("--input-ligand", type=str, default=None, help="(Optional) single ligand SDF; otherwise auto-detect ligand_*.sdf")
-parser.add_argument("--n-steps", type=int, default=1_000_000, help="Production steps (default: 1,000,000 ≈ 2 ns with 2 fs)")
+parser.add_argument("--n-steps", type=int, default=1_000_000, help="Production MD steps (default: 1,000,000)")
 parser.add_argument("--seed", type=int, default=13579, help="Random seed")
 
-# MixMD
-parser.add_argument("--mixmd-box-size-nm", type=float, default=7.0, help="MD cubic box edge length (nm)")
-parser.add_argument("--mixmd-resnames", type=str, default="IPA,ACN,IMD,ACM,PHO,HAC,ACEA,PHOL,ACOH", help="Comma-separated probe residue names")
-parser.add_argument("--mixmd-from-packmol", action="store_true", help="Import Packmol probes (implies --no-ligand)")
-parser.add_argument("--mixmd-placements-csv", type=str, default=None, help="Override placements CSV")
-parser.add_argument("--mixmd-edge-margin-nm", type=float, default=0.15, help="Safety margin from box edge (nm)")
-parser.add_argument("--hotspot-csv", type=str, default=None, help="Output CSV for probe centroids")
-parser.add_argument("--hotspot-stride", type=int, default=1000, help="Stride for hotspots logging (steps)")
+# Multi‑ligand convenience
+parser.add_argument("--ligand-pattern", type=str, default="ligand_*.sdf",
+                    help="Glob to find multiple ligands (default ligand_*.sdf). Falls back to ligand.sdf.")
+
+# MixMD-from-Packmol options
+parser.add_argument("--mixmd-from-packmol", action="store_true",
+    help="Read placements CSV (build/<receptor>_mixmd_placements.csv) and place probes before solvation (implies --no-ligand).")
+parser.add_argument("--mixmd-placements-csv", type=str, default=None,
+    help="Override path to placements CSV (default: build/<receptor>_mixmd_placements.csv).")
+parser.add_argument("--mixmd-resnames", type=str, default="IPA,ACN,IMD,ACM,PHO,HAC,ACEA,PHOL,ACOH",
+    help="Comma-separated probe residue names to import.")
+parser.add_argument("--mixmd-box-size-nm", type=float, default=7.0,
+    help="MD cubic box edge length; probes outside this cube are dropped.")
+parser.add_argument("--mixmd-edge-margin-nm", type=float, default=0.15,
+    help="Safety margin from box edge when filtering Packmol centroids (nm).")
+parser.add_argument("--hotspot-stride", type=int, default=1000,
+    help="Stride (steps) for MixMD hotspot logging (segmented stepping).")
+parser.add_argument("--hotspot-csv", type=str, default=None,
+    help="Output CSV for MixMD hotspots (default: mixmd_hotspots_no_ligand.csv).")
 
 args = parser.parse_args()
 receptor_path = Path(args.input_receptor)
 
-# MixMD implies apo
+# MixMD implies apo (ignore ligands)
 if args.mixmd_from_packmol:
     args.no_ligand = True
 
@@ -373,7 +388,7 @@ suffix = "_no_ligand" if args.no_ligand else ""
 receptor_pdb = PDBFile(args.input_receptor)
 
 # ---------------------------
-# Force field
+# Force fields
 # ---------------------------
 if args.rna:
     print("🧬 [RNA MODE] Using amber14/RNA.OL3 + TIP3P-FB")
@@ -383,40 +398,24 @@ else:
     forcefield = ForceField("amber14-all.xml", "amber14/tip3pfb.xml")
 
 # ---------------------------
-# Build modeller & add ligands (if any)
+# Build modeller & merge ligands or probes
 # ---------------------------
 modeller = Modeller(receptor_pdb.topology, receptor_pdb.positions)
 
-ligand_paths = []
-if not args.no_ligand and not args.mixmd_from_packmol:
-    ligand_paths = _glob_ligands(args.input_ligand)
-    if ligand_paths:
-        lig_mols = []
-        for lp in ligand_paths:
-            m = Molecule.from_file(lp.as_posix())
-            if m.n_conformers == 0:
-                raise RuntimeError(f"Ligand has no conformer: {lp}")
-            lig_mols.append(m)
-
-        # Register all ligands together for SMIRNOFF
-        smirnoff = SMIRNOFFTemplateGenerator(molecules=lig_mols)
-        forcefield.registerTemplateGenerator(smirnoff.generator)
-
-        # Add ligands to modeller
-        for m in lig_mols:
-            lig_pos = to_openmm(m.conformers[0])
-            lig_top = OFFTopology.from_molecules([m]).to_openmm()
-            modeller.add(lig_top, lig_pos)
-        print(f"✅ Ligands merged: {', '.join(p.name for p in ligand_paths)}")
+lig_count = 0
+if not args.no_ligand:
+    # discover ligands
+    lig_paths = sorted(Path(".").glob(args.ligand_pattern),
+                       key=lambda p: (len(p.stem), p.stem))
+    if not lig_paths and Path("ligand.sdf").exists():
+        lig_paths = [Path("ligand.sdf")]
+    if lig_paths:
+        lig_count = _merge_ligands_into_modeller(modeller, forcefield, lig_paths)
+        print(f"✅ Merged {lig_count} ligand(s): {[p.name for p in lig_paths]}")
     else:
-        print("ℹ️  No ligand files found (ligand.sdf or ligand_*.sdf); continuing apo.")
+        print("ℹ️  No ligand SDF found; running apo.")
 
-else:
-    print("✅ No ligand: Running receptor-only (apo) setup")
-
-# ---------------------------
-# If Packmol probes are requested, add them now (before solvation)
-# ---------------------------
+# MixMD cosolvents (before solvation)
 if args.mixmd_from_packmol:
     resnames = [s.strip().upper() for s in args.mixmd_resnames.split(",") if s.strip()]
     added = _add_probes_from_packmol(
@@ -433,34 +432,25 @@ if args.mixmd_from_packmol:
 # Hydrogens after all non‑water molecules are present
 modeller.addHydrogens(forcefield)
 
-# Save combined (pre-solvation) for reference
-with open(f"combined_receptor_ligand{suffix}.pdb", "w") as f:
-    PDBFile.writeFile(modeller.topology, modeller.positions, f)
-print(f"✅ System ready for solvation ({'apo' if args.no_ligand else 'holo'})")
-
-# Diagnostics before solvation
-n_atoms_pre = _count_atoms(modeller.topology)
-print(f"[diag] atoms pre‑solvation = {n_atoms_pre}")
+# Pre‑solvation snapshot
+pre_path = _write_structure_auto(modeller.topology, modeller.positions,
+                                 f"combined_receptor_ligand{suffix}")
+print(f"✅ System ready for solvation → {pre_path}")
 
 # ---------------------------
-# Solvate
+# Solvate in the requested MD box
 # ---------------------------
 box_edge = float(args.mixmd_box_size_nm if args.mixmd_from_packmol else 7.0)
 modeller.addSolvent(
     forcefield,
     model="tip3p",
-    boxSize=(box_edge, box_edge, box_edge) * u.nanometer,
-    ionicStrength=0.15 * u.molar,
+    boxSize=(box_edge, box_edge, box_edge) * nanometer,
+    ionicStrength=0.15 * molar,
     neutralize=True
 )
-
-with open(f"solvated_receptor_ligand{suffix}.pdb", "w") as f:
-    PDBFile.writeFile(modeller.topology, modeller.positions, f)
-print(f"✅ Solvated system ready. Box = {box_edge:.2f} nm")
-
-# Diagnostics after solvation
-n_atoms_post = _count_atoms(modeller.topology)
-print(f"[diag] atoms post‑solvation = {n_atoms_post}")
+solv_path = _write_structure_auto(modeller.topology, modeller.positions,
+                                  f"solvated_receptor_ligand{suffix}")
+print(f"✅ Solvated system ready. Box = {box_edge:.2f} nm → {solv_path}")
 
 # ---------------------------
 # Create System
@@ -468,73 +458,62 @@ print(f"[diag] atoms post‑solvation = {n_atoms_post}")
 system = forcefield.createSystem(
     modeller.topology,
     nonbondedMethod=PME,
-    nonbondedCutoff=1.0 * u.nanometer,
+    nonbondedCutoff=1.0 * nanometer,
     constraints=HBonds
 )
 
 seed = int(args.seed)
-barostat = MonteCarloBarostat(1 * u.bar, 300 * u.kelvin, 25)
+barostat = MonteCarloBarostat(1 * bar, 300 * kelvin, 25)
 barostat.setRandomNumberSeed(seed)
 system.addForce(barostat)
 
-integrator = LangevinMiddleIntegrator(300 * u.kelvin, 1 / u.picosecond, 0.002 * u.picoseconds)
+integrator = LangevinMiddleIntegrator(300 * kelvin, 1 / picosecond, 0.002 * picoseconds)
 integrator.setRandomNumberSeed(seed)
 
 simulation = Simulation(modeller.topology, system, integrator)
 simulation.context.setPositions(modeller.positions)
 
-# --- Hotspot reporter (only if MixMD) ---
-if args.mixmd_from_packmol:
-    probe_resnames = [s.strip().upper() for s in args.mixmd_resnames.split(",") if s.strip()]
-    hotspot_csv = args.hotspot_csv or f"mixmd_hotspots{suffix}.csv"
-    hrep = ProbeHotspotReporter(
-        hotspot_csv,
-        reportInterval=int(args.hotspot_stride),
-        topology=simulation.topology,
-        probe_resnames=probe_resnames
-    )
-    # Force an initial snapshot at step 0 so the CSV is never empty
-    state0 = simulation.context.getState(getPositions=True, enforcePeriodicBox=True)
-    hrep.report(simulation, state0)
-    simulation.reporters.append(hrep)
+# Standard reporters (PDB is small/frequent; mmCIF is for whole snapshots we already wrote)
+simulation.reporters.append(PDBReporter(f"minimized{suffix}.pdb", 100))
+simulation.reporters.append(PDBReporter(f"nvt_equilibrated{suffix}.pdb", 100))
+simulation.reporters.append(PDBReporter(f"npt_equilibrated{suffix}.pdb", 500))
+simulation.reporters.append(DCDReporter(f"production_md{suffix}.dcd", 1000))
+simulation.reporters.append(StateDataReporter(f"production_md{suffix}.log", 1000, step=True, potentialEnergy=True, temperature=True))
+simulation.reporters.append(StateDataReporter(stdout, 1000, step=True, potentialEnergy=True, temperature=True))
 
 # ---------------------------
-# Run
+# Run (segmented with explicit hotspot logging)
 # ---------------------------
 print("🔹 Energy Minimization...")
 simulation.minimizeEnergy()
-simulation.reporters.append(PDBReporter(f"minimized{suffix}.pdb", 100))
 
 print("🔹 NVT Equilibration (1 ps)...")
-simulation.context.setVelocitiesToTemperature(300 * u.kelvin, seed)
-simulation.reporters.append(PDBReporter(f"nvt_equilibrated{suffix}.pdb", 100))
-simulation.reporters.append(StateDataReporter(stdout, 100, step=True, potentialEnergy=True, temperature=True))
-simulation.step(500)  # 1 ps
+simulation.context.setVelocitiesToTemperature(300 * kelvin, seed)
+
+# total segmentation stride
+stride = max(1, int(args.hotspot_stride))
+
+# MixMD hotspot CSV path (only if MixMD enabled)
+hotspot_csv = None
+probe_hint = None
+if args.mixmd_from_packmol:
+    probe_hint = {s.strip().upper() for s in args.mixmd_resnames.split(",") if s.strip()}
+    hotspot_csv = Path(args.hotspot_csv or f"mixmd_hotspots{suffix}.csv")
+
+# NVT (500 steps)
+_ = _run_segmented(simulation, total_steps=500, stride=stride,
+                   csv_path=hotspot_csv, probe_names=probe_hint)
 
 print("🔹 NPT Equilibration (5 ps)...")
-simulation.reporters.append(PDBReporter(f"npt_equilibrated{suffix}.pdb", 500))
-simulation.step(2500)  # 5 ps
+_ = _run_segmented(simulation, total_steps=2500, stride=stride,
+                   csv_path=hotspot_csv, probe_names=probe_hint)
 
 print(f"🔥 Production MD: {args.n_steps:,} steps")
-# Make DCD first so it always sees the same topology as final structure
-simulation.reporters.append(DCDReporter(f"production_md{suffix}.dcd", 1000))
-simulation.reporters.append(StateDataReporter(f"production_md{suffix}.log", 1000, step=True, potentialEnergy=True, temperature=True))
-simulation.step(args.n_steps)
+_ = _run_segmented(simulation, total_steps=int(args.n_steps), stride=stride,
+                   csv_path=hotspot_csv, probe_names=probe_hint)
 
-# --- Final structures: PDB + mmCIF (to avoid serial overflow in large systems) ---
-state_final = simulation.context.getState(getPositions=True, enforcePeriodicBox=True)
-with open(f"final_structure{suffix}.pdb", "w") as f:
-    PDBFile.writeFile(simulation.topology, state_final.getPositions(), f)
-
-# mmCIF (ChimeraX-friendly for very large atom counts)
-try:
-    with open(f"final_structure{suffix}.cif", "w") as f:
-        PDBxFile.writeFile(simulation.topology, state_final.getPositions(), f)
-    print(f"✅ Final structures saved: final_structure{suffix}.pdb and .cif")
-except Exception as e:
-    print(f"⚠️  mmCIF write failed ({e}); PDB written.")
-
-# Final diagnostics
-n_atoms_final = _count_atoms(simulation.topology)
-print(f"[diag] atoms final(topology) = {n_atoms_final}")
-print("🎉 MD complete.")
+# Final snapshot
+final_path = _write_structure_auto(simulation.topology,
+                                   simulation.context.getState(getPositions=True).getPositions(),
+                                   f"final_structure{suffix}")
+print(f"🎉 MD complete → {final_path}")
