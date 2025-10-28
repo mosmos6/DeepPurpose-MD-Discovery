@@ -1,13 +1,14 @@
 # 5_md_simulation.py
 # Author: Iori Mochizuki + collaborator patch
-# Updated: 2025-10-23
+# Updated: 2025-10-28
+#
 # Description: OpenMM MD (protein/RNA/ligand[s]) with optional MixMD-from-Packmol import.
-# - Multi-ligand ready: auto-detects ligand*.sdf and/or ligands/*.sdf and adds all.
+# - Multi-ligand ready: auto-detects SDF ligands (reads ligands_sdf.index when present) and adds all.
 # - MixMD: reads Packmol placements CSV, adds probes pre-solvation, logs probe centroids each stride.
-# - Hotspot CSV is receptor-centered (protein COM) and actually records beyond step 0 (robust schedule).
-# - Writes both PDB and mmCIF (PDBx) to avoid 5-digit atom-serial issues in large boxes.
+# - Hotspot CSV is receptor-centered (protein COM) and records beyond step 0 (robust schedule).
+# - Writes both PDB and mmCIF to avoid 5-digit atom-serial issues in large boxes.
 
-import argparse, csv, glob
+import argparse, csv, glob, re
 from pathlib import Path
 from sys import stdout
 
@@ -19,6 +20,7 @@ from openmmforcefields.generators import SMIRNOFFTemplateGenerator
 
 from openff.toolkit.topology import Molecule, Topology as OFFTopology
 from openff.units.openmm import to_openmm
+
 
 # =========================
 # MixMD probe dictionary
@@ -44,7 +46,7 @@ def _default_packmol_csv(receptor_path: Path) -> Path:
 
 
 # =========================
-# Hotspot Reporter (fixed)
+# Hotspot Reporter (robust)
 # =========================
 class ProbeHotspotReporter:
     """
@@ -114,9 +116,9 @@ class ProbeHotspotReporter:
         self.file.write("step,resname,resid,x_nm,y_nm,z_nm\n")
         self.file.flush()
 
-    # *** Critical fix: robust schedule aligned to stride multiples ***
+    # Critical fix: schedule aligned to stride multiples so it logs beyond step 0
     def describeNextReport(self, simulation):
-        # compute current integer step
+        # determine current integer step
         step = 0
         try:
             step = int(simulation.currentStep)
@@ -129,13 +131,14 @@ class ProbeHotspotReporter:
             except Exception:
                 step = 0
         n = self.reportInterval
-        # number of steps until next multiple of n (never return 0)
         rem = step % n
         due = n if rem == 0 else (n - rem)
+        # (steps, positions, velocities, forces, energies, enforcePeriodicBox)
         return (due, True, False, False, False, True)
 
     @staticmethod
     def _com_of_indices(positions, idxs):
+        # avoid Python's sum() because OpenMM monkey-patches it for unit arrays
         sx = sy = sz = 0.0
         n = 0
         for i in idxs:
@@ -195,9 +198,9 @@ class ProbeHotspotReporter:
 # =========================
 def _openff_conf_to_angstrom_list(off_mol: Molecule):
     """Return [(x,y,z) in Å] from an OpenFF Molecule conformer (no NumPy)."""
-    conf = off_mol.conformers[0]  # OpenFF quantity with units
+    conf = off_mol.conformers[0]
     try:
-        arr = conf.to("angstrom").m  # N×3 numeric via Pint
+        arr = conf.to("angstrom").m  # Pint → ndarray-like
         return [(float(r[0]), float(r[1]), float(r[2])) for r in arr]
     except Exception:
         q = to_openmm(conf)  # Quantity(list(Vec3), angstrom)
@@ -315,7 +318,25 @@ def _add_probes_from_packmol(modeller: Modeller,
 # =========================
 # Helpers: multi‑ligand load
 # =========================
-def _find_ligand_sdfs(patterns=("ligand*.sdf",), folders=("ligands", "Ligands", "LIGANDS")):
+def _read_ligand_index(index_path: Path) -> list[Path]:
+    """Read ligands_sdf.index and return absolute paths that exist."""
+    out = []
+    if not index_path.exists():
+        return out
+    base = index_path.parent
+    for ln in index_path.read_text(encoding="utf-8").splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        p = Path(ln)
+        if not p.is_absolute():
+            p = (base / p).resolve()
+        if p.exists() and p.suffix.lower() == ".sdf":
+            out.append(p)
+    return out
+
+def _find_ligand_sdfs(patterns=("*.sdf", "ligand*.sdf"),
+                      folders=("ligands", "Ligands", "LIGANDS")) -> list[Path]:
     found = set()
     for pat in patterns:
         for p in glob.glob(pat):
@@ -326,8 +347,31 @@ def _find_ligand_sdfs(patterns=("ligand*.sdf",), folders=("ligands", "Ligands", 
         if d.is_dir():
             for p in d.glob("*.sdf"):
                 found.add(p.resolve())
-    # deterministic order
-    return sorted(found, key=lambda p: p.name)
+    # stable order
+    return sorted(found, key=lambda p: p.name.lower())
+
+def _select_subset(paths: list[Path], selector: str | None, index_ref: list[Path]) -> list[Path]:
+    """
+    selector can be comma list of names or 1-based indices (w.r.t index_ref order if provided,
+    otherwise w.r.t 'paths' order). Names match stem without extension.
+    """
+    if not selector:
+        return paths
+    wanted = set()
+    tokens = [t.strip() for t in selector.split(",") if t.strip()]
+    # helper: build maps
+    by_name = {p.stem: p for p in paths}
+    order = index_ref if index_ref else paths
+    by_idx = {str(i): order[i-1] for i in range(1, len(order)+1)}
+    for t in tokens:
+        if t in by_idx:
+            wanted.add(by_idx[t])
+        elif t in by_name:
+            wanted.add(by_name[t])
+        else:
+            print(f"⚠️  --ligand-select token '{t}' not matched; ignoring.")
+    out = [p for p in order if p in wanted] if wanted else paths
+    return out
 
 def _add_ligands(modeller: Modeller, forcefield: ForceField, sdf_paths: list[Path]) -> int:
     """
@@ -342,7 +386,6 @@ def _add_ligands(modeller: Modeller, forcefield: ForceField, sdf_paths: list[Pat
     for sdf in sdf_paths:
         lig = Molecule.from_file(str(sdf))
         if len(lig.conformers) == 0:
-            # attempt one conformer (keeps absolute coords if present)
             lig.generate_conformers(n_conformers=1)
         off_mols.append(lig)
         tops.append(OFFTopology.from_molecules([lig]).to_openmm())
@@ -355,6 +398,12 @@ def _add_ligands(modeller: Modeller, forcefield: ForceField, sdf_paths: list[Pat
     print(f"✅ Added {len(sdf_paths)} ligand(s): " + ", ".join(p.name for p in sdf_paths))
     return len(sdf_paths)
 
+def _count_atoms(top: Topology) -> int:
+    c = 0
+    for _ in top.atoms():
+        c += 1
+    return c
+
 
 # =========================
 # CLI
@@ -366,11 +415,11 @@ parser.add_argument("--rna", action="store_true", help="Enable RNA forcefield an
 parser.add_argument("--no-ligand", action="store_true", help="Run without ligand (receptor only)")
 parser.add_argument("--input-receptor", type=str, default="receptor_cleaned.pdb", help="Input receptor PDB")
 parser.add_argument("--input-ligand", type=str, default=None,
-                    help="Single-ligand SDF (kept for backward compatibility).")
-parser.add_argument("--ligand-pattern", type=str, default="ligand*.sdf",
-                    help="Glob pattern to pick up multiple SDF ligands (default: ligand*.sdf).")
-parser.add_argument("--ligand-dir", type=str, default=None,
-                    help="Optional folder to scan for *.sdf (e.g., ligands/).")
+                    help="Backward-compat single-ligand SDF (will be included alongside auto-discovered ligands).")
+parser.add_argument("--ligand-index", type=str, default="ligands_sdf.index",
+                    help="If present, read SDF list from this file (default: ligands_sdf.index).")
+parser.add_argument("--ligand-select", type=str, default=None,
+                    help="Optional subset by names or 1-based indices (comma-separated). Examples: '1,3' or 'GMP,caffeine'.")
 
 # MixMD
 parser.add_argument("--mixmd-from-packmol", action="store_true",
@@ -421,39 +470,35 @@ else:
 modeller = Modeller(receptor_pdb.topology, receptor_pdb.positions)
 
 added_ligands = 0
-if not args.no_ligand:
-    # gather SDFs
-    candidates = []
-    if args.input_ligand:
-        p = Path(args.input_ligand)
-        if p.exists() and p.suffix.lower()==".sdf":
-            candidates.append(p.resolve())
-    # glob pattern in CWD
-    for p in _find_ligand_sdfs(patterns=(args.ligand_pattern,)):
-        if p not in candidates:
-            candidates.append(p)
-    # optional folder
-    if args.ligand_dir:
-        d = Path(args.ligand_dir)
-        if d.is_dir():
-            for p in d.glob("*.sdf"):
-                rp = p.resolve()
-                if rp not in candidates:
-                    candidates.append(rp)
+ligand_paths = []
 
-    added_ligands = _add_ligands(modeller, forcefield, candidates)
-    if added_ligands == 0 and args.input_ligand:
-        # Back-compat: try single path even if extension is different
-        lig = Molecule.from_file(args.input_ligand)
-        if len(lig.conformers) == 0:
-            lig.generate_conformers(n_conformers=1)
-        smirnoff = SMIRNOFFTemplateGenerator(molecules=[lig])
-        forcefield.registerTemplateGenerator(smirnoff.generator)
-        modeller.add(OFFTopology.from_molecules([lig]).to_openmm(), to_openmm(lig.conformers[0]))
-        added_ligands = 1
+if not args.no_ligand:
+    # 1) index-driven (preferred, deterministic)
+    index_paths = _read_ligand_index(Path(args.ligand_index))
+    # 2) fallback discovery
+    discovered = _find_ligand_sdfs()
+    # 3) optional explicit single path
+    if args.input_ligand:
+        p = Path(args.input_ligand).resolve()
+        if p.exists() and p.suffix.lower() == ".sdf":
+            discovered.append(p)
+
+    # Unique, preserving index order first, then discovered (by name)
+    seen = set()
+    for p in index_paths + discovered:
+        if p not in seen:
+            ligand_paths.append(p)
+            seen.add(p)
+
+    # Optional subset selection (names or 1-based indices w.r.t index order)
+    ligand_paths = _select_subset(ligand_paths, args.ligand_select, index_paths)
+
+    added_ligands = _add_ligands(modeller, forcefield, ligand_paths)
     print(f"✅ Ligand mode: added {added_ligands} ligand(s).")
 else:
     print("✅ No ligand: receptor-only (apo) setup")
+
+print(f"   Atoms before solvation: {_count_atoms(modeller.topology)}")
 
 # =========================
 # MixMD probes (before solvation)
@@ -489,9 +534,11 @@ modeller.addSolvent(
     ionicStrength=0.15 * molar,
     neutralize=True
 )
+print(f"✅ Solvated system ready. Box = {box_edge:.2f} nm")
+print(f"   Atoms after solvation:  {_count_atoms(modeller.topology)}")
+
 with open(f"solvated_receptor_ligand{suffix}.pdb", "w") as f:
     PDBFile.writeFile(modeller.topology, modeller.positions, f)
-print(f"✅ Solvated system ready. Box = {box_edge:.2f} nm")
 
 # =========================
 # System & Integrator
@@ -515,7 +562,7 @@ simulation = Simulation(modeller.topology, system, integrator)
 simulation.context.setPositions(modeller.positions)
 
 # =========================
-# Hotspot reporter
+# Hotspot reporter (MixMD only)
 # =========================
 if args.mixmd_from_packmol:
     probe_resnames = [s.strip().upper() for s in args.mixmd_resnames.split(",") if s.strip()]
@@ -529,7 +576,7 @@ if args.mixmd_from_packmol:
         center_mode="protein-com"
     )
 
-    # Force an initial snapshot (step 0), then append reporter for scheduled logging
+    # Initial snapshot at step 0, then scheduled logging
     state0 = simulation.context.getState(getPositions=True, enforcePeriodicBox=True)
     hrep.report(simulation, state0)
     simulation.reporters.append(hrep)
@@ -552,12 +599,11 @@ simulation.reporters.append(PDBReporter(f"npt_equilibrated{suffix}.pdb", 500))
 simulation.step(2500)  # 5 ps
 
 print(f"🔥 Production MD: {args.n_steps:,} steps")
-
 simulation.reporters.append(DCDReporter(f"production_md{suffix}.dcd", 1000))
 simulation.reporters.append(StateDataReporter(f"production_md{suffix}.log", 1000, step=True, potentialEnergy=True, temperature=True))
 simulation.step(args.n_steps)
 
-# extra: ensure hotspot reporter at final state too
+# extra: ensure hotspot reporter logs final state too
 if args.mixmd_from_packmol:
     try:
         final_state = simulation.context.getState(getPositions=True, enforcePeriodicBox=True)
@@ -575,7 +621,6 @@ with open(f"final_structure{suffix}.pdb", "w") as f:
     PDBFile.writeFile(simulation.topology, final_positions, f)
 print(f"✅ PDB written → final_structure{suffix}.pdb")
 
-# mmCIF avoids 5-digit serial overflow; very important for large boxes
 with open(f"final_structure{suffix}.cif", "w") as f:
     PDBxFile.writeFile(simulation.topology, final_positions, f)
 print(f"✅ mmCIF written → final_structure{suffix}.cif")
