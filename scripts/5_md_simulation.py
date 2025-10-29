@@ -17,6 +17,7 @@ from openmm.app import *
 from openmm import MonteCarloBarostat, LangevinMiddleIntegrator
 from openmm.unit import *
 from openmmforcefields.generators import SMIRNOFFTemplateGenerator
+from openff.toolkit.utils.exceptions import MoleculeParseError
 
 from openff.toolkit.topology import Molecule, Topology as OFFTopology
 from openff.units.openmm import to_openmm
@@ -318,37 +319,31 @@ def _add_probes_from_packmol(modeller: Modeller,
 # =========================
 # Helpers: multi‑ligand load
 # =========================
-def _read_ligand_index(index_path: Path) -> list[Path]:
-    """Read ligands_sdf.index and return absolute paths that exist."""
-    out = []
-    if not index_path.exists():
-        return out
-    base = index_path.parent
-    for ln in index_path.read_text(encoding="utf-8").splitlines():
-        ln = ln.strip()
-        if not ln or ln.startswith("#"):
-            continue
-        p = Path(ln)
-        if not p.is_absolute():
-            p = (base / p).resolve()
-        if p.exists() and p.suffix.lower() == ".sdf":
-            out.append(p)
-    return out
 
-def _find_ligand_sdfs(patterns=("*.sdf", "ligand*.sdf"),
-                      folders=("ligands", "Ligands", "LIGANDS")) -> list[Path]:
-    found = set()
+def _read_ligand_index(index_path=Path("ligands.index")) -> list[str]:
+    if index_path.exists():
+        return [ln.strip() for ln in index_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    return []
+
+def _find_ligand_sdfs(patterns=("ligand*.sdf",), folders=("ligands","Ligands","LIGANDS"), respect_index=True) -> list[Path]:
+    allow = set(_read_ligand_index()) if respect_index else None
+    found = []
+    # CWD patterns
     for pat in patterns:
-        for p in glob.glob(pat):
-            if p.lower().endswith(".sdf"):
-                found.add(Path(p).resolve())
+        for p in sorted(Path(".").glob(pat)):
+            if p.suffix.lower() == ".sdf":
+                if (allow is None) or (p.stem in allow):
+                    found.append(p.resolve())
+    # Optional folders
     for folder in folders:
         d = Path(folder)
         if d.is_dir():
-            for p in d.glob("*.sdf"):
-                found.add(p.resolve())
-    # stable order
-    return sorted(found, key=lambda p: p.name.lower())
+            for p in sorted(d.glob("*.sdf")):
+                if (allow is None) or (p.stem in allow):
+                    found.append(p.resolve())
+    # deterministic by name
+    return sorted(set(found), key=lambda q: q.name)
+
 
 def _select_subset(paths: list[Path], selector: str | None, index_ref: list[Path]) -> list[Path]:
     """
@@ -375,28 +370,48 @@ def _select_subset(paths: list[Path], selector: str | None, index_ref: list[Path
 
 def _add_ligands(modeller: Modeller, forcefield: ForceField, sdf_paths: list[Path]) -> int:
     """
-    Add one or many ligands (already positioned in SDF coords).
-    Each SDF should contain a single molecule with 3D conformer.
+    Add ligands using SDF coordinates (preferred). If an SDF fails to parse, try the
+    corresponding MOL2 (same stem) while keeping the coordinates from that file.
     """
     if not sdf_paths:
         return 0
+
     off_mols = []
     tops = []
     poss = []
+
     for sdf in sdf_paths:
-        lig = Molecule.from_file(str(sdf))
+        lig = None
+        try:
+            lig = Molecule.from_file(str(sdf))  # preferred
+            source = sdf.name
+        except MoleculeParseError:
+            # fallback to MOL2
+            mol2 = sdf.with_suffix(".mol2")
+            if mol2.exists():
+                lig = Molecule.from_file(str(mol2))
+                source = mol2.name
+            else:
+                raise
+
         if len(lig.conformers) == 0:
+            # ensure we have coordinates
             lig.generate_conformers(n_conformers=1)
+
         off_mols.append(lig)
         tops.append(OFFTopology.from_molecules([lig]).to_openmm())
         poss.append(to_openmm(lig.conformers[0]))
+        print(f"   • ligand loaded from {source}")
+
     smirnoff = SMIRNOFFTemplateGenerator(molecules=off_mols)
     forcefield.registerTemplateGenerator(smirnoff.generator)
 
     for top, pos in zip(tops, poss):
         modeller.add(top, pos)
-    print(f"✅ Added {len(sdf_paths)} ligand(s): " + ", ".join(p.name for p in sdf_paths))
-    return len(sdf_paths)
+
+    print(f"✅ Added {len(off_mols)} ligand(s): " + ", ".join(p.name for p in sdf_paths))
+    return len(off_mols)
+
 
 def _count_atoms(top: Topology) -> int:
     c = 0
@@ -416,7 +431,7 @@ parser.add_argument("--no-ligand", action="store_true", help="Run without ligand
 parser.add_argument("--input-receptor", type=str, default="receptor_cleaned.pdb", help="Input receptor PDB")
 parser.add_argument("--input-ligand", type=str, default=None,
                     help="Backward-compat single-ligand SDF (will be included alongside auto-discovered ligands).")
-parser.add_argument("--ligand-index", type=str, default="ligands_sdf.index",
+parser.add_argument("--ligand-index", type=str, default="ligands.index",
                     help="If present, read SDF list from this file (default: ligands_sdf.index).")
 parser.add_argument("--ligand-select", type=str, default=None,
                     help="Optional subset by names or 1-based indices (comma-separated). Examples: '1,3' or 'GMP,caffeine'.")
@@ -470,33 +485,56 @@ else:
 modeller = Modeller(receptor_pdb.topology, receptor_pdb.positions)
 
 added_ligands = 0
-ligand_paths = []
+ligand_paths: list[Path] = []
 
 if not args.no_ligand:
-    # 1) index-driven (preferred, deterministic)
-    index_paths = _read_ligand_index(Path(args.ligand_index))
-    # 2) fallback discovery
-    discovered = _find_ligand_sdfs()
-    # 3) optional explicit single path
+    # --- (C) Respect ligands.index order, ignore strays by default ---
+    # 1) names in index (if file exists)
+    index_names = _read_ligand_index(Path(args.ligand_index))  # list[str] stems
+
+    # 2) discover all SDFs without applying index yet
+    discovered: list[Path] = []
+    # CWD pattern(s)
+    for p in Path(".").glob(args.ligand_pattern):
+        if p.suffix.lower() == ".sdf":
+            discovered.append(p.resolve())
+    # optional folder scan
+    if args.ligand_dir:
+        d = Path(args.ligand_dir)
+        if d.is_dir():
+            for p in d.glob("*.sdf"):
+                discovered.append(p.resolve())
+
+    # 3) map by stem for ordering/filtering
+    by_name = {p.stem: p for p in discovered}
+
+    # 4) if index present: keep only those, in that order; else keep all (sorted)
+    if index_names:
+        ordered_by_index = [by_name[n] for n in index_names if n in by_name]
+        # extras not mentioned in index (append after, alphabetically)
+        extras = sorted([p for name, p in by_name.items() if name not in set(index_names)],
+                        key=lambda q: q.name)
+        ligand_paths = ordered_by_index + extras
+        index_ref_paths = ordered_by_index[:]  # for --ligand-select 1-based indexing
+    else:
+        ligand_paths = sorted(set(discovered), key=lambda q: q.name)
+        index_ref_paths = ligand_paths[:]  # no index file; index == current order
+
+    # 5) optionally include an explicit single path as well
     if args.input_ligand:
         p = Path(args.input_ligand).resolve()
-        if p.exists() and p.suffix.lower() == ".sdf":
-            discovered.append(p)
-
-    # Unique, preserving index order first, then discovered (by name)
-    seen = set()
-    for p in index_paths + discovered:
-        if p not in seen:
+        if p.exists() and p.suffix.lower() == ".sdf" and p not in ligand_paths:
             ligand_paths.append(p)
-            seen.add(p)
 
-    # Optional subset selection (names or 1-based indices w.r.t index order)
-    ligand_paths = _select_subset(ligand_paths, args.ligand_select, index_paths)
+    # 6) optional subset selection (names or 1-based indices wrt index order)
+    ligand_paths = _select_subset(ligand_paths, args.ligand_select, index_ref_paths)
 
+    # 7) add to modeller
     added_ligands = _add_ligands(modeller, forcefield, ligand_paths)
     print(f"✅ Ligand mode: added {added_ligands} ligand(s).")
 else:
     print("✅ No ligand: receptor-only (apo) setup")
+
 
 print(f"   Atoms before solvation: {_count_atoms(modeller.topology)}")
 
