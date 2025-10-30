@@ -84,7 +84,7 @@ def _discover_jobs():
 def _write_sdf_via_obabel(fixed_pdb: Path, out_sdf: Path):
     # Use OBabel exactly like your original pipeline
     # (this route handled phosphate O1- nicely in your prior study)
-    subprocess.run(["obabel", str(fixed_pdb), "-O", str(out_sdf)], check=True)
+    subprocess.run(["obabel", str(fixed_pdb), "-O", str(out_sdf)])
 
 def _write_sdf_fallback_rdkit(tag: str, mol2_path: Path, coords_xyz: np.ndarray, out_sdf: Path):
     # Very forgiving RDKit fallback: sanitize=False, then just write the coordinates to an SDF.
