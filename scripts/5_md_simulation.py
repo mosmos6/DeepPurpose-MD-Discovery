@@ -320,7 +320,7 @@ def _add_probes_from_packmol(modeller: Modeller,
 # Helpers: multi‑ligand load
 # =========================
 
-def _read_ligand_index(index_path=Path("ligands.index")) -> list[str]:
+def _read_ligand_index(index_path=Path("ligands_sdf.index")) -> list[str]:
     if index_path.exists():
         return [ln.strip() for ln in index_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
     return []
@@ -431,10 +431,17 @@ parser.add_argument("--no-ligand", action="store_true", help="Run without ligand
 parser.add_argument("--input-receptor", type=str, default="receptor_cleaned.pdb", help="Input receptor PDB")
 parser.add_argument("--input-ligand", type=str, default=None,
                     help="Backward-compat single-ligand SDF (will be included alongside auto-discovered ligands).")
-parser.add_argument("--ligand-index", type=str, default="ligands.index",
+parser.add_argument("--ligand-index", type=str, default="ligands_sdf.index",
                     help="If present, read SDF list from this file (default: ligands_sdf.index).")
 parser.add_argument("--ligand-select", type=str, default=None,
                     help="Optional subset by names or 1-based indices (comma-separated). Examples: '1,3' or 'GMP,caffeine'.")
+parser.add_argument("--ligand-pattern", type=str, default="*.sdf",
+                    help="Glob pattern to search for SDFs in CWD when no index is present.")
+parser.add_argument("--ligand-dir", type=str, default=None,
+                    help="Optional folder to also scan for SDFs.")
+# optional switch to INCLUDE strays not in the index (default: ignore)
+parser.add_argument("--allow-extras", action="store_true",
+                    help="Also include SDFs not listed in the --ligand-index file.")
 
 # MixMD
 parser.add_argument("--mixmd-from-packmol", action="store_true",
@@ -488,7 +495,7 @@ added_ligands = 0
 ligand_paths: list[Path] = []
 
 if not args.no_ligand:
-    # --- (C) Respect ligands.index order, ignore strays by default ---
+    # --- (C) Respect ligands_sdf.index order, ignore strays by default ---
     # 1) names in index (if file exists)
     index_names = _read_ligand_index(Path(args.ligand_index))  # list[str] stems
 
@@ -509,16 +516,29 @@ if not args.no_ligand:
     by_name = {p.stem: p for p in discovered}
 
     # 4) if index present: keep only those, in that order; else keep all (sorted)
+    by_name = {p.stem: p for p in discovered}
+    
     if index_names:
         ordered_by_index = [by_name[n] for n in index_names if n in by_name]
-        # extras not mentioned in index (append after, alphabetically)
-        extras = sorted([p for name, p in by_name.items() if name not in set(index_names)],
-                        key=lambda q: q.name)
+    
+        if args.allow_extras:
+            extras = sorted(
+                [p for name, p in by_name.items() if name not in set(index_names)],
+                key=lambda q: q.name
+            )
+        else:
+            extras = []  # default: ignore strays
+    
         ligand_paths = ordered_by_index + extras
-        index_ref_paths = ordered_by_index[:]  # for --ligand-select 1-based indexing
+        index_ref_paths = ordered_by_index[:] if ordered_by_index else ligand_paths[:]
     else:
         ligand_paths = sorted(set(discovered), key=lambda q: q.name)
-        index_ref_paths = ligand_paths[:]  # no index file; index == current order
+        index_ref_paths = ligand_paths[:]
+
+    if index_names:
+    missing = [n for n in index_names if n not in by_name]
+    if missing:
+        print("⚠️  Listed in index but SDF missing:", ", ".join(missing))
 
     # 5) optionally include an explicit single path as well
     if args.input_ligand:
