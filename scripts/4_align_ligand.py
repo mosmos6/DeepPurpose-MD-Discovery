@@ -1,128 +1,152 @@
 # scripts/4_align_ligand.py
 # Author: Iori Mochizuki + patch
-# Updated: 2025-10-29
-# Description: Align one or many ligands to docked coordinates; export SDF for OpenFF.
-# Key change: write SDF with RDKit from the original Step-1 MOL2 topology
-#             to preserve bond orders & formal charges (no Babel ambiguity).
+# Updated: 2025-10-30
+# Description: Align many ligands to their docked coordinates; write per‑ligand PDB+SDF.
+# Key: uses ligands.index for names; SDF is written with RDKit from the original MOL2 topology.
 
-import re
 from pathlib import Path
+import re
 import numpy as np
-from utils import extract_coordinates, kabsch, fix_pdb_element_column
-
-# NEW: RDKit is used here to write SDF using original MOL2 topology
 from rdkit import Chem
 
-def _discover_pairs():
-    """
-    Return list of (tag, files) where tag is 'ligand' or 'ligand_3',
-    files has: original_pdb, stripped_pdbqt, docked_pdb, template_mol2.
-    """
-    tags = set()
-    for p in Path(".").glob("ligand_*.pdb"):
-        tags.add(p.stem)
-    for p in Path(".").glob("ligand_*.pdbqt"):
-        tags.add(p.stem)
-    for p in Path(".").glob("output_ligand_*.pdb"):
-        m = re.match(r"output_(ligand_\d+)$", p.stem)
-        if m: tags.add(m.group(1))
-    if Path("ligand.pdb").exists() or Path("ligand.pdbqt").exists() or Path("output.pdb").exists():
-        tags.add("ligand")
+from utils import extract_coordinates, kabsch, fix_pdb_element_column
 
-    def _order_key(t):
-        return (0 if t == "ligand" else 1, int(re.sub(r"[^\d]", "", t) or 0))
+INDEX_FILE = Path("ligands.index")   # written by Step 1
 
-    out = []
-    for tag in sorted(tags, key=_order_key):
-        files = {
-            "original_pdb": Path(f"{tag}.pdb") if Path(f"{tag}.pdb").exists() else Path("ligand.pdb"),
-            "stripped_pdbqt": Path(f"{tag}.pdbqt") if Path(f"{tag}.pdbqt").exists() else Path("ligand.pdbqt"),
-            "docked_pdb": Path(f"output_{tag}.pdb") if Path(f"output_{tag}.pdb").exists() else Path("output.pdb"),
-            # NEW: template MOL2 from Step 1 (same atom ordering as original PDB)
-            "template_mol2": Path(f"{tag}.mol2") if Path(f"{tag}.mol2").exists() else Path("ligand.mol2"),
-        }
-        if all(files[k].exists() for k in ("original_pdb", "stripped_pdbqt", "docked_pdb")):
-            out.append((tag, files))
+def _read_names_from_index() -> list[str]:
+    if INDEX_FILE.exists():
+        names = [ln.strip() for ln in INDEX_FILE.read_text(encoding="utf-8").splitlines()
+                 if ln.strip() and not ln.strip().startswith("#")]
+        # keep order, dedupe
+        seen, out = set(), []
+        for n in names:
+            if n not in seen:
+                out.append(n); seen.add(n)
+        return out
+    return []
+
+def _fallback_discover_names() -> list[str]:
+    # derive names from output_*.pdb (Step 3 products), e.g., output_GMP.pdb → "GMP"
+    names = []
+    for p in sorted(Path(".").glob("output_*.pdb")):
+        m = re.match(r"output_(.+)\.pdb$", p.name)
+        if m:
+            names.append(m.group(1))
+    # dedupe keep-order
+    seen, out = set(), []
+    for n in names:
+        if n not in seen:
+            out.append(n); seen.add(n)
+    # last fallback: legacy single 'ligand'
+    if not out and (Path("output.pdb").exists() or Path("ligand.pdb").exists()):
+        out = ["ligand"]
     return out
 
+def _discover_jobs():
+    """
+    Return list of jobs:
+      {"name": N, "orig_pdb": N.pdb, "stripped_pdbqt": N.pdbqt, "docked_pdb": output_N.pdb, "template_mol2": N.mol2}
+    with robust fallbacks (legacy single-ligand).
+    """
+    names = _read_names_from_index()
+    if not names:
+        names = _fallback_discover_names()
+    jobs = []
+
+    single_mode = (len(names) == 1 and names[0] == "ligand")
+
+    for nm in names:
+        orig = Path(f"{nm}.pdb")
+        pq  = Path(f"{nm}.pdbqt")
+        mol2 = Path(f"{nm}.mol2")
+        dock = Path(f"output_{nm}.pdb")
+        if not dock.exists():
+            # allow "best_docked_<name>.pdb" from Step 3
+            bd = Path(f"best_docked_{nm}.pdb")
+            dock = bd if bd.exists() else dock
+        # legacy single-ligand fallbacks
+        if not orig.exists() and single_mode and Path("ligand.pdb").exists():
+            orig = Path("ligand.pdb")
+        if not pq.exists() and single_mode and Path("ligand.pdbqt").exists():
+            pq = Path("ligand.pdbqt")
+        if not mol2.exists() and single_mode and Path("ligand.mol2").exists():
+            mol2 = Path("ligand.mol2")
+        if not dock.exists() and single_mode and Path("output.pdb").exists():
+            dock = Path("output.pdb")
+
+        missing = [k for k, p in {"orig_pdb":orig, "stripped_pdbqt":pq, "docked_pdb":dock, "template_mol2":mol2}.items() if not p.exists()]
+        if missing:
+            print(f"⚠️  Skipping {nm}: missing files {missing}")
+            continue
+
+        jobs.append({"name": nm, "orig_pdb": orig, "stripped_pdbqt": pq, "docked_pdb": dock, "template_mol2": mol2})
+
+    if not jobs:
+        raise SystemExit("No ligand triplets found for alignment. Check ligands.index and Step 3 outputs (output_<name>.pdb).")
+    return jobs
+
 def _write_sdf_from_mol2_with_coords(tag: str, mol2_path: Path, coords_xyz: np.ndarray, out_sdf: Path):
-    """
-    Load RDKit Mol from MOL2 (preserves bond orders & charges),
-    replace conformer coordinates with aligned coords, and write SDF.
-    """
-    # Load MOL2 as RDKit mol (keeps charges/bonds)
+    """Load RDKit Mol from MOL2 (preserves bond orders & charges), set coords (Å), write SDF."""
     mol = Chem.MolFromMol2File(str(mol2_path), sanitize=True, removeHs=False)
     if mol is None:
         raise RuntimeError(f"[{tag}] RDKit failed to read MOL2: {mol2_path}")
-
     n = mol.GetNumAtoms()
     if n != coords_xyz.shape[0]:
         raise RuntimeError(f"[{tag}] Atom count mismatch: MOL2 has {n}, aligned coords have {coords_xyz.shape[0]}")
-
-    # Ensure a conformer exists; create if missing
     if mol.GetNumConformers() == 0:
         conf = Chem.Conformer(n)
         mol.AddConformer(conf, assignId=True)
     conf = mol.GetConformer(0)
-
-    # Set coordinates (Å)
     for i in range(n):
         x, y, z = float(coords_xyz[i,0]), float(coords_xyz[i,1]), float(coords_xyz[i,2])
         conf.SetAtomPosition(i, (x, y, z))
+    w = Chem.SDWriter(str(out_sdf))
+    w.write(mol); w.close()
 
-    # Write SDF
-    writer = Chem.SDWriter(str(out_sdf))
-    writer.write(mol)
-    writer.close()
+def _align_one(job):
+    nm = job["name"]
+    docked_coords, _   = extract_coordinates(str(job["docked_pdb"]))
+    full_coords, full_atoms = extract_coordinates(str(job["orig_pdb"]))
+    stripped_coords, _ = extract_coordinates(str(job["stripped_pdbqt"]))
 
-def _align_one(tag, files):
-    docked_coords, docked_atoms = extract_coordinates(str(files["docked_pdb"]))
-    full_coords,   full_atoms   = extract_coordinates(str(files["original_pdb"]))
-    stripped_coords,_           = extract_coordinates(str(files["stripped_pdbqt"]))
+    print(f"✅ Loaded {len(docked_coords)} docked, {len(full_coords)} full, {len(stripped_coords)} stripped atoms for {nm}")
 
-    print(f"✅ Loaded {len(docked_coords)} docked, {len(full_coords)} full, {len(stripped_coords)} stripped atoms for {tag}")
-
-    # sort by radial distance to centroid for stability
+    # stabilize pairing: sort by radial distance to centroid
     d1 = np.linalg.norm(docked_coords   - docked_coords.mean(axis=0), axis=1)
     d2 = np.linalg.norm(stripped_coords - stripped_coords.mean(axis=0), axis=1)
     sorted_docked   = docked_coords[np.argsort(d1)]
     sorted_stripped = stripped_coords[np.argsort(d2)]
 
     R, c_stripped, c_docked = kabsch(sorted_stripped, sorted_docked)
-    aligned_coords = (full_coords - c_stripped) @ R.T + c_docked  # Å
+    aligned = (full_coords - c_stripped) @ R.T + c_docked  # Å
 
-    aligned_pdb = Path(f"aligned_{tag}_fixed.pdb")
-    final_pdb   = Path(f"fixed_{tag}.pdb")
-    final_sdf   = Path(f"{tag}.sdf")
+    aligned_pdb = Path(f"aligned_{nm}_fixed.pdb")
+    fixed_pdb   = Path(f"fixed_{nm}.pdb")
+    out_sdf     = Path(f"{nm}.sdf")
 
-    # Write aligned PDB (for manual QC) and fix element column
+    # PDB for QC
     with aligned_pdb.open("w") as f:
         for i, (_, _, _, _, line) in enumerate(full_atoms):
-            x, y, z = aligned_coords[i]
+            x, y, z = aligned[i]
             f.write(f"{line[:30]}{x:8.3f}{y:8.3f}{z:8.3f}{line[54:]}")
-    fix_pdb_element_column(str(aligned_pdb), str(final_pdb))
 
-    # NEW: Write SDF from original MOL2 topology but with aligned coordinates
-    if not files["template_mol2"].exists():
-        raise FileNotFoundError(f"[{tag}] Missing template MOL2 from Step 1: {files['template_mol2']}")
-    _write_sdf_from_mol2_with_coords(tag, files["template_mol2"], aligned_coords, final_sdf)
-
-    print(f"✅ {tag}: aligned → {aligned_pdb} | fixed → {final_pdb} | SDF (RDKit) → {final_sdf}")
-
-    # legacy single-ligand copies, if needed
-    if tag == "ligand":
-        Path("aligned_ligand_fixed.pdb").write_bytes(aligned_pdb.read_bytes())
-        Path("fixed_ligand.pdb").write_bytes(final_pdb.read_bytes())
-        Path("ligand.sdf").write_bytes(final_sdf.read_bytes())
-        print("↪️  Also wrote legacy aligned_ligand_fixed.pdb / fixed_ligand.pdb / ligand.sdf")
+    fix_pdb_element_column(str(aligned_pdb), str(fixed_pdb))
+    _write_sdf_from_mol2_with_coords(nm, job["template_mol2"], aligned, out_sdf)
+    print(f"✅ {nm}: aligned → {aligned_pdb} | fixed → {fixed_pdb} | SDF → {out_sdf}")
 
 def main():
-    pairs = _discover_pairs()
-    if not pairs:
-        raise SystemExit("No ligand triplets found (expected ligand[_N].pdb/.pdbqt and output_ligand[_N].pdb).")
-    for tag, files in pairs:
-        print(f"\n--- Aligning {tag} ---")
-        _align_one(tag, files)
+    jobs = _discover_jobs()
+    print(f"\n[4] Aligning {len(jobs)} ligand(s): {', '.join(j['name'] for j in jobs)}\n")
+    for j in jobs:
+        _align_one(j)
+
+    # index of SDFs for Step 5 (and write a friendly summary)
+    names = [j["name"] for j in jobs]
+    Path("ligands_sdf.index").write_text("\n".join(names) + "\n", encoding="utf-8")
+    print("\nSummary:")
+    print("  • ligands_sdf.index  (one name per line, SDF = <name>.sdf)")
+    for n in names:
+        print(f"    - {n}.sdf")
 
 if __name__ == "__main__":
     main()
