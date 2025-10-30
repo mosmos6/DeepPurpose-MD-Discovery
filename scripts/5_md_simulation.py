@@ -536,9 +536,9 @@ if not args.no_ligand:
         index_ref_paths = ligand_paths[:]
 
     if index_names:
-    missing = [n for n in index_names if n not in by_name]
-    if missing:
-        print("⚠️  Listed in index but SDF missing:", ", ".join(missing))
+        missing = [n for n in index_names if n not in by_name]
+        if missing:
+            print("⚠️  Listed in index but SDF missing:", ", ".join(missing))
 
     # 5) optionally include an explicit single path as well
     if args.input_ligand:
