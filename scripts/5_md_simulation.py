@@ -11,6 +11,7 @@
 import argparse, csv, glob, re
 from pathlib import Path
 from sys import stdout
+import subprocess
 
 import openmm as mm
 from openmm.app import *
@@ -22,7 +23,6 @@ from openff.toolkit.utils.exceptions import MoleculeParseError
 from openff.toolkit.topology import Molecule, Topology as OFFTopology
 from openff.units.openmm import to_openmm
 
-from rdkit import Chem
 
 
 # =========================
@@ -370,25 +370,20 @@ def _select_subset(paths: list[Path], selector: str | None, index_ref: list[Path
     out = [p for p in order if p in wanted] if wanted else paths
     return out
 
-def _rdkit_from_sdf_repair(sdf_path: Path):
+def _obabel_rewrite_sdf_inplace(sdf_path: Path):
     """
-    Load an SDF with RDKit (sanitize=False), reapply charges from M  CHG records,
-    normalize phosphate O(-) charges, then sanitize. Returns an RDKit Mol.
+    Use Open Babel to rewrite the SDF in-place (normalizes charge/valence encoding
+    the same way you used in the single-ligand pipeline).
     """
-    # --- read raw text + parse M  CHG charge map ---
-    txt = sdf_path.read_text(encoding="utf-8", errors="ignore")
-    charges = {}
-    for ln in txt.splitlines():
-        if ln.startswith("M  CHG"):
-            parts = ln.split()
-            try:
-                n = int(parts[2])
-                for k in range(n):
-                    idx = int(parts[3 + 2*k]) - 1  # SDF is 1-based
-                    q   = int(parts[4 + 2*k])
-                    charges[idx] = q
-            except Exception:
-                pass
+    tmp = sdf_path.with_name(sdf_path.stem + ".__obw.sdf")
+    # Plain rewrite (no geometry changes); preserves coordinates.
+    subprocess.run(["obabel", str(sdf_path), "-O", str(tmp)], check=True)
+    # Replace original file atomically
+    sdf_path.write_bytes(tmp.read_bytes())
+    try:
+        tmp.unlink()
+    except Exception:
+        pass
 
     # --- load without sanitization ---
     suppl = Chem.SDMolSupplier(str(sdf_path), removeHs=False, sanitize=False)
@@ -432,40 +427,49 @@ def _rdkit_from_sdf_repair(sdf_path: Path):
     return mol
 
 def _add_ligands(modeller: Modeller, forcefield: ForceField, sdf_paths: list[Path]) -> int:
-    """
-    Add ligands using SDF coordinates (preferred). If an SDF fails to parse, try the
-    corresponding MOL2 (same stem) while keeping the coordinates from that file.
-    """
     if not sdf_paths:
         return 0
 
-    off_mols = []
-    tops = []
-    poss = []
+    off_mols, tops, poss = [], [], []
 
     for sdf in sdf_paths:
         lig = None
+        source = sdf.name
         try:
-            lig = Molecule.from_file(str(sdf))  # preferred
-            source = sdf.name
+            # First try: read the SDF exactly as written by Step 4 (Open Babel path)
+            lig = Molecule.from_file(str(sdf))
         except MoleculeParseError:
-            # 🔧 RDKit-based SDF repair (avoids MOL2 fallback)
+            # Only fallback: ask Open Babel to rewrite the SDF and try once more
+            print(f"   ↻ OpenFF could not parse {sdf.name}. Rewriting with Open Babel and retrying...")
+            _obabel_rewrite_sdf_inplace(sdf)
             try:
-                rdk = _rdkit_from_sdf_repair(sdf)
-                lig = Molecule.from_rdkit(rdk, allow_undefined_stereo=True)
-                source = f"{sdf.name} [repaired]"
-                print(f"   • repaired SDF charges/aromaticity for {sdf.name}")
-            except Exception as e:
-                raise MoleculeParseError(f"Unable to read (or repair) SDF: {sdf}  :: {e}")
+                lig = Molecule.from_file(str(sdf))
+                source = f"{sdf.name} [rewritten by obabel]"
+            except MoleculeParseError as e:
+                raise MoleculeParseError(
+                    f"OpenFF still could not parse {sdf.name} after an Open Babel rewrite. "
+                    f"Please inspect the file (charges/bonds). Under multi‑ligand mode we avoid RDKit repairs. "
+                    f"Original error: {e}"
+                )
 
         if len(lig.conformers) == 0:
-            # ensure we have coordinates
+            # Safety: SDF should already contain coords, but don't break if it doesn't.
             lig.generate_conformers(n_conformers=1)
 
         off_mols.append(lig)
         tops.append(OFFTopology.from_molecules([lig]).to_openmm())
         poss.append(to_openmm(lig.conformers[0]))
         print(f"   • ligand loaded from {source}")
+
+    smirnoff = SMIRNOFFTemplateGenerator(molecules=off_mols)
+    forcefield.registerTemplateGenerator(smirnoff.generator)
+
+    for top, pos in zip(tops, poss):
+        modeller.add(top, pos)
+
+    print(f"✅ Added {len(off_mols)} ligand(s): " + ", ".join(p.name for p in sdf_paths))
+    return len(off_mols)
+
 
     smirnoff = SMIRNOFFTemplateGenerator(molecules=off_mols)
     forcefield.registerTemplateGenerator(smirnoff.generator)
