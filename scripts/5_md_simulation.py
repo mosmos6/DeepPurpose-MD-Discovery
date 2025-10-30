@@ -22,6 +22,8 @@ from openff.toolkit.utils.exceptions import MoleculeParseError
 from openff.toolkit.topology import Molecule, Topology as OFFTopology
 from openff.units.openmm import to_openmm
 
+from rdkit import Chem
+
 
 # =========================
 # MixMD probe dictionary
@@ -368,6 +370,67 @@ def _select_subset(paths: list[Path], selector: str | None, index_ref: list[Path
     out = [p for p in order if p in wanted] if wanted else paths
     return out
 
+def _rdkit_from_sdf_repair(sdf_path: Path):
+    """
+    Load an SDF with RDKit (sanitize=False), reapply charges from M  CHG records,
+    normalize phosphate O(-) charges, then sanitize. Returns an RDKit Mol.
+    """
+    # --- read raw text + parse M  CHG charge map ---
+    txt = sdf_path.read_text(encoding="utf-8", errors="ignore")
+    charges = {}
+    for ln in txt.splitlines():
+        if ln.startswith("M  CHG"):
+            parts = ln.split()
+            try:
+                n = int(parts[2])
+                for k in range(n):
+                    idx = int(parts[3 + 2*k]) - 1  # SDF is 1-based
+                    q   = int(parts[4 + 2*k])
+                    charges[idx] = q
+            except Exception:
+                pass
+
+    # --- load without sanitization ---
+    suppl = Chem.SDMolSupplier(str(sdf_path), removeHs=False, sanitize=False)
+    mol = next((m for m in suppl if m is not None), None)
+    if mol is None:
+        # fallback parser
+        mol = Chem.MolFromMolBlock(txt, sanitize=False, removeHs=False, strictParsing=False)
+    if mol is None:
+        raise RuntimeError(f"RDKit could not load {sdf_path.name} even with sanitize=False")
+
+    # Clear any pre-existing formal charges (atom-block charge codes may be inconsistent)
+    for a in mol.GetAtoms():
+        a.SetFormalCharge(0)
+
+    # Re-apply charges from M  CHG
+    for idx, q in charges.items():
+        if 0 <= idx < mol.GetNumAtoms():
+            mol.GetAtomWithIdx(idx).SetFormalCharge(q)
+
+    # Phosphate guard: if an oxygen is singly bonded to P and has no explicit charge, set −1
+    for a in mol.GetAtoms():
+        if a.GetAtomicNum() == 8:  # O
+            nbrs = list(a.GetNeighbors())
+            bonds_to_P = sum(1 for nb in nbrs if nb.GetAtomicNum() == 15)  # P
+            if bonds_to_P == 1 and a.GetDegree() == 1 and a.GetFormalCharge() == 0:
+                a.SetFormalCharge(-1)
+
+    # Now sanitize in two stages (skip kekulization first; then try it)
+    try:
+        Chem.SanitizeMol(mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_KEKULIZE)
+        try:
+            Chem.Kekulize(mol, clearAromaticFlags=True)
+        except Exception:
+            # If kekulize still fails for fused/aromatic systems, keep aromatic as-is
+            pass
+    except Exception:
+        # Minimal sanitize if the full pipeline complains
+        Chem.SanitizeMol(mol, sanitizeOps=(Chem.SanitizeFlags.SANITIZE_PROPERTIES |
+                                           Chem.SanitizeFlags.SANITIZE_SYMMRINGS |
+                                           Chem.SanitizeFlags.SANITIZE_CLEANUP))
+    return mol
+
 def _add_ligands(modeller: Modeller, forcefield: ForceField, sdf_paths: list[Path]) -> int:
     """
     Add ligands using SDF coordinates (preferred). If an SDF fails to parse, try the
@@ -386,13 +449,14 @@ def _add_ligands(modeller: Modeller, forcefield: ForceField, sdf_paths: list[Pat
             lig = Molecule.from_file(str(sdf))  # preferred
             source = sdf.name
         except MoleculeParseError:
-            # fallback to MOL2
-            mol2 = sdf.with_suffix(".mol2")
-            if mol2.exists():
-                lig = Molecule.from_file(str(mol2))
-                source = mol2.name
-            else:
-                raise
+            # 🔧 RDKit-based SDF repair (avoids MOL2 fallback)
+            try:
+                rdk = _rdkit_from_sdf_repair(sdf)
+                lig = Molecule.from_rdkit(rdk, allow_undefined_stereo=True)
+                source = f"{sdf.name} [repaired]"
+                print(f"   • repaired SDF charges/aromaticity for {sdf.name}")
+            except Exception as e:
+                raise MoleculeParseError(f"Unable to read (or repair) SDF: {sdf}  :: {e}")
 
         if len(lig.conformers) == 0:
             # ensure we have coordinates
