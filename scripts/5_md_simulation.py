@@ -1,17 +1,17 @@
 # 5_md_simulation.py
 # Author: Iori Mochizuki + collaborator patch
-# Updated: 2025-10-28
+# Updated: 2025-11-04
 #
 # Description: OpenMM MD (protein/RNA/ligand[s]) with optional MixMD-from-Packmol import.
-# - Multi-ligand ready: auto-detects SDF ligands (reads ligands_sdf.index when present) and adds all.
+# - Multi-ligand ready: reads SDFs written by Step 4 (Open Babel path), ordered by ligands_sdf.index.
+# - NO RDKit/MOL2 fallbacks here — if a ligand fails to load, fix/rewrite its SDF in Step 4.
 # - MixMD: reads Packmol placements CSV, adds probes pre-solvation, logs probe centroids each stride.
 # - Hotspot CSV is receptor-centered (protein COM) and records beyond step 0 (robust schedule).
 # - Writes both PDB and mmCIF to avoid 5-digit atom-serial issues in large boxes.
 
-import argparse, csv, glob, re
+import argparse, csv
 from pathlib import Path
 from sys import stdout
-import subprocess
 
 import openmm as mm
 from openmm.app import *
@@ -22,7 +22,6 @@ from openff.toolkit.utils.exceptions import MoleculeParseError
 
 from openff.toolkit.topology import Molecule, Topology as OFFTopology
 from openff.units.openmm import to_openmm
-
 
 
 # =========================
@@ -197,7 +196,7 @@ class ProbeHotspotReporter:
 
 
 # =========================
-# Helpers: probes from Packmol
+# Helpers: Packmol probes
 # =========================
 def _openff_conf_to_angstrom_list(off_mol: Molecule):
     """Return [(x,y,z) in Å] from an OpenFF Molecule conformer (no NumPy)."""
@@ -319,33 +318,12 @@ def _add_probes_from_packmol(modeller: Modeller,
 
 
 # =========================
-# Helpers: multi‑ligand load
+# Helpers: multi‑ligand load (SDF only)
 # =========================
-
 def _read_ligand_index(index_path=Path("ligands_sdf.index")) -> list[str]:
     if index_path.exists():
         return [ln.strip() for ln in index_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
     return []
-
-def _find_ligand_sdfs(patterns=("ligand*.sdf",), folders=("ligands","Ligands","LIGANDS"), respect_index=True) -> list[Path]:
-    allow = set(_read_ligand_index()) if respect_index else None
-    found = []
-    # CWD patterns
-    for pat in patterns:
-        for p in sorted(Path(".").glob(pat)):
-            if p.suffix.lower() == ".sdf":
-                if (allow is None) or (p.stem in allow):
-                    found.append(p.resolve())
-    # Optional folders
-    for folder in folders:
-        d = Path(folder)
-        if d.is_dir():
-            for p in sorted(d.glob("*.sdf")):
-                if (allow is None) or (p.stem in allow):
-                    found.append(p.resolve())
-    # deterministic by name
-    return sorted(set(found), key=lambda q: q.name)
-
 
 def _select_subset(paths: list[Path], selector: str | None, index_ref: list[Path]) -> list[Path]:
     """
@@ -356,7 +334,6 @@ def _select_subset(paths: list[Path], selector: str | None, index_ref: list[Path
         return paths
     wanted = set()
     tokens = [t.strip() for t in selector.split(",") if t.strip()]
-    # helper: build maps
     by_name = {p.stem: p for p in paths}
     order = index_ref if index_ref else paths
     by_idx = {str(i): order[i-1] for i in range(1, len(order)+1)}
@@ -370,106 +347,81 @@ def _select_subset(paths: list[Path], selector: str | None, index_ref: list[Path
     out = [p for p in order if p in wanted] if wanted else paths
     return out
 
-def _obabel_rewrite_sdf_inplace(sdf_path: Path):
+def _collect_sdf_paths(index_file: Path,
+                       allow_extras: bool,
+                       pattern: str | None,
+                       extra_dir: str | None) -> tuple[list[Path], list[Path]]:
     """
-    Use Open Babel to rewrite the SDF in-place (normalizes charge/valence encoding
-    the same way you used in the single-ligand pipeline).
+    Return (ligand_paths, index_ref_paths).
+    - If index exists: use names in index (N.sdf). If --allow-extras, append other *.sdf found.
+    - Else: use discovered *.sdf (sorted by name).
     """
-    tmp = sdf_path.with_name(sdf_path.stem + ".__obw.sdf")
-    # Plain rewrite (no geometry changes); preserves coordinates.
-    subprocess.run(["obabel", str(sdf_path), "-O", str(tmp)], check=True)
-    # Replace original file atomically
-    sdf_path.write_bytes(tmp.read_bytes())
-    try:
-        tmp.unlink()
-    except Exception:
-        pass
+    names = _read_ligand_index(index_file)
+    discovered: list[Path] = []
 
-    # --- load without sanitization ---
-    suppl = Chem.SDMolSupplier(str(sdf_path), removeHs=False, sanitize=False)
-    mol = next((m for m in suppl if m is not None), None)
-    if mol is None:
-        # fallback parser
-        mol = Chem.MolFromMolBlock(txt, sanitize=False, removeHs=False, strictParsing=False)
-    if mol is None:
-        raise RuntimeError(f"RDKit could not load {sdf_path.name} even with sanitize=False")
+    # discover SDFs in CWD by pattern (default: "*.sdf")
+    pat = pattern or "*.sdf"
+    for p in sorted(Path(".").glob(pat)):
+        if p.suffix.lower() == ".sdf":
+            discovered.append(p.resolve())
 
-    # Clear any pre-existing formal charges (atom-block charge codes may be inconsistent)
-    for a in mol.GetAtoms():
-        a.SetFormalCharge(0)
+    # optional extra folder
+    if extra_dir:
+        d = Path(extra_dir)
+        if d.is_dir():
+            for p in sorted(d.glob("*.sdf")):
+                discovered.append(p.resolve())
 
-    # Re-apply charges from M  CHG
-    for idx, q in charges.items():
-        if 0 <= idx < mol.GetNumAtoms():
-            mol.GetAtomWithIdx(idx).SetFormalCharge(q)
+    by_name = {p.stem: p for p in discovered}
+    ligand_paths: list[Path] = []
+    index_ref_paths: list[Path] = []
 
-    # Phosphate guard: if an oxygen is singly bonded to P and has no explicit charge, set −1
-    for a in mol.GetAtoms():
-        if a.GetAtomicNum() == 8:  # O
-            nbrs = list(a.GetNeighbors())
-            bonds_to_P = sum(1 for nb in nbrs if nb.GetAtomicNum() == 15)  # P
-            if bonds_to_P == 1 and a.GetDegree() == 1 and a.GetFormalCharge() == 0:
-                a.SetFormalCharge(-1)
+    if names:
+        ordered = [by_name[n] for n in names if n in by_name]
+        index_ref_paths = ordered[:]
+        if allow_extras:
+            extras = [p for nm, p in sorted(by_name.items(), key=lambda kv: kv[0]) if nm not in set(names)]
+        else:
+            extras = []
+        ligand_paths = ordered + extras
 
-    # Now sanitize in two stages (skip kekulization first; then try it)
-    try:
-        Chem.SanitizeMol(mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_KEKULIZE)
-        try:
-            Chem.Kekulize(mol, clearAromaticFlags=True)
-        except Exception:
-            # If kekulize still fails for fused/aromatic systems, keep aromatic as-is
-            pass
-    except Exception:
-        # Minimal sanitize if the full pipeline complains
-        Chem.SanitizeMol(mol, sanitizeOps=(Chem.SanitizeFlags.SANITIZE_PROPERTIES |
-                                           Chem.SanitizeFlags.SANITIZE_SYMMRINGS |
-                                           Chem.SanitizeFlags.SANITIZE_CLEANUP))
-    return mol
+        missing = [n for n in names if n not in by_name]
+        if missing:
+            print("⚠️  Listed in index but SDF missing:", ", ".join(missing))
+    else:
+        ligand_paths = [p for p in sorted(set(discovered), key=lambda q: q.name)]
+        index_ref_paths = ligand_paths[:]
+
+    return ligand_paths, index_ref_paths
 
 def _add_ligands(modeller: Modeller, forcefield: ForceField, sdf_paths: list[Path]) -> int:
+    """
+    Add ligands using SDF coordinates written by Step 4 (Open Babel route).
+    NO RDKit/MOL2 fallback here; failures should be fixed by re-running Step 4.
+    """
     if not sdf_paths:
         return 0
 
     off_mols, tops, poss = [], [], []
 
     for sdf in sdf_paths:
-        lig = None
-        source = sdf.name
         try:
-            # First try: read the SDF exactly as written by Step 4 (Open Babel path)
-            lig = Molecule.from_file(str(sdf))
-        except MoleculeParseError:
-            # Only fallback: ask Open Babel to rewrite the SDF and try once more
-            print(f"   ↻ OpenFF could not parse {sdf.name}. Rewriting with Open Babel and retrying...")
-            _obabel_rewrite_sdf_inplace(sdf)
-            try:
-                lig = Molecule.from_file(str(sdf))
-                source = f"{sdf.name} [rewritten by obabel]"
-            except MoleculeParseError as e:
-                raise MoleculeParseError(
-                    f"OpenFF still could not parse {sdf.name} after an Open Babel rewrite. "
-                    f"Please inspect the file (charges/bonds). Under multi‑ligand mode we avoid RDKit repairs. "
-                    f"Original error: {e}"
-                )
+            lig = Molecule.from_file(str(sdf))  # OpenFF (RDKit backend) on the OB-generated SDF
+        except MoleculeParseError as e:
+            raise MoleculeParseError(
+                f"Unable to read ligand from SDF: {sdf}. "
+                f"Re-run Step 4 (Open Babel) for this ligand and try again. "
+                f"Original error: {e}"
+            )
 
         if len(lig.conformers) == 0:
-            # Safety: SDF should already contain coords, but don't break if it doesn't.
+            # Safety: SDF should already contain coords; generate if missing.
             lig.generate_conformers(n_conformers=1)
 
         off_mols.append(lig)
         tops.append(OFFTopology.from_molecules([lig]).to_openmm())
         poss.append(to_openmm(lig.conformers[0]))
-        print(f"   • ligand loaded from {source}")
-
-    smirnoff = SMIRNOFFTemplateGenerator(molecules=off_mols)
-    forcefield.registerTemplateGenerator(smirnoff.generator)
-
-    for top, pos in zip(tops, poss):
-        modeller.add(top, pos)
-
-    print(f"✅ Added {len(off_mols)} ligand(s): " + ", ".join(p.name for p in sdf_paths))
-    return len(off_mols)
-
+        print(f"   • ligand loaded from {sdf.name}")
 
     smirnoff = SMIRNOFFTemplateGenerator(molecules=off_mols)
     forcefield.registerTemplateGenerator(smirnoff.generator)
@@ -507,7 +459,6 @@ parser.add_argument("--ligand-pattern", type=str, default="*.sdf",
                     help="Glob pattern to search for SDFs in CWD when no index is present.")
 parser.add_argument("--ligand-dir", type=str, default=None,
                     help="Optional folder to also scan for SDFs.")
-# optional switch to INCLUDE strays not in the index (default: ignore)
 parser.add_argument("--allow-extras", action="store_true",
                     help="Also include SDFs not listed in the --ligand-index file.")
 
@@ -563,66 +514,27 @@ added_ligands = 0
 ligand_paths: list[Path] = []
 
 if not args.no_ligand:
-    # --- (C) Respect ligands_sdf.index order, ignore strays by default ---
-    # 1) names in index (if file exists)
-    index_names = _read_ligand_index(Path(args.ligand_index))  # list[str] stems
+    ligand_paths, index_ref_paths = _collect_sdf_paths(
+        index_file=Path(args.ligand_index),
+        allow_extras=bool(args.allow_extras),
+        pattern=args.ligand_pattern,
+        extra_dir=args.ligand_dir,
+    )
 
-    # 2) discover all SDFs without applying index yet
-    discovered: list[Path] = []
-    # CWD pattern(s)
-    for p in Path(".").glob(args.ligand_pattern):
-        if p.suffix.lower() == ".sdf":
-            discovered.append(p.resolve())
-    # optional folder scan
-    if args.ligand_dir:
-        d = Path(args.ligand_dir)
-        if d.is_dir():
-            for p in d.glob("*.sdf"):
-                discovered.append(p.resolve())
-
-    # 3) map by stem for ordering/filtering
-    by_name = {p.stem: p for p in discovered}
-
-    # 4) if index present: keep only those, in that order; else keep all (sorted)
-    by_name = {p.stem: p for p in discovered}
-    
-    if index_names:
-        ordered_by_index = [by_name[n] for n in index_names if n in by_name]
-    
-        if args.allow_extras:
-            extras = sorted(
-                [p for name, p in by_name.items() if name not in set(index_names)],
-                key=lambda q: q.name
-            )
-        else:
-            extras = []  # default: ignore strays
-    
-        ligand_paths = ordered_by_index + extras
-        index_ref_paths = ordered_by_index[:] if ordered_by_index else ligand_paths[:]
-    else:
-        ligand_paths = sorted(set(discovered), key=lambda q: q.name)
-        index_ref_paths = ligand_paths[:]
-
-    if index_names:
-        missing = [n for n in index_names if n not in by_name]
-        if missing:
-            print("⚠️  Listed in index but SDF missing:", ", ".join(missing))
-
-    # 5) optionally include an explicit single path as well
+    # Optional explicit single path as well
     if args.input_ligand:
         p = Path(args.input_ligand).resolve()
         if p.exists() and p.suffix.lower() == ".sdf" and p not in ligand_paths:
             ligand_paths.append(p)
 
-    # 6) optional subset selection (names or 1-based indices wrt index order)
+    # Optional subset selection (names or 1-based indices w.r.t index order)
     ligand_paths = _select_subset(ligand_paths, args.ligand_select, index_ref_paths)
 
-    # 7) add to modeller
+    print(f"🔎 SDFs to add (in order): {', '.join(p.name for p in ligand_paths)}")
     added_ligands = _add_ligands(modeller, forcefield, ligand_paths)
     print(f"✅ Ligand mode: added {added_ligands} ligand(s).")
 else:
     print("✅ No ligand: receptor-only (apo) setup")
-
 
 print(f"   Atoms before solvation: {_count_atoms(modeller.topology)}")
 
