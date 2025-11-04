@@ -46,9 +46,9 @@ def _align_one(name: str):
         return False
 
     # === Step 1: Load coordinates (same helpers as before) ===
-    docked_coords, _        = extract_coordinates(str(docked_pdb))
-    full_coords,  full_atoms = extract_coordinates(str(original_pdb))
-    stripped_coords, _      = extract_coordinates(str(stripped_pdbqt))
+    docked_coords, _        = extract_coordinates(docked_pdb)
+    full_coords,  full_atoms = extract_coordinates(original_pdb)
+    stripped_coords, _      = extract_coordinates(stripped_pdbqt)
 
     print(f"✅ Loaded {len(docked_coords)} docked, {len(full_coords)} full, {len(stripped_coords)} stripped atoms for {name}")
 
@@ -71,7 +71,7 @@ def _align_one(name: str):
     print(f"✅ Aligned ligand written to: {aligned_pdb}")
 
     # === Step 5: Fix element column ===
-    fix_pdb_element_column(str(aligned_pdb), str(final_pdb))
+    fix_pdb_element_column(aligned_pdb, final_pdb)
 
     # === Step 6: Convert to SDF via Open Babel (unchanged route) ===
     try:
