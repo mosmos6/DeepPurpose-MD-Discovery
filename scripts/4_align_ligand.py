@@ -102,7 +102,7 @@ def _discover_jobs():
 def _obabel_pdb_to_sdf(fixed_pdb: Path, out_sdf: Path):
     """Use Open Babel exactly as in the original single‑ligand pipeline."""
     try:
-        subprocess.run(["obabel", str(fixed_pdb), "-O", str(out_sdf)],
+        subprocess.run(["obabel", str(fixed_pdb), "-O", out_sdf],
                        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except FileNotFoundError:
         raise SystemExit("Open Babel ('obabel') not found in PATH. Install it in your conda env.")
