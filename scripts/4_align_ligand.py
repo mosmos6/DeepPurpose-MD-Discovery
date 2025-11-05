@@ -52,14 +52,15 @@ def _align_one(name: str):
 
     print(f"✅ Loaded {len(docked_coords)} docked, {len(full_coords)} full, {len(stripped_coords)} stripped atoms for {name}")
 
-    # === Step 2: Sort by radial distance (stability) ===
-    d1 = np.linalg.norm(docked_coords   - docked_coords.mean(axis=0), axis=1)
-    d2 = np.linalg.norm(stripped_coords - stripped_coords.mean(axis=0), axis=1)
-    sorted_docked   = docked_coords[np.argsort(d1)]
-    sorted_stripped = stripped_coords[np.argsort(d2)]
-
-    # === Step 3: Kabsch alignment ===
-    R, c_stripped, c_docked = kabsch(sorted_stripped, sorted_docked)
+    # === Step 2+3: Kabsch alignment WITHOUT any reordering ===
+    # Make sure the atom counts match between the stripped (PDBQT) and docked pose.
+    if stripped_coords.shape[0] != docked_coords.shape[0]:
+        raise ValueError(
+            f"Atom count mismatch for {nm}: stripped={stripped_coords.shape[0]} vs docked={docked_coords.shape[0]}"
+        )
+    
+    # Align using original index order (Vina keeps atom order)
+    R, c_stripped, c_docked = kabsch(stripped_coords, docked_coords)
     aligned_coords = (full_coords - c_stripped) @ R.T + c_docked  # Å
 
     # === Step 4: Write aligned structure ===
