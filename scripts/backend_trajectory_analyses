@@ -1,0 +1,2729 @@
+import jax.numpy as jnp
+import numpy as np
+import matplotlib.pyplot as plt
+import mdtraj as md
+from tqdm import tqdm
+import seaborn as sns
+import pandas as pd
+import builtins
+from collections import defaultdict
+from sklearn.decomposition import PCA
+from scipy.constants import Boltzmann
+
+# Helper: Get ligand atom indices
+def get_ligand_atoms(traj, ligand_resname="UNK"):
+    return [atom.index for atom in traj.topology.atoms if atom.residue.name.strip() == ligand_resname]
+
+# 1. Global RMSD (Overlay: holo vs apo)
+def run_rmsd_overlay(traj_apo_file, top_apo_file, traj_holo_file, top_holo_file, out_prefix=""):
+    traj_apo = md.load_dcd(traj_apo_file, top=top_apo_file)
+    traj_holo = md.load_dcd(traj_holo_file, top=top_holo_file)
+    exclude = {"HOH", "NA", "CL"}
+    valid_atoms_apo = [i for i, a in enumerate(traj_apo.topology.atoms) if a.residue.name.strip() not in exclude]
+    valid_atoms_holo = [i for i, a in enumerate(traj_holo.topology.atoms) if a.residue.name.strip() not in exclude]
+    coords_apo = jnp.array(traj_apo.xyz)[:, valid_atoms_apo, :]
+    coords_holo = jnp.array(traj_holo.xyz)[:, valid_atoms_holo, :]
+    ref_xyz_apo = coords_apo[0]
+    ref_xyz_holo = coords_holo[0]
+    def compute_rmsd(coords, ref):
+        return jnp.sqrt(jnp.mean(jnp.square(coords - ref), axis=(1,2)))
+    rmsd_apo = compute_rmsd(coords_apo, ref_xyz_apo)
+    rmsd_holo = compute_rmsd(coords_holo, ref_xyz_holo)
+    plt.figure(figsize=(10, 4))
+    plt.plot(rmsd_apo, label="Apo (no ligand)")
+    plt.plot(rmsd_holo, label="Ligand-bound")
+    plt.xlabel("Frame")
+    plt.ylabel("RMSD (nm)")
+    plt.title("Global RMSD: Apo vs Ligand-bound (JAX)")
+    plt.legend()
+    plt.tight_layout()
+    fname = f"{out_prefix}rmsd_overlay.png"
+    plt.savefig(fname)
+    print(f"✅ RMSD overlay saved as {fname}")
+
+# 2. Global RMSF (Overlay)
+def run_rmsf_overlay(traj_apo_file, top_apo_file, traj_holo_file, top_holo_file, out_prefix=""):
+    traj_apo = md.load_dcd(traj_apo_file, top=top_apo_file)
+    traj_holo = md.load_dcd(traj_holo_file, top=top_holo_file)
+    exclude = {"HOH", "NA", "CL"}
+    valid_atoms_apo = [i for i, a in enumerate(traj_apo.topology.atoms) if a.residue.name.strip() not in exclude]
+    valid_atoms_holo = [i for i, a in enumerate(traj_holo.topology.atoms) if a.residue.name.strip() not in exclude]
+    coords_apo = jnp.array(traj_apo.xyz)[:, valid_atoms_apo, :]
+    coords_holo = jnp.array(traj_holo.xyz)[:, valid_atoms_holo, :]
+    avg_xyz_apo = jnp.mean(coords_apo, axis=0)
+    avg_xyz_holo = jnp.mean(coords_holo, axis=0)
+    rmsf_apo = jnp.sqrt(jnp.mean(jnp.sum((coords_apo - avg_xyz_apo[None, :, :])**2, axis=2), axis=0))
+    rmsf_holo = jnp.sqrt(jnp.mean(jnp.sum((coords_holo - avg_xyz_holo[None, :, :])**2, axis=2), axis=0))
+    plt.figure(figsize=(10, 4))
+    plt.plot(rmsf_apo, label="Apo (no ligand)")
+    plt.plot(rmsf_holo, label="Ligand-bound")
+    plt.xlabel("Atom Index")
+    plt.ylabel("RMSF (nm)")
+    plt.title("Global RMSF: Apo vs Ligand-bound (JAX)")
+    plt.legend()
+    plt.tight_layout()
+    fname = f"{out_prefix}rmsf_overlay.png"
+    plt.savefig(fname)
+    print(f"✅ RMSF overlay saved as {fname}")
+
+# 3. Ligand RMSD (holo only)
+def run_ligand_rmsd(traj_file, top_file, ligand_resname="UNK", out_prefix=""):
+    traj = md.load_dcd(traj_file, top=top_file)
+    ligand_atoms = get_ligand_atoms(traj, ligand_resname)
+    if not ligand_atoms:
+        print("❗ No ligand atoms found; skipping ligand RMSD.")
+        return
+    ligand_rmsd = md.rmsd(traj, traj, frame=0, atom_indices=ligand_atoms)
+    plt.figure(figsize=(8, 5))
+    plt.plot(traj.time / 1000, ligand_rmsd, label="Ligand RMSD (nm)")
+    plt.xlabel("Time (ns)")
+    plt.ylabel("RMSD (nm)")
+    plt.title("Ligand RMSD Over Time")
+    plt.legend()
+    plt.grid()
+    plt.tight_layout()
+    fname = f"{out_prefix}ligand_rmsd.png"
+    plt.savefig(fname)
+    print(f"✅ Ligand RMSD plot saved as {fname}")
+
+# 4. Hydration Shell (holo only, JAX-accelerated)
+def run_hydration_shell(traj_file, top_file, ligand_resname="UNK", out_prefix="", dist_cutoff=0.35):
+    traj = md.load_dcd(traj_file, top=top_file)
+    ligand_atoms = get_ligand_atoms(traj, ligand_resname)
+    water_atoms = traj.topology.select("water")
+    # Compute distances (JAX)
+    coords = jnp.array(traj.xyz)
+    lig_xyz = coords[:, ligand_atoms, :]
+    wat_xyz = coords[:, water_atoms, :]
+    # Pairwise distances: (frames, n_lig, n_wat, 3)
+    diff = lig_xyz[:, :, None, :] - wat_xyz[:, None, :, :]
+    dists = jnp.linalg.norm(diff, axis=-1)  # (frames, n_lig, n_wat)
+    min_dists = jnp.min(dists, axis=1)      # (frames, n_wat)
+    hydration_counts = jnp.sum(min_dists < dist_cutoff, axis=1)
+    plt.figure(figsize=(8, 5))
+    plt.plot(np.arange(traj.n_frames), hydration_counts, label="Hydration Count (Water Bridges)")
+    plt.xlabel("Frame")
+    plt.ylabel("Number of Water Molecules")
+    plt.title("Hydration Shell Around Ligand Over Time")
+    plt.legend()
+    plt.grid()
+    plt.tight_layout()
+    fname = f"{out_prefix}hydration_shell.png"
+    plt.savefig(fname)
+    print(f"✅ Hydration shell plot saved as {fname}")
+
+# 5. Contact Analysis (holo only, but can extend)
+def run_contact_analysis_rna(traj_file, top_file, ligand_resname="UNK", out_prefix=""):
+    import mdtraj as md
+    import jax.numpy as jnp
+    from tqdm import tqdm
+    from collections import defaultdict
+    import pandas as pd
+    import builtins
+
+    traj = md.load_dcd(traj_file, top=top_file)
+    coords = jnp.array(traj.xyz)
+    rna_base_names = {"A", "U", "G", "C", "DA", "DG", "DT", "DC", "DU"}
+
+    ligand_atoms = [atom.index for atom in traj.topology.atoms if atom.residue.name.strip() == ligand_resname]
+    rna_atoms = [atom.index for atom in traj.topology.atoms if atom.residue.name.strip() in rna_base_names]
+
+    atom_to_res_obj = {atom.index: atom.residue for atom in traj.topology.atoms if atom.index in rna_atoms}
+    atom_to_res_label = {atom.index: f"{atom.residue.name} {atom.residue.resSeq}" for atom in traj.topology.atoms if atom.index in rna_atoms}
+
+    cutoff = 0.4  # nm = 4 Å
+    residue_contact_counts = defaultdict(int)
+    residue_frame_hits = defaultdict(set)
+    residue_unique_labels = defaultdict(set)
+
+    for frame_idx in tqdm(range(coords.shape[0]), desc="Processing frames (contact)"):
+        lig_xyz = coords[frame_idx, ligand_atoms]
+        rna_xyz = coords[frame_idx, rna_atoms]
+        diff = lig_xyz[:, None, :] - rna_xyz[None, :, :]
+        dists = jnp.linalg.norm(diff, axis=-1)
+        contacts = jnp.argwhere(dists < cutoff)
+        for _, rna_idx in contacts:
+            rna_index = int(rna_atoms[int(rna_idx)])
+            res_obj = atom_to_res_obj[rna_index]
+            res_label = atom_to_res_label[rna_index]
+            residue_contact_counts[res_obj] += 1
+            residue_frame_hits[res_obj].add(frame_idx)
+            residue_unique_labels[res_label].add(frame_idx)
+
+    total_contacts = builtins.sum(residue_contact_counts.values())
+    interaction_frequencies = {
+        f"{res}": (count / total_contacts) * 100 for res, count in residue_contact_counts.items()
+    }
+    residence_times = {
+        f"{res}": (len(frames) / traj.n_frames) * 100 for res, frames in residue_frame_hits.items()
+    }
+
+    residue_frame_counts = {label: len(frames) for label, frames in residue_unique_labels.items()}
+    sorted_counts = sorted(residue_frame_counts.items(), key=lambda x: x[1], reverse=True)
+
+    df = pd.DataFrame({
+        "Residue": list(interaction_frequencies.keys()),
+        "Frequency (%)": list(interaction_frequencies.values()),
+        "Residence Time (%)": [residence_times[res] for res in interaction_frequencies]
+    }).sort_values(by="Frequency (%)", ascending=False).reset_index(drop=True)
+
+    # === Output (text and csv)
+    summary_txt = "\n🔹 Residue-Ligand Interaction Summary:\n" + df.to_string(index=False)
+    summary_txt += "\n\n🔹 Most Frequent RNA Residue Contacts with Ligand (unique frames):\n"
+    for res, count in sorted_counts[:20]:
+        summary_txt += f"{res}: {count} frames\n"
+    print(summary_txt)
+    with open(f"{out_prefix}contact_summary.txt", "w") as f:
+        f.write(summary_txt)
+    df.to_csv(f"{out_prefix}contact_summary.csv", index=False)
+
+    # === Bar plot
+    plt.figure(figsize=(12, 4))
+    plt.bar([x[0] for x in sorted_counts[:20]], [x[1] for x in sorted_counts[:20]])
+    plt.xticks(rotation=90)
+    plt.xlabel("RNA Residue")
+    plt.ylabel("Unique Frames")
+    plt.title("Top 20 Residue-Ligand Contacts (unique frames)")
+    plt.tight_layout()
+    plt.savefig(f"{out_prefix}contact_barplot.png")
+    plt.show()
+    print(f"✅ Contact summary: text, csv, and plot saved (prefix {out_prefix})")
+
+def run_contact_analysis_protein(traj_file, top_file, ligand_resname="UNK", out_prefix=""):
+    import mdtraj as md
+    import jax.numpy as jnp
+    from tqdm import tqdm
+    from collections import defaultdict
+    import pandas as pd
+    import builtins
+
+    traj = md.load_dcd(traj_file, top=top_file)
+    coords = jnp.array(traj.xyz)
+
+    # === Protein residue atom selection ===
+    protein_resnames = set([res.name for res in traj.topology.residues if res.name not in {"HOH", ligand_resname}])
+    ligand_atoms = [atom.index for atom in traj.topology.atoms if atom.residue.name.strip() == ligand_resname]
+    protein_atoms = [atom.index for atom in traj.topology.atoms if atom.residue.name.strip() in protein_resnames]
+
+    atom_to_res_obj = {atom.index: atom.residue for atom in traj.topology.atoms if atom.index in protein_atoms}
+    atom_to_res_label = {atom.index: f"{atom.residue.name} {atom.residue.resSeq}" for atom in traj.topology.atoms if atom.index in protein_atoms}
+
+    cutoff = 0.4  # nm = 4 Å
+    residue_contact_counts = defaultdict(int)
+    residue_frame_hits = defaultdict(set)
+    residue_unique_labels = defaultdict(set)
+
+    for frame_idx in tqdm(range(coords.shape[0]), desc="Processing frames (protein contact)"):
+        lig_xyz = coords[frame_idx, ligand_atoms]
+        prot_xyz = coords[frame_idx, protein_atoms]
+        diff = lig_xyz[:, None, :] - prot_xyz[None, :, :]
+        dists = jnp.linalg.norm(diff, axis=-1)
+        contacts = jnp.argwhere(dists < cutoff)
+        for _, prot_idx in contacts:
+            prot_index = int(protein_atoms[int(prot_idx)])
+            res_obj = atom_to_res_obj[prot_index]
+            res_label = atom_to_res_label[prot_index]
+            residue_contact_counts[res_obj] += 1
+            residue_frame_hits[res_obj].add(frame_idx)
+            residue_unique_labels[res_label].add(frame_idx)
+
+    total_contacts = builtins.sum(residue_contact_counts.values())
+    interaction_frequencies = {
+        f"{res}": (count / total_contacts) * 100 for res, count in residue_contact_counts.items()
+    }
+    residence_times = {
+        f"{res}": (len(frames) / traj.n_frames) * 100 for res, frames in residue_frame_hits.items()
+    }
+
+    residue_frame_counts = {label: len(frames) for label, frames in residue_unique_labels.items()}
+    sorted_counts = sorted(residue_frame_counts.items(), key=lambda x: x[1], reverse=True)
+
+    df = pd.DataFrame({
+        "Residue": list(interaction_frequencies.keys()),
+        "Frequency (%)": list(interaction_frequencies.values()),
+        "Residence Time (%)": [residence_times[res] for res in interaction_frequencies]
+    }).sort_values(by="Frequency (%)", ascending=False).reset_index(drop=True)
+
+    summary_txt = "\n🔹 Protein Residue-Ligand Interaction Summary:\n" + df.to_string(index=False)
+    summary_txt += "\n\n🔹 Most Frequent Protein Residue Contacts with Ligand (unique frames):\n"
+    for res, count in sorted_counts[:20]:
+        summary_txt += f"{res}: {count} frames\n"
+    print(summary_txt)
+    with open(f"{out_prefix}protein_contact_summary.txt", "w") as f:
+        f.write(summary_txt)
+    df.to_csv(f"{out_prefix}protein_contact_summary.csv", index=False)
+
+    plt.figure(figsize=(12, 4))
+    plt.bar([x[0] for x in sorted_counts[:20]], [x[1] for x in sorted_counts[:20]])
+    plt.xticks(rotation=90)
+    plt.xlabel("Protein Residue")
+    plt.ylabel("Unique Frames")
+    plt.title("Top 20 Protein Residue-Ligand Contacts (unique frames)")
+    plt.tight_layout()
+    plt.savefig(f"{out_prefix}protein_contact_barplot.png")
+    plt.show()
+    print(f"✅ Protein contact summary: text, csv, and plot saved (prefix {out_prefix})")
+
+
+# 6. H-Bond Analysis (holo only, image heatmap)
+def run_hbond_analysis_rna(traj_file, top_file, ligand_resname="UNK", out_prefix="", dist_cutoff=0.35, angle_cutoff=120.0):
+    import mdtraj as md, jax.numpy as jnp
+    from tqdm import tqdm
+    from collections import defaultdict, Counter
+    import pandas as pd, seaborn as sns, matplotlib.pyplot as plt, numpy as np
+
+    traj = md.load_dcd(traj_file, top=top_file)
+    coords = jnp.array(traj.xyz)
+    atoms = list(traj.topology.atoms)
+
+    # --- bond map ---
+    bond_map = {i: [] for i in range(len(atoms))}
+    for a, b in traj.topology.bonds:
+        bond_map[a.index].append(b.index)
+        bond_map[b.index].append(a.index)
+
+    # --- selection flags ---
+    is_water  = np.array([a.residue.name.strip() == "HOH" for a in atoms])
+    is_ligand = np.array([a.residue.name.strip() == ligand_resname for a in atoms])
+    is_rna    = np.array([a.residue.is_nucleic for a in atoms])  # mdtraj flag for nucleic acids
+
+    # Acceptors: N or O on RNA OR ligand (not water)
+    acceptors = np.array([i for i,a in enumerate(atoms)
+                          if a.element.symbol in ("N","O") and (is_rna[i] or is_ligand[i]) and not is_water[i]], dtype=int)
+
+    # Donor heavy atoms: N–H, O–H (optionally S–H) on RNA OR ligand (not water)
+    donors, hydrogens = [], []
+    for i, a in enumerate(atoms):
+        if is_water[i]:
+            continue
+        if not (is_rna[i] or is_ligand[i]):
+            continue
+        if a.element.symbol not in ("N","O","S"):  # drop carbon donors
+            continue
+        Hs = [h for h in bond_map[i] if atoms[h].element.symbol == "H"]
+        if Hs:
+            donors.extend([i]*len(Hs))
+            hydrogens.extend(Hs)
+    donors = np.array(donors, dtype=int)
+    hydrogens = np.array(hydrogens, dtype=int)
+
+    if len(donors) == 0 or len(acceptors) == 0:
+        print("❗ No donors/acceptors detected after selection.")
+        return
+
+    # donor–H vs acceptor triplets (exclude self-acceptor)
+    triplets = np.array([(d,h,a) for d,h in zip(donors, hydrogens) for a in acceptors if a != d], dtype=np.int32)
+    donor_idxs    = jnp.array(triplets[:,0]); hydrogen_idxs = jnp.array(triplets[:,1]); acceptor_idxs = jnp.array(triplets[:,2])
+
+    ligand_atom_indices = jnp.array([i for i in range(len(atoms)) if is_ligand[i]], dtype=jnp.int32)
+    involves_ligand_mask = jnp.isin(donor_idxs, ligand_atom_indices) | jnp.isin(acceptor_idxs, ligand_atom_indices)
+
+    # --- scan frames ---
+    h_bonds_found = []
+    n_frames = coords.shape[0]
+    for frame_idx in tqdm(range(n_frames), desc="Scanning H-bonds (RNA)"):
+        xyz = coords[frame_idx]
+        d_xyz = xyz[donor_idxs]; h_xyz = xyz[hydrogen_idxs]; a_xyz = xyz[acceptor_idxs]
+        vec_HA = h_xyz - a_xyz; dist_HA = jnp.linalg.norm(vec_HA, axis=1)
+        vec_DH = h_xyz - d_xyz
+        norm_DH = vec_DH / jnp.linalg.norm(vec_DH, axis=1)[:, None]
+        norm_HA = vec_HA / jnp.linalg.norm(vec_HA, axis=1)[:, None]
+        angles = jnp.degrees(jnp.arccos(jnp.clip(jnp.sum(norm_DH * norm_HA, axis=1), -1.0, 1.0)))
+        passed = jnp.where((dist_HA < dist_cutoff) & (angles > angle_cutoff) & involves_ligand_mask)[0]
+        for idx in passed:
+            d = atoms[int(donor_idxs[idx])]
+            a = atoms[int(acceptor_idxs[idx])]
+            h_bonds_found.append((f"{d.residue.name} {d.residue.resSeq} ({d.name})",
+                                  f"{a.residue.name} {a.residue.resSeq} ({a.name})"))
+
+    # --- write summary (two-tuples) ---
+    with open(f"{out_prefix}hbond_summary.txt", "w") as f:
+        for donor, acceptor in h_bonds_found:
+            f.write(f"{donor} → {acceptor}\n")
+    print(f"✅ H-bond summary saved as {out_prefix}hbond_summary.txt")
+
+    # --- Top residues (replace 'UNK' with ligand_resname everywhere) ---
+    residue_counter = Counter()
+    for donor, acceptor in h_bonds_found:
+        for entry in (donor, acceptor):
+            if entry.startswith(ligand_resname):
+                continue
+            res_label = entry.split('(')[0].strip()
+            residue_counter[res_label] += 1
+    df = pd.DataFrame(residue_counter.items(), columns=["Residue", "Count"]).sort_values("Count", ascending=False).reset_index(drop=True)
+    plt.figure(figsize=(12, 6)); plt.bar(df["Residue"][:20], df["Count"][:20], color='skyblue')
+    plt.title(f"Top 20 Residues Involved in H-Bonds with {ligand_resname}", fontsize=14)
+    plt.xlabel("RNA Residue"); plt.ylabel("H-Bond Count"); plt.xticks(rotation=45, ha='right'); plt.tight_layout()
+    plt.grid(axis='y', linestyle='--', alpha=0.6); plt.savefig(f"{out_prefix}hbond_top20_bar.png"); plt.show()
+
+    # --- roles (ligand donor vs acceptor) ---
+    donor_roles = Counter(); acceptor_roles = Counter()
+    for donor, acceptor in h_bonds_found:
+        if donor.startswith(ligand_resname):
+            res = acceptor.split('(')[0].strip()
+            donor_roles[res] += 1
+        elif acceptor.startswith(ligand_resname):
+            res = donor.split('(')[0].strip()
+            acceptor_roles[res] += 1
+    residues = list(set(donor_roles) | set(acceptor_roles))
+    df_roles = pd.DataFrame({
+        "Residue": residues,
+        f"{ligand_resname} as Donor":   [donor_roles.get(r, 0) for r in residues],
+        f"{ligand_resname} as Acceptor":[acceptor_roles.get(r, 0) for r in residues]
+    }).sort_values([f"{ligand_resname} as Donor", f"{ligand_resname} as Acceptor"], ascending=False).head(20)
+    df_roles.set_index("Residue").plot(kind="bar", stacked=True, figsize=(12, 6), colormap="viridis")
+    plt.title(f"Top 20 H-Bond Partners ({ligand_resname} as Donor vs Acceptor)", fontsize=14)
+    plt.ylabel("Bond Count"); plt.xlabel("RNA Residue"); plt.xticks(rotation=45, ha='right'); plt.tight_layout()
+    plt.grid(axis='y', linestyle='--', alpha=0.5); plt.savefig(f"{out_prefix}hbond_roles_top20_stacked.png"); plt.show()
+
+    # --- per-frame heatmap (skip ligand rows correctly) ---
+    framewise_counts = defaultdict(lambda: defaultdict(int))
+    for frame_idx in tqdm(range(n_frames), desc="Building frame-wise heatmap"):
+        xyz = coords[frame_idx]
+        d_xyz = xyz[donor_idxs]; h_xyz = xyz[hydrogen_idxs]; a_xyz = xyz[acceptor_idxs]
+        vec_HA = h_xyz - a_xyz; dist_HA = jnp.linalg.norm(vec_HA, axis=1)
+        vec_DH = h_xyz - d_xyz
+        norm_DH = vec_DH / jnp.linalg.norm(vec_DH, axis=1)[:, None]
+        norm_HA = vec_HA / jnp.linalg.norm(vec_HA, axis=1)[:, None]
+        angles = jnp.degrees(jnp.arccos(jnp.clip(jnp.sum(norm_DH * norm_HA, axis=1), -1.0, 1.0)))
+        passed = jnp.where((dist_HA < dist_cutoff) & (angles > angle_cutoff) & involves_unk_mask)[0]  # re-using mask is fine
+        for idx in passed:
+            d = atoms[int(donor_idxs[idx])]; a = atoms[int(acceptor_idxs[idx])]
+            for atom in (d, a):
+                if atom.residue.name.strip() == ligand_resname:
+                    continue
+                res_key = f"{atom.residue.name} {atom.residue.resSeq}"
+                framewise_counts[frame_idx][res_key] += 1
+
+    total_counts = defaultdict(int)
+    for frame_dict in framewise_counts.values():
+        for res, count in frame_dict.items():
+            total_counts[res] += count
+    top_residues = sorted(total_counts, key=total_counts.get, reverse=True)[:20]
+    heatmap_df = pd.DataFrame(index=range(n_frames), columns=top_residues).fillna(0)
+    for frame_idx, res_counts in framewise_counts.items():
+        for res in top_residues:
+            if res in res_counts:
+                heatmap_df.at[frame_idx, res] = res_counts[res]
+    plt.figure(figsize=(14, 6)); sns.heatmap(heatmap_df.T, cmap="YlGnBu", cbar_kws={'label': 'H-Bond Count'})
+    plt.title("H-Bond Time Series per Residue (Top 20)"); plt.xlabel("Frame"); plt.ylabel("RNA Residue")
+    plt.tight_layout(); plt.savefig(f"{out_prefix}hbond_heatmap.png"); plt.show()
+
+    print(f"✅ H-bond summary (txt), top-20 bar, roles, and heatmap saved (prefix {out_prefix})")
+
+
+def run_hbond_analysis_protein(traj_file, top_file, ligand_resname="UNK", out_prefix="", dist_cutoff=0.35, angle_cutoff=120.0):
+    import mdtraj as md, jax.numpy as jnp
+    from collections import defaultdict, Counter
+    import pandas as pd, numpy as np, seaborn as sns, matplotlib.pyplot as plt
+    from tqdm import tqdm
+
+    traj = md.load_dcd(traj_file, top=top_file)
+    atoms = list(traj.topology.atoms)
+    coords = jnp.array(traj.xyz)
+
+    # --- bond map (who is bonded to whom) ---
+    bond_map = {i: [] for i in range(len(atoms))}
+    for a, b in traj.topology.bonds:
+        bond_map[a.index].append(b.index)
+        bond_map[b.index].append(a.index)
+
+    # --- sets for selection ---
+    prot_resnames = {res.name for res in traj.topology.residues if res.name not in {"HOH", ligand_resname}}
+    is_protein = np.array([a.residue.name.strip() in prot_resnames for a in atoms])
+    is_ligand  = np.array([a.residue.name.strip() == ligand_resname for a in atoms])
+
+    # Acceptors: N or O on protein **or ligand**
+    acceptors = np.array([i for i,a in enumerate(atoms)
+                          if a.element.symbol in ("N","O") and (is_protein[i] or is_ligand[i])], dtype=int)
+    acceptor_set = set(acceptors)
+
+    # Donor heavy atoms: atoms (protein or ligand) that have at least one bonded hydrogen
+    # Donor heavy atoms: N-H, O-H (optional S-H), on protein OR ligand
+    donors, hydrogens = [], []
+    for i, a in enumerate(atoms):
+        if not (is_protein[i] or is_ligand[i]):
+            continue
+        if a.element.symbol not in ("N", "O", "S"):   # <-- exclude carbon donors
+            continue
+        Hs = [h for h in bond_map[i] if atoms[h].element.symbol == "H"]
+        if Hs:
+            donors.extend([i]*len(Hs))
+            hydrogens.extend(Hs)
+
+    donors = np.array(donors, dtype=int)
+    hydrogens = np.array(hydrogens, dtype=int)
+
+    if len(donors) == 0 or len(acceptors) == 0:
+        print("❗ No donors/acceptors detected after selection.")
+        return
+
+    # Build all donor–H vs acceptor triplets, excluding self-acceptor
+    triplets = []
+    for d, h in zip(donors, hydrogens):
+        for a in acceptors:
+            if a != d:
+                triplets.append((d,h,a))
+    triplets = np.array(triplets, dtype=np.int32)
+
+    donor_idxs    = jnp.array(triplets[:,0])
+    hydrogen_idxs = jnp.array(triplets[:,1])
+    acceptor_idxs = jnp.array(triplets[:,2])
+
+    # Mask: keep only triplets where either donor or acceptor belongs to the ligand residue
+    ligand_atom_indices = jnp.array([i for i in range(len(atoms)) if is_ligand[i]], dtype=jnp.int32)
+    involves_ligand_mask = jnp.isin(donor_idxs, ligand_atom_indices) | jnp.isin(acceptor_idxs, ligand_atom_indices)
+
+    # --- evaluate frames ---
+    h_bonds_found = []
+    n_frames = coords.shape[0]
+    for f in tqdm(range(n_frames), desc="Scanning H-bonds (protein)"):
+        xyz = coords[f]
+        d_xyz = xyz[donor_idxs]
+        h_xyz = xyz[hydrogen_idxs]
+        a_xyz = xyz[acceptor_idxs]
+
+        vec_HA = h_xyz - a_xyz
+        dist_HA = jnp.linalg.norm(vec_HA, axis=1)
+
+        vec_DH = h_xyz - d_xyz
+        norm_DH = vec_DH / jnp.linalg.norm(vec_DH, axis=1)[:, None]
+        norm_HA = vec_HA / jnp.linalg.norm(vec_HA, axis=1)[:, None]
+        cos_angle = jnp.sum(norm_DH * norm_HA, axis=1)
+        angles = jnp.degrees(jnp.arccos(jnp.clip(cos_angle, -1.0, 1.0)))
+
+        passed = jnp.where((dist_HA < dist_cutoff) & (angles > angle_cutoff) & involves_ligand_mask)[0]
+        for idx in passed:
+            d = atoms[int(donor_idxs[idx])]
+            a = atoms[int(acceptor_idxs[idx])]
+            h_bonds_found.append((f,
+                f"{d.residue.name} {d.residue.resSeq} ({d.name})",
+                f"{a.residue.name} {a.residue.resSeq} ({a.name})"))
+
+    with open(f"{out_prefix}protein_hbond_summary.txt", "w") as f:
+        for frame, donor, acceptor in h_bonds_found:
+            f.write(f"[frame {frame}] {donor} → {acceptor}\n")
+    print(f"✅ Protein H-bond summary saved as {out_prefix}protein_hbond_summary.txt")
+
+    residue_counter = Counter()
+    for _, donor, acceptor in h_bonds_found:
+        for entry in (donor, acceptor):
+            if entry.startswith(ligand_resname): continue
+            res_label = entry.split('(')[0].strip()
+            residue_counter[res_label] += 1
+    df = pd.DataFrame(residue_counter.items(), columns=["Residue", "Count"]).sort_values("Count", ascending=False).reset_index(drop=True)
+    plt.figure(figsize=(12, 6))
+    plt.bar(df["Residue"][:20], df["Count"][:20], color='orange')
+    plt.title("Top 20 Protein Residues Involved in H-Bonds with Ligand", fontsize=14)
+    plt.xlabel("Protein Residue")
+    plt.ylabel("H-Bond Count")
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    plt.grid(axis='y', linestyle='--', alpha=0.6)
+    plt.savefig(f"{out_prefix}protein_hbond_top20_bar.png")
+    plt.show()
+
+    donor_roles = Counter()
+    acceptor_roles = Counter()
+    for _, donor, acceptor in h_bonds_found:
+        lig = ligand_resname.strip().upper()
+        if donor.upper().startswith(lig):
+            res = acceptor.split('(')[0].strip()
+            donor_roles[res] += 1
+        elif acceptor.upper().startswith(lig):
+            res = donor.split('(')[0].strip()
+            acceptor_roles[res] += 1
+    residues = list(set(donor_roles) | set(acceptor_roles))
+    df_roles = pd.DataFrame({
+        "Residue": residues,
+        "Ligand as Donor": [donor_roles.get(r, 0) for r in residues],
+        "Ligand as Acceptor": [acceptor_roles.get(r, 0) for r in residues]
+    }).sort_values(["Ligand as Donor", "Ligand as Acceptor"], ascending=False).head(20)
+    df_roles.set_index("Residue").plot(kind="bar", stacked=True, figsize=(12, 6), colormap="magma")
+    plt.title("Top 20 H-Bond Partners (Ligand as Donor vs Acceptor)", fontsize=14)
+    plt.ylabel("Bond Count")
+    plt.xlabel("Protein Residue")
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    plt.grid(axis='y', linestyle='--', alpha=0.5)
+    plt.savefig(f"{out_prefix}protein_hbond_roles_top20_stacked.png")
+    plt.show()
+
+    # Per-frame heatmap (top 20)
+    framewise_counts = defaultdict(lambda: defaultdict(int))
+    for frame_idx in tqdm(range(n_frames), desc="Building protein H-bond heatmap"):
+        xyz = coords[frame_idx]
+        d_xyz = xyz[donor_idxs]
+        h_xyz = xyz[hydrogen_idxs]
+        a_xyz = xyz[acceptor_idxs]
+        vec_HA = h_xyz - a_xyz
+        dist_HA = jnp.linalg.norm(vec_HA, axis=1)
+        vec_DH = h_xyz - d_xyz
+        norm_DH = vec_DH / jnp.linalg.norm(vec_DH, axis=1)[:, None]
+        norm_HA = vec_HA / jnp.linalg.norm(vec_HA, axis=1)[:, None]
+        cos_angle = jnp.sum(norm_DH * norm_HA, axis=1)
+        angles = jnp.degrees(jnp.arccos(jnp.clip(cos_angle, -1.0, 1.0)))
+        passed = jnp.where((dist_HA < dist_cutoff) & (angles > angle_cutoff) & involves_ligand_mask)[0]
+        for idx in passed:
+            d = atoms[int(donor_idxs[idx])]
+            a = atoms[int(acceptor_idxs[idx])]
+            for atom in [d, a]:
+                if atom.residue.name.strip() == ligand_resname:
+                    continue
+                res_key = f"{atom.residue.name} {atom.residue.resSeq}"
+                framewise_counts[frame_idx][res_key] += 1
+
+    total_counts = defaultdict(int)
+    for frame_dict in framewise_counts.values():
+        for res, count in frame_dict.items():
+            total_counts[res] += count
+    top_residues = sorted(total_counts, key=total_counts.get, reverse=True)[:20]
+    heatmap_df = pd.DataFrame(index=range(n_frames), columns=top_residues).fillna(0)
+    for frame_idx, res_counts in framewise_counts.items():
+        for res in top_residues:
+            if res in res_counts:
+                heatmap_df.at[frame_idx, res] = res_counts[res]
+    plt.figure(figsize=(14, 6))
+    sns.heatmap(heatmap_df.T, cmap="YlOrBr", cbar_kws={'label': 'H-Bond Count'})
+    plt.title("Protein H-Bond Time Series per Residue (Top 20)")
+    plt.xlabel("Frame")
+    plt.ylabel("Protein Residue")
+    plt.tight_layout()
+    plt.savefig(f"{out_prefix}protein_hbond_heatmap.png")
+    plt.show()
+
+    print(f"✅ Protein H-bond summary (txt), top-20 bar, role stacked, and per-frame heatmap plots saved (prefix {out_prefix})")
+
+
+# 7. PCA & FEL (Overlay)
+def run_pca_fel_overlay(traj_apo_file, top_apo_file, traj_holo_file, top_holo_file, out_prefix=""):
+    import mdtraj as md, numpy as np
+    import matplotlib.pyplot as plt
+    from sklearn.decomposition import PCA
+    from scipy.constants import Boltzmann
+
+    # --- load
+    traj_apo  = md.load(traj_apo_file,  top=top_apo_file)
+    traj_holo = md.load(traj_holo_file, top=top_holo_file)
+
+    # --- try RNA selection (phosphorus)
+    sel_apo  = traj_apo.top.select("nucleic and name P")
+    sel_holo = traj_holo.top.select("nucleic and name P")
+
+    def select_CA_intersection(t):
+        """Return Cα indices mapped by (chain.id, resSeq) for a protein."""
+        ca_map = {}
+        for a in t.top.atoms:
+            if a.name.strip() == "CA" and a.residue.is_protein:
+                key = (getattr(a.residue.chain, "id", ""), a.residue.resSeq)
+                ca_map[key] = a.index
+        return ca_map
+
+    # --- if no P atoms in either, fall back to protein CA matched by (chain,resSeq)
+    if len(sel_apo) == 0 or len(sel_holo) == 0:
+        ca_apo  = select_CA_intersection(traj_apo)
+        ca_holo = select_CA_intersection(traj_holo)
+        common_keys = sorted(set(ca_apo) & set(ca_holo))
+        sel_apo  = np.array([ca_apo[k]  for k in common_keys], dtype=int)
+        sel_holo = np.array([ca_holo[k] for k in common_keys], dtype=int)
+
+    # --- final sanity
+    if sel_apo.size == 0 or sel_holo.size == 0:
+        raise ValueError("No atoms selected for PCA (neither RNA P nor protein CA found in common).")
+    if sel_apo.size != sel_holo.size:
+        # make sizes identical by intersecting on residue mapping again (safety net)
+        raise ValueError(f"Selection mismatch: apo={sel_apo.size}, holo={sel_holo.size} — "
+                         "ensure both trajectories cover the same residues.")
+
+    # --- slice & align
+    traj_apo_s  = traj_apo.atom_slice(sel_apo)
+    traj_holo_s = traj_holo.atom_slice(sel_holo)
+    traj_apo_s.superpose(traj_apo_s, 0)
+    traj_holo_s.superpose(traj_apo_s, 0)
+
+    # --- flatten for PCA
+    xyz_apo  = traj_apo_s.xyz.reshape(traj_apo_s.n_frames, -1)
+    xyz_holo = traj_holo_s.xyz.reshape(traj_holo_s.n_frames, -1)
+
+    # --- guard: finite and nonzero features
+    if xyz_apo.shape[1] == 0 or not np.all(np.isfinite(xyz_apo)):
+        raise ValueError("Apo feature matrix is empty or non-finite.")
+    if xyz_holo.shape[1] == 0 or not np.all(np.isfinite(xyz_holo)):
+        raise ValueError("Holo feature matrix is empty or non-finite.")
+
+    # --- PCA
+    pca = PCA(n_components=2)
+    pca.fit(xyz_apo)
+    pc_apo  = pca.transform(xyz_apo)
+    pc_holo = pca.transform(xyz_holo)
+
+    # --- plot PCA
+    plt.figure(figsize=(8,5))
+    plt.scatter(pc_apo[:,0],  pc_apo[:,1],  alpha=0.5, label="Apo",  color="blue")
+    plt.scatter(pc_holo[:,0], pc_holo[:,1], alpha=0.5, label="Holo", color="red")
+    plt.xlabel(f"PC1 ({pca.explained_variance_ratio_[0]*100:.2f}% var)")
+    plt.ylabel(f"PC2 ({pca.explained_variance_ratio_[1]*100:.2f}% var)")
+    plt.title("PCA Projection: Apo vs Ligand-bound")
+    plt.legend(); plt.grid(True); plt.tight_layout()
+    plt.savefig(f"{out_prefix}pca_overlay.png")
+    print(f"✅ PCA overlay saved as {out_prefix}pca_overlay.png")
+
+    # --- FEL helper
+    def compute_fel(pc1, pc2, bins=100):
+        H, xedges, yedges = np.histogram2d(pc1, pc2, bins=bins, density=True)
+        P = H.T; P[P==0] = 1e-12
+        G = -Boltzmann * 310.15 * np.log(P); G -= G.min()
+        return G, xedges, yedges
+
+    G_apo, x_a, y_a   = compute_fel(pc_apo[:,0],  pc_apo[:,1])
+    G_holo, x_h, y_h  = compute_fel(pc_holo[:,0], pc_holo[:,1])
+    X_a, Y_a = np.meshgrid(x_a[:-1], y_a[:-1])
+    X_h, Y_h = np.meshgrid(x_h[:-1], y_h[:-1])
+
+    plt.figure(figsize=(12,5))
+    plt.subplot(1,2,1); cp1 = plt.contourf(X_a, Y_a, G_apo, levels=30, cmap="Blues")
+    plt.colorbar(cp1, label="Free Energy (J)"); plt.title("FEL: Apo");  plt.xlabel("PC1"); plt.ylabel("PC2")
+    plt.subplot(1,2,2); cp2 = plt.contourf(X_h, Y_h, G_holo, levels=30, cmap="Reds")
+    plt.colorbar(cp2, label="Free Energy (J)"); plt.title("FEL: Holo"); plt.xlabel("PC1"); plt.ylabel("PC2")
+    plt.tight_layout(); plt.savefig(f"{out_prefix}fel_overlay.png")
+    print(f"✅ FEL overlay saved as {out_prefix}fel_overlay.png")
+
+
+# 8. WC checker (Overlay)
+
+def run_wc_pair_checker_overlay(
+    traj_apo_file, top_apo_file, traj_holo_file, top_holo_file, out_prefix=""
+):
+    """
+    Overlays Watson–Crick base pair stability for both apo and holo MD runs.
+    Saves plot as .png and prints number of pairs detected in each run.
+    """
+    import mdtraj as md
+    import jax.numpy as jnp
+    from tqdm import tqdm
+    import matplotlib.pyplot as plt
+
+    def get_pairs(traj, coords):
+        topology = traj.topology
+        atoms = list(topology.atoms)
+        wc_pairs = {
+            ("A", "U"): ("N1", "N3"),
+            ("U", "A"): ("N3", "N1"),
+            ("G", "C"): ("N1", "N3"),
+            ("C", "G"): ("N3", "N1"),
+        }
+        min_seq_gap = 4
+        atom_lookup = {
+            (atom.residue.name.strip(), atom.residue.resSeq, atom.name): atom.index
+            for atom in atoms
+        }
+        rna_residues = [
+            res
+            for res in topology.residues
+            if res.name.strip() in {"A", "U", "G", "C"}
+        ]
+        pairs = []
+        for i, res1 in enumerate(rna_residues):
+            for j in range(i + 1, len(rna_residues)):
+                res2 = rna_residues[j]
+                if abs(res1.resSeq - res2.resSeq) < min_seq_gap:
+                    continue
+                pair_key = (res1.name.strip(), res2.name.strip())
+                if pair_key not in wc_pairs:
+                    continue
+                atom1_name, atom2_name = wc_pairs[pair_key]
+                idx1 = atom_lookup.get((res1.name.strip(), res1.resSeq, atom1_name))
+                idx2 = atom_lookup.get((res2.name.strip(), res2.resSeq, atom2_name))
+                if idx1 is None or idx2 is None:
+                    continue
+                dist = jnp.linalg.norm(coords[0, idx1] - coords[0, idx2])
+                if dist < 0.35:
+                    pairs.append((res1, idx1, res2, idx2))
+        return pairs
+
+    def pair_status_over_time(coords, pairs):
+        framewise_status = []
+        for frame in range(coords.shape[0]):
+            count = 0
+            for res1, idx1, res2, idx2 in pairs:
+                dist = jnp.linalg.norm(coords[frame, idx1] - coords[frame, idx2])
+                if dist < 0.35:
+                    count += 1
+            framewise_status.append(count)
+        return framewise_status
+
+    # Apo trajectory
+    traj_apo = md.load_dcd(traj_apo_file, top=top_apo_file)
+    coords_apo = jnp.array(traj_apo.xyz)
+    pairs_apo = get_pairs(traj_apo, coords_apo)
+    print(f"✅ [Apo] Detected {len(pairs_apo)} WC pairs in frame 0")
+    wc_apo = pair_status_over_time(coords_apo, pairs_apo)
+
+    # Holo trajectory
+    traj_holo = md.load_dcd(traj_holo_file, top=top_holo_file)
+    coords_holo = jnp.array(traj_holo.xyz)
+    pairs_holo = get_pairs(traj_holo, coords_holo)
+    print(f"✅ [Ligand] Detected {len(pairs_holo)} WC pairs in frame 0")
+    wc_holo = pair_status_over_time(coords_holo, pairs_holo)
+
+    # Plot
+    plt.figure(figsize=(10, 4))
+    plt.plot(wc_apo, label="Apo (No Ligand)", color="blue")
+    plt.plot(wc_holo, label="Ligand-bound", color="red")
+    plt.xlabel("Frame")
+    plt.ylabel("Intact Watson–Crick Pairs")
+    plt.title("WC Base Pair Stability Over Time")
+    plt.grid()
+    plt.legend()
+    plt.tight_layout()
+    fname = f"{out_prefix}wc_pair_stability_overlay.png"
+    plt.savefig(fname)
+    plt.show()
+    print(f"📊 Overlay plot saved as {fname}")
+
+# 9. Ligand–RNA Atom Contact Frequencies (Table, CSV, UI)
+
+def run_ligand_rna_atom_contact_frequencies_safe(
+    traj_file="production_md.dcd",
+    top_file="final_structure.pdb",
+    ligand_resname="UNK",
+    out_prefix=""
+):
+    """
+    Computes h-bonds between ligand and RNA, then tabulates RNA atom contacts.
+    Self-contained and robust: does not depend on external/global h_bonds_found.
+    """
+    import mdtraj as md
+    import jax.numpy as jnp
+    import numpy as np
+    import pandas as pd
+    from collections import defaultdict
+    import re
+    from IPython.display import display
+    from tqdm import tqdm
+
+    # --- Load trajectory
+    traj = md.load_dcd(traj_file, top=top_file)
+    coords = jnp.array(traj.xyz)
+    atoms = list(traj.topology.atoms)
+    bond_map = {i: [] for i in range(len(atoms))}
+    for bond in traj.topology.bonds:
+        bond_map[bond[0].index].append(bond[1].index)
+        bond_map[bond[1].index].append(bond[0].index)
+    # Only RNA and ligand as donors/acceptors (no water)
+    rna_bases = {"A", "U", "G", "C"}
+    acceptors = [a for a in atoms if a.element.symbol in ['N', 'O'] and a.residue.name.strip() in rna_bases]
+    acceptor_indices_set = set(a.index for a in acceptors)
+    triplets_np = []
+    for h in atoms:
+        if h.element.symbol != 'H':
+            continue
+        if h.residue.name.strip() not in (rna_bases | {ligand_resname}):
+            continue
+        bonded = bond_map[h.index]
+        if not bonded:
+            continue
+        d_idx = bonded[0]
+        for a_idx in acceptor_indices_set:
+            if a_idx != d_idx:
+                triplets_np.append((d_idx, h.index, a_idx))
+    triplets_np = np.array(triplets_np, dtype=np.int32)
+    triplets = jnp.array(triplets_np)
+    donor_idxs = triplets[:, 0]
+    hydrogen_idxs = triplets[:, 1]
+    acceptor_idxs = triplets[:, 2]
+    ligand_atom_indices = jnp.array([a.index for a in atoms if a.residue.name.strip() == ligand_resname])
+    involves_ligand_mask = jnp.isin(donor_idxs, ligand_atom_indices) | jnp.isin(acceptor_idxs, ligand_atom_indices)
+
+    # --- Find h-bonds (RNA-ligand only)
+    h_bonds_found = []
+    dist_cutoff = 0.35  # nm
+    angle_cutoff = 120.0  # degrees
+    n_frames = coords.shape[0]
+    for frame_idx in tqdm(range(n_frames), desc="Scanning ligand–RNA H-bonds"):
+        xyz = coords[frame_idx]
+        d_xyz = xyz[donor_idxs]
+        h_xyz = xyz[hydrogen_idxs]
+        a_xyz = xyz[acceptor_idxs]
+        vec_HA = h_xyz - a_xyz
+        dist_HA = jnp.linalg.norm(vec_HA, axis=1)
+        vec_DH = h_xyz - d_xyz
+        norm_DH = vec_DH / jnp.linalg.norm(vec_DH, axis=1)[:, None]
+        norm_HA = vec_HA / jnp.linalg.norm(vec_HA, axis=1)[:, None]
+        cos_angle = jnp.sum(norm_DH * norm_HA, axis=1)
+        angles = jnp.degrees(jnp.arccos(jnp.clip(cos_angle, -1.0, 1.0)))
+        passed = jnp.where((dist_HA < dist_cutoff) & (angles > angle_cutoff) & involves_ligand_mask)[0]
+        for idx in passed:
+            d = atoms[int(donor_idxs[idx])]
+            a = atoms[int(acceptor_idxs[idx])]
+            h_bonds_found.append((
+                f"{d.residue.name} {d.residue.resSeq} ({d.name})",
+                f"{a.residue.name} {a.residue.resSeq} ({a.name})"
+            ))
+
+    if not h_bonds_found:
+        print("❗ No ligand–RNA H-bonds found. Nothing to tabulate.")
+        return
+
+    # --- Tally RNA atom contacts from h-bonds_found ---
+    atom_contact_counts = defaultdict(int)
+    for donor, acceptor in h_bonds_found:
+        for entry in (donor, acceptor):
+            if entry.startswith("UNK"):
+                continue
+            match = re.match(r"([AUGC])\s\d+\s\((\w+)\)", entry)
+            if match:
+                base, atom = match.groups()
+                key = f"{base}-{atom}"
+                atom_contact_counts[key] += 1
+
+    df = pd.DataFrame(atom_contact_counts.items(), columns=["RNA Atom", "Contact Count"])
+    df = df.sort_values(by="Contact Count", ascending=False).reset_index(drop=True)
+
+    print("🔹 Most Frequently Contacted RNA Atoms by UNK:")
+    display(df.head(30))
+    df.to_csv(f"{out_prefix}ligand_rna_atom_contact_frequencies.csv", index=False)
+    print(f"✅ Saved to '{out_prefix}ligand_rna_atom_contact_frequencies.csv'")
+
+
+# 10. Carboxyl - OP1/2 P binding checker
+
+def run_carboxylate_OP_checker(
+    traj_file, top_file, ligand_resname="UNK", out_prefix="carboxylate_OP_"
+):
+    """
+    Checks and visualizes ligand carboxylate O contacts with RNA OP1/OP2.
+    Saves heatmap, barplot, and prints top contacts.
+    """
+    import mdtraj as md
+    import jax.numpy as jnp
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from tqdm import tqdm
+
+    traj = md.load_dcd(traj_file, top=top_file)
+    atoms = list(traj.topology.atoms)
+
+    # 1. Find ligand carboxylate O atoms
+    carboxylate_O_names = {"O", "OXT", "O1", "O2"}
+    ligand_O_idxs = [
+        atom.index for atom in atoms
+        if atom.residue.name.strip() == ligand_resname and atom.name.strip() in carboxylate_O_names
+    ]
+    if not ligand_O_idxs:
+        ligand_idxs = [atom.index for atom in atoms if atom.residue.name.strip() == ligand_resname]
+        ligand_O_idxs = [atom.index for atom in atoms if atom.residue.name.strip() == ligand_resname and atom.element.symbol == "O"]
+        if not ligand_O_idxs:
+            print("❗ No carboxylate O atoms found in the ligand. Analysis aborted.")
+            return
+        print("Auto-detected ligand O atoms:", ligand_O_idxs)
+
+    print(f"Found ligand carboxylate O atoms (indices): {ligand_O_idxs}")
+
+    # 2. Find all RNA OP1/OP2 atoms
+    rna_bases = {"A", "U", "G", "C"}
+    phos_names = {"OP1", "OP2"}
+    rna_OP_idxs = []
+    rna_OP_labels = []
+    for atom in atoms:
+        if atom.residue.name.strip() in rna_bases and atom.name.strip() in phos_names:
+            rna_OP_idxs.append(atom.index)
+            rna_OP_labels.append(f"{atom.residue.name.strip()}{atom.residue.resSeq}-{atom.name.strip()}")
+    print(f"Found {len(rna_OP_idxs)} OP1/OP2 atoms in RNA backbone.")
+
+    # 3. Extract coordinates
+    coords = jnp.array(traj.xyz)
+    ligand_coords = coords[:, ligand_O_idxs, :]
+    rna_OP_coords = coords[:, rna_OP_idxs, :]
+    n_frames = coords.shape[0]
+    n_OP = len(rna_OP_idxs)
+    n_ligand_O = len(ligand_O_idxs)
+
+    # 4. Compute contacts
+    threshold = 0.35  # nm
+    contact_matrix = np.zeros((n_frames, n_OP), dtype=int)
+    print("Computing contacts (carboxylate O ↔ OP1/OP2)...")
+    for f in tqdm(range(n_frames)):
+        for li in range(n_ligand_O):
+            dists = jnp.linalg.norm(rna_OP_coords[f] - ligand_coords[f, li], axis=1)
+            contact_matrix[f] = np.logical_or(contact_matrix[f], dists < threshold)
+
+    # 5. Occupancy per OP
+    occupancy = contact_matrix.sum(axis=0) / n_frames
+
+    # 6. Save data for downstream analysis
+    np.save(out_prefix + "contact_matrix.npy", contact_matrix)
+    np.save(out_prefix + "occupancy.npy", occupancy)
+    with open(out_prefix + "labels.txt", "w") as f:
+        for label in rna_OP_labels:
+            f.write(label + "\n")
+
+    # 7. Plots
+    plt.figure(figsize=(14, 3))
+    sns.heatmap(contact_matrix.T, cmap="Blues", cbar=True, yticklabels=rna_OP_labels)
+    plt.title("Ligand Carboxylate–RNA OP1/OP2 Contacts (framewise)")
+    plt.xlabel("Frame")
+    plt.ylabel("RNA OP1/OP2 Atom")
+    plt.tight_layout()
+    plt.savefig(out_prefix + "contact_heatmap.png", dpi=200)
+    plt.show()
+
+    plt.figure(figsize=(16, 4))
+    sns.barplot(x=rna_OP_labels, y=occupancy)
+    plt.xticks(rotation=90)
+    plt.ylabel("Contact Occupancy (fraction)")
+    plt.title("Occupancy of Ligand Carboxylate Contact with RNA OP1/OP2")
+    plt.tight_layout()
+    plt.savefig(out_prefix + "occupancy.png", dpi=200)
+    plt.show()
+
+    print(f"Saved: {out_prefix}contact_heatmap.png and {out_prefix}occupancy.png")
+
+    # 8. Print top 10 contacts
+    op_contact = list(zip(rna_OP_labels, occupancy))
+    op_contact_sorted = sorted(op_contact, key=lambda x: x[1], reverse=True)
+    print("\nTop 10 ligand–OP contacts by occupancy:")
+    for label, occ in op_contact_sorted[:10]:
+        print(f'{label}: {occ:.3f}')
+
+    print(f"✅ Carboxylate–OP checker complete! (prefix '{out_prefix}')")
+
+# 11. Backbone exposure by the ligand
+
+def run_backbone_exposure_overlay(
+    ligand_dcd="production_md.dcd",
+    ligand_pdb="final_structure.pdb",
+    control_dcd="production_md_no_ligand.dcd",
+    control_pdb="final_structure_no_ligand.pdb",
+    ligand_resname="UNK",
+    topN=10,
+    out_prefix="backbone_exposure_"
+):
+    """
+    Compares RNA backbone exposure (proxy: neighbor count) with/without ligand.
+    Plots and saves overlays, sorted by distance to ligand, and exports top-exposed atoms as a PDB.
+    """
+    import mdtraj as md
+    import jax.numpy as jnp
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from tqdm import tqdm
+    import pandas as pd
+    import re
+
+    # Helper for atom info
+    def extract_atom_info(traj):
+        return [
+            {
+                'index': atom.index,
+                'resname': atom.residue.name.strip(),
+                'resid': atom.residue.resSeq,
+                'atomname': atom.name.strip()
+            }
+            for atom in traj.topology.atoms
+        ]
+
+    # --- Load holo ---
+    traj_lig = md.load_dcd(ligand_dcd, top=ligand_pdb)
+    atom_info_lig = extract_atom_info(traj_lig)
+    coords_lig = jnp.array(traj_lig.xyz)
+    backbone_names = {"OP1", "OP2", "P"}
+    rna_resnames = {"A", "U", "G", "C"}
+    backbone_lig = [
+        i for i, atom in enumerate(atom_info_lig)
+        if atom['resname'] in rna_resnames and atom['atomname'] in backbone_names
+    ]
+    all_lig = set(range(len(atom_info_lig)))
+    nonrna_lig = list(all_lig - set([
+        i for i, atom in enumerate(atom_info_lig)
+        if atom['resname'] in rna_resnames
+    ]))
+
+    # --- Load apo ---
+    traj_ctrl = md.load_dcd(control_dcd, top=control_pdb)
+    atom_info_ctrl = extract_atom_info(traj_ctrl)
+    coords_ctrl = jnp.array(traj_ctrl.xyz)
+    backbone_ctrl = [
+        i for i, atom in enumerate(atom_info_ctrl)
+        if atom['resname'] in rna_resnames and atom['atomname'] in backbone_names
+    ]
+    all_ctrl = set(range(len(atom_info_ctrl)))
+    nonrna_ctrl = list(all_ctrl - set([
+        i for i, atom in enumerate(atom_info_ctrl)
+        if atom['resname'] in rna_resnames
+    ]))
+
+    # --- Exposure calculation (same as your proxy) ---
+    def exposure_count(coords, backbone_idxs, nonrna_idxs, cutoff=0.35):
+        n_frames = coords.shape[0]
+        n_backbone = len(backbone_idxs)
+        counts = np.zeros((n_frames, n_backbone), dtype=int)
+        for f in tqdm(range(n_frames), desc="Frames (Exposure)"):
+            nonrna_pos = coords[f, nonrna_idxs, :]
+            for k, bb_idx in enumerate(backbone_idxs):
+                bb_pos = coords[f, bb_idx, :]
+                dists = jnp.linalg.norm(nonrna_pos - bb_pos, axis=1)
+                counts[f, k] = (dists < cutoff).sum()
+        return counts
+
+    counts_lig = exposure_count(coords_lig, backbone_lig, nonrna_lig)
+    counts_ctrl = exposure_count(coords_ctrl, backbone_ctrl, nonrna_ctrl)
+
+    mean_exp_lig = counts_lig.mean(axis=0)
+    mean_exp_ctrl = counts_ctrl.mean(axis=0)
+
+    # Label backbone atoms by (resname, resid, atomname)
+    labels_lig = [
+        f"{atom_info_lig[i]['resname']}{atom_info_lig[i]['resid']}-{atom_info_lig[i]['atomname']}"
+        for i in backbone_lig
+    ]
+    labels_ctrl = [
+        f"{atom_info_ctrl[i]['resname']}{atom_info_ctrl[i]['resid']}-{atom_info_ctrl[i]['atomname']}"
+        for i in backbone_ctrl
+    ]
+
+    # Match by labels for comparison
+    lig_map = dict(zip(labels_lig, mean_exp_lig))
+    ctrl_map = dict(zip(labels_ctrl, mean_exp_ctrl))
+    common_labels = sorted(set(labels_lig) & set(labels_ctrl))
+    delta_exp = np.array([lig_map[l] - ctrl_map[l] for l in common_labels])
+
+    # Save CSV with all data
+    df_sasa = pd.DataFrame({
+        "label": common_labels,
+        "exp_lig": [lig_map[l] for l in common_labels],
+        "exp_ctrl": [ctrl_map[l] for l in common_labels],
+        "delta_exp": delta_exp
+    })
+    df_sasa.to_csv(out_prefix + "sasa.csv", index=False)
+
+    # --- Ligand centroid & backbone distances ---
+    ligand_atoms = [i for i, a in enumerate(atom_info_lig) if a['resname'] == ligand_resname]
+    if len(ligand_atoms) == 0:
+        print("❗ No ligand atoms found. Check ligand_resname!")
+        return
+    ligand_coords = coords_lig[:, ligand_atoms, :]
+    ligand_centroid = ligand_coords.mean(axis=(0, 1))
+    bb_positions = np.array([
+        coords_lig[:, idx, :].mean(axis=0) for idx in backbone_lig
+    ])
+    dist_to_ligand = np.linalg.norm(bb_positions - ligand_centroid, axis=1)
+
+    # Reorder by distance for default plots
+    order = np.argsort(dist_to_ligand)
+    sorted_labels = [common_labels[i] for i in order]
+    sorted_delta = delta_exp[order]
+    sorted_dist = dist_to_ligand[order]
+
+    # Save ordered CSV too
+    df_sasa_sorted = pd.DataFrame({
+        "label": sorted_labels,
+        "delta_exp": sorted_delta,
+        "dist_to_ligand": sorted_dist
+    })
+    df_sasa_sorted.to_csv(out_prefix + "delta_exposure_sasa_sorted.csv", index=False)
+
+    # --- Plots ---
+    plt.figure(figsize=(20,5))
+    plt.bar(sorted_labels, sorted_delta)
+    plt.axhline(0, color='k', linestyle='--', alpha=0.6)
+    plt.xticks(rotation=90, fontsize=8)
+    plt.ylabel("ΔExposure (ligand – control, lower = more exposed)")
+    plt.title("Backbone Exposure Proxy (Contact Number): Ligand vs. Control")
+    plt.tight_layout()
+    plt.savefig(out_prefix + "delta_backbone_exposure_proxy.png", dpi=180)
+    plt.show()
+
+    plt.figure(figsize=(22,5))
+    plt.bar(range(len(sorted_labels)), sorted_delta, tick_label=sorted_labels)
+    plt.axhline(0, color='k', linestyle='--', alpha=0.6)
+    plt.xticks(rotation=90, fontsize=8)
+    plt.ylabel("ΔExposure (ligand – control)")
+    plt.xlabel("Backbone atoms, sorted by distance from ligand centroid (closest → farthest)")
+    plt.title("Backbone Exposure Change (ΔExposure) vs. Proximity to Ligand")
+    plt.tight_layout()
+    plt.savefig(out_prefix + "delta_exposure_sorted_by_distance.png", dpi=180)
+    plt.show()
+
+    plt.figure(figsize=(7,4))
+    plt.scatter(sorted_dist, sorted_delta, c=sorted_delta, cmap='coolwarm')
+    plt.axhline(0, color='k', linestyle='--', alpha=0.5)
+    plt.xlabel("Distance to Ligand Centroid (nm)")
+    plt.ylabel("ΔExposure (ligand – control)")
+    plt.title("Exposure Change vs. Ligand Distance")
+    plt.tight_layout()
+    plt.savefig(out_prefix + "delta_exposure_vs_distance.png", dpi=180)
+    plt.show()
+
+    # --- Top N hotspots (most negative delta) ---
+    df_hotspot = df_sasa_sorted.nsmallest(topN, 'delta_exp')
+    print(f"\nTop {topN} most negatively exposed backbone atoms (hotspots):")
+    print(df_hotspot)
+    df_hotspot.to_csv(out_prefix + f"top{topN}_exposed.csv", index=False)
+
+    # --- Export as PDB for ChimeraX ---
+    try:
+        from Bio.PDB import PDBParser, PDBIO, Select
+        pdb = ligand_pdb
+        # Get set of (resname, resid) for all top-exposed backbone atoms
+        hotspot_residues = set()
+        for label in df_hotspot['label']:
+            match = re.match(r'([AUGC])(\d+)-(\w+)', label)
+            if match:
+                resname, resid, atomname = match.groups()
+                hotspot_residues.add((resname, int(resid)))
+        parser = PDBParser(QUIET=True)
+        structure = parser.get_structure("RNA", pdb)
+        class ResidueSelect(Select):
+            def accept_residue(self, residue):
+                resname = residue.get_resname().strip()
+                resid = residue.get_id()[1]
+                return (resname, resid) in hotspot_residues
+        io = PDBIO()
+        io.set_structure(structure)
+        io.save(out_prefix + "top_exposed_residues.pdb", ResidueSelect())
+        print(f"Saved: {out_prefix}top_exposed_residues.pdb")
+    except Exception as e:
+        print("❗ Could not write PDB for hotspots:", e)
+
+    print("✅ Backbone exposure checker complete!")
+
+# 12. π–π stacking analysis
+
+def run_pi_pi_stacking(traj_file, top_file, ligand_ring_defs, ligand_resname="UNK", out_prefix="pi_pi_"):
+    import mdtraj as md
+    import jax.numpy as jnp
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from tqdm import tqdm
+
+    traj = md.load_dcd(traj_file, top=top_file)
+    coords = jnp.array(traj.xyz)
+    n_frames = coords.shape[0]
+    top = traj.topology
+
+    # Load ring mapping
+    hexagon_ring_atoms = {"N1", "C2", "N3", "C4", "C5", "C6"}
+    hex_ring_atom_map = []
+    for res in top.residues:
+        base = res.name.strip()
+        if base in {"A", "G", "C", "U"}:
+            for atom in res.atoms:
+                if atom.name.strip() in hexagon_ring_atoms:
+                    hex_ring_atom_map.append((res.index, base, atom.name.strip(), atom.index))
+    rna_ring_df = pd.DataFrame(hex_ring_atom_map, columns=["res_index", "base", "atom", "atom_index"])
+
+    # RNA base hexagon rings (list of 6 atom indices per base)
+    rna_base_ring_idxs = []
+    rna_base_ring_labels = []
+    rna_base_pdbinfo = []
+    for res_index in rna_ring_df["res_index"].unique():
+        subdf = rna_ring_df[rna_ring_df["res_index"] == res_index]
+        if len(subdf) == 6:
+            idxs = subdf.sort_values("atom")["atom_index"].tolist()
+            atom0 = top.atom(int(subdf.iloc[0]["atom_index"]))
+            chain = getattr(atom0.residue.chain, "id", None) or getattr(atom0.residue.chain, "name", None) or "A"
+            base = atom0.residue.name
+            resSeq = atom0.residue.resSeq
+            label = f"{base}{resSeq}"
+            rna_base_ring_idxs.append(idxs)
+            rna_base_ring_labels.append(label)
+            rna_base_pdbinfo.append((chain, base, resSeq, label))
+
+    # --- Ligand ring indices
+    ligand_atoms = {atom.name.strip(): atom.index for atom in top.atoms if atom.residue.name.strip() == ligand_resname}
+    ligand_ring_idxs = []
+    for i, ring in enumerate(ligand_ring_defs):
+        try:
+            idxs = [ligand_atoms[a] for a in ring]
+        except KeyError as e:
+            print(f"❗ Ligand atom name not found: {e}")
+            return
+        ligand_ring_idxs.append(idxs)
+
+    # Centroid/normal helper
+    def get_centroid_and_normal(ring_coords):
+        centroid = jnp.mean(ring_coords, axis=0)
+        v1 = ring_coords[1] - ring_coords[0]
+        v2 = ring_coords[2] - ring_coords[0]
+        normal = jnp.cross(v1, v2)
+        normal = normal / jnp.linalg.norm(normal)
+        return centroid, normal
+
+    distance_cutoff = 0.6  # nm
+    angle_cutoff_deg = 30
+
+    stack_events = []
+    for f in tqdm(range(n_frames), desc="Frames (π–π stacking)"):
+        for lidx, lring_idxs in enumerate(ligand_ring_idxs):
+            l_ring_coords = coords[f, lring_idxs, :]
+            l_centroid, l_normal = get_centroid_and_normal(l_ring_coords)
+            for ridx, rring_idxs in enumerate(rna_base_ring_idxs):
+                r_ring_coords = coords[f, rring_idxs, :]
+                r_centroid, r_normal = get_centroid_and_normal(r_ring_coords)
+                dist = jnp.linalg.norm(l_centroid - r_centroid)
+                cos_angle = jnp.dot(l_normal, r_normal)
+                angle = jnp.degrees(jnp.arccos(jnp.clip(cos_angle, -1, 1)))
+                if dist <= distance_cutoff and (angle <= angle_cutoff_deg or angle >= 180 - angle_cutoff_deg):
+                    chain, base, resSeq, label = rna_base_pdbinfo[ridx]
+                    stack_events.append((f, lidx, ridx, dist, angle, chain, base, resSeq, label))
+
+    stack_df = pd.DataFrame(stack_events, columns=["frame", "ligand_ring", "rna_base_index", "distance", "angle", "chain", "base", "resSeq", "pdb_label"])
+    stack_df.to_csv(out_prefix + "stacking_events_PDBlabels.csv", index=False)
+    print(f"✅ Saved {out_prefix}stacking_events_PDBlabels.csv with robust PDB labels.")
+
+    if not stack_df.empty:
+        counts = stack_df["pdb_label"].value_counts().sort_index()
+        plt.figure(figsize=(14,4))
+        plt.bar(counts.index, counts.values)
+        plt.xticks(rotation=90)
+        plt.ylabel("Stacking Events")
+        plt.title("π–π Stacking Events (Ligand–RNA Hexagon Rings, PDB numbering)")
+        plt.tight_layout()
+        plt.savefig(out_prefix + "stacking_events_PDBlabels_barplot.png", dpi=150)
+        plt.show()
+    else:
+        print("No π–π stacking events detected with current cutoffs.")
+
+# === NAB–PLpro radial clench/enlarge metric (Δ⟨r⊥⟩) =========================
+# Align frames to a rigid PLpro core (CA atoms), define an apo radial axis ẑ,
+# then measure r⊥ = ||(I - ẑẑᵀ) · (COM_NAB - COM_PLpro)|| per frame.
+# Report Δ⟨r⊥⟩ (holo-apo), 95% CI, and estimated pore ΔD ≈ 2·Δ⟨r⊥⟩.
+import jax
+import jax.numpy as jnp
+import numpy as np
+import mdtraj as md
+import matplotlib.pyplot as plt
+from typing import Tuple
+
+def _ca_indices_in_range(top, start:int, end:int):
+    """Return dict {resSeq: atom_index_of_CA} within [start,end]."""
+    out = {}
+    for a in top.atoms:
+        if a.name.strip() == "CA":
+            rs = a.residue.resSeq
+            if start <= rs <= end:
+                out[rs] = a.index
+    return out
+
+def _heavy_indices_in_range(top, start:int, end:int):
+    """Return list of heavy-atom indices within [start,end]."""
+    idxs = []
+    for a in top.atoms:
+        rs = a.residue.resSeq
+        if start <= rs <= end and a.element.symbol != "H":
+            idxs.append(a.index)
+    return np.array(idxs, dtype=int)
+
+def _intersect_by_resSeq(mapA, mapB):
+    """Given two {resSeq: index} maps, return two aligned index arrays for the common resSeqs."""
+    common = sorted(set(mapA.keys()) & set(mapB.keys()))
+    idxA = np.array([mapA[r] for r in common], dtype=int)
+    idxB = np.array([mapB[r] for r in common], dtype=int)
+    return idxA, idxB, common
+
+def _kabsch_R_t(P, Q):
+    """
+    Kabsch on a single frame: find R,t that minimizes ||P R + t - Q||_F.
+    P,Q: (n,3) arrays. Returns R (3x3), t (1x3).
+    """
+    muP = jnp.mean(P, axis=0)
+    muQ = jnp.mean(Q, axis=0)
+    X = P - muP
+    Y = Q - muQ
+    C = X.T @ Y
+    U, S, Vt = jnp.linalg.svd(C, full_matrices=False)
+    R = U @ Vt
+    # reflection fix
+    det = jnp.linalg.det(R)
+    R = jnp.where(det < 0,
+                  U @ jnp.diag(jnp.array([1.0, 1.0, -1.0])) @ Vt,
+                  R)
+    t = muQ - (muP @ R)
+    return R, t
+
+def _apply_RT(X, R, t):
+    """Apply rotation+translation to an (m,3) coordinate set."""
+    return X @ R + t
+
+def run_nab_plpro_radial_clench(
+    traj_apo_file="production_md_no_ligand.dcd",
+    top_apo_file="final_structure_no_ligand.pdb",
+    traj_holo_file="production_md.dcd",
+    top_holo_file="final_structure.pdb",
+    plpro_range: Tuple[int,int]=(1,338),
+    nab_range: Tuple[int,int]=(339,454),
+    out_prefix="radial_",
+    figure_dpi=180
+):
+    # --- Load
+    ta = md.load_dcd(traj_apo_file, top=top_apo_file)
+    th = md.load_dcd(traj_holo_file, top=top_holo_file)
+
+    # --- Build CA selections for PLpro alignment (match by resSeq)
+    caA = _ca_indices_in_range(ta.topology, *plpro_range)
+    caH = _ca_indices_in_range(th.topology, *plpro_range)
+    CAa, CAh, common_res = _intersect_by_resSeq(caA, caH)
+    if CAa.size == 0:
+        raise ValueError("No common PLpro CA atoms found in the specified range. Check plpro_range.")
+    print(f"[INFO] PLpro alignment: using {CAa.size} common CA residues (resSeq min={min(common_res)}, max={max(common_res)}).")
+
+    # --- Heavy-atom selections for COMs
+    PLa = _heavy_indices_in_range(ta.topology, *plpro_range)
+    NBa = _heavy_indices_in_range(ta.topology, *nab_range)
+    PLh = _heavy_indices_in_range(th.topology, *plpro_range)
+    NBh = _heavy_indices_in_range(th.topology, *nab_range)
+    if NBa.size == 0 or NBh.size == 0:
+        raise ValueError("No NAB heavy atoms found in the specified nab_range.")
+
+    # --- Coordinates
+    Xa = jnp.array(ta.xyz)  # (Fa, Na, 3)
+    Xh = jnp.array(th.xyz)  # (Fh, Nh, 3)
+
+    # --- Reference (apo frame 0) on CA set
+    Qref = Xa[0, CAa, :]
+
+    # --- Kabsch per frame (vectorized) on CA set
+    def R_t_for_frame_CA(Xframe, CAidx):
+        return _kabsch_R_t(Xframe[CAidx, :], Qref)
+
+    Ra, ta_trans = jax.vmap(lambda X: R_t_for_frame_CA(X, CAa))(Xa)
+    Rh, th_trans = jax.vmap(lambda X: R_t_for_frame_CA(X, CAh))(Xh)
+
+    # --- Transform PLpro & NAB coordinates (we only need COMs)
+    def COM_after_align(X, idxs, R, t):
+        Y = X[idxs, :]
+        Y_al = _apply_RT(Y, R, t)
+        return jnp.mean(Y_al, axis=0)
+
+    PLcom_a = jax.vmap(lambda X, R, t: COM_after_align(X, PLa, R, t))(Xa, Ra, ta_trans)
+    NBcom_a = jax.vmap(lambda X, R, t: COM_after_align(X, NBa, R, t))(Xa, Ra, ta_trans)
+    PLcom_h = jax.vmap(lambda X, R, t: COM_after_align(X, PLh, R, t))(Xh, Rh, th_trans)
+    NBcom_h = jax.vmap(lambda X, R, t: COM_after_align(X, NBh, R, t))(Xh, Rh, th_trans)
+
+    # --- Minimal-image fix for COM vectors if unit cell present (orthorhombic assumption)
+    def nearest_image(r, L):
+        # r: (...,3), L: (3,)
+        return r - L * jnp.round(r / L)
+
+    if ta.unitcell_lengths is not None and np.all(np.isfinite(ta.unitcell_lengths)):
+        La = jnp.array(ta.unitcell_lengths)  # (Fa,3)
+        rh_a = NBcom_a - PLcom_a
+        rh_a = rh_a - La * jnp.round(rh_a / La)
+    else:
+        rh_a = NBcom_a - PLcom_a
+
+    if th.unitcell_lengths is not None and np.all(np.isfinite(th.unitcell_lengths)):
+        Lh = jnp.array(th.unitcell_lengths)  # (Fh,3)
+        rh_h = NBcom_h - PLcom_h
+        rh_h = rh_h - Lh * jnp.round(rh_h / Lh)
+    else:
+        rh_h = NBcom_h - PLcom_h
+
+    # --- Apo axis ẑ and projector P onto radial plane
+    zhat = jnp.mean(rh_a, axis=0)
+    zhat = zhat / jnp.linalg.norm(zhat)
+    P = jnp.eye(3) - jnp.outer(zhat, zhat)
+
+    # --- Radial distances r⊥ per frame
+    rperp_a = jnp.linalg.norm(rh_a @ P.T, axis=1)
+    rperp_h = jnp.linalg.norm(rh_h @ P.T, axis=1)
+
+    # --- Summary stats & 95% CI
+    def mean_ci(x):
+        x = np.asarray(x)
+        mu = float(x.mean())
+        sd = float(x.std(ddof=1)) if x.size > 1 else 0.0
+        se = sd / np.sqrt(max(1, x.size))
+        ci = 1.96 * se
+        return mu, ci, sd
+
+    mu_a, ci_a, sd_a = mean_ci(rperp_a)
+    mu_h, ci_h, sd_h = mean_ci(rperp_h)
+    delta = mu_h - mu_a
+    deltaD = 2.0 * delta  # 12-mer diameter surrogate
+
+    print(f"\n[RESULT] ⟨r⊥⟩_apo  = {mu_a:.3f} ± {ci_a:.3f} nm  (SD={sd_a:.3f})")
+    print(f"[RESULT] ⟨r⊥⟩_holo = {mu_h:.3f} ± {ci_h:.3f} nm  (SD={sd_h:.3f})")
+    print(f"[RESULT] Δ⟨r⊥⟩ (holo-apo) = {delta:.3f} nm  →  ΔD_est ≈ {deltaD:.3f} nm\n")
+
+    # --- Plots
+    plt.figure(figsize=(9,4))
+    plt.plot(np.asarray(rperp_a), label="Apo", alpha=0.85)
+    plt.plot(np.asarray(rperp_h), label="Holo", alpha=0.85)
+    plt.xlabel("Frame"); plt.ylabel(r"$r_\perp$ (nm)")
+    plt.title("NAB–PLpro radial distance (projected)")
+    plt.legend(); plt.tight_layout()
+    plt.savefig(f"{out_prefix}rperp_timeseries.png", dpi=figure_dpi)
+
+    plt.figure(figsize=(6,4))
+    plt.hist(np.asarray(rperp_a), bins=40, alpha=0.6, label="Apo")
+    plt.hist(np.asarray(rperp_h), bins=40, alpha=0.6, label="Holo")
+    plt.xlabel(r"$r_\perp$ (nm)"); plt.ylabel("Count")
+    plt.title("Distribution of projected radial distance")
+    plt.legend(); plt.tight_layout()
+    plt.savefig(f"{out_prefix}rperp_hist.png", dpi=figure_dpi)
+
+    # --- Save text summary
+    with open(f"{out_prefix}summary.txt", "w") as f:
+        f.write(f"⟨r⊥⟩_apo  = {mu_a:.6f} ± {ci_a:.6f} nm (95% CI)\n")
+        f.write(f"⟨r⊥⟩_holo = {mu_h:.6f} ± {ci_h:.6f} nm (95% CI)\n")
+        f.write(f"Δ⟨r⊥⟩ (holo-apo) = {delta:.6f} nm\n")
+        f.write(f"Estimated pore diameter change (12-mer): ΔD ≈ {deltaD:.6f} nm\n")
+        f.write(f"PLpro CA residues used: {min(common_res)}–{max(common_res)} (count={len(common_res)})\n")
+        f.write(f"PLpro range input: {plpro_range}\nNAB range input: {nab_range}\n")
+    print(f"✅ Saved: {out_prefix}rperp_timeseries.png, {out_prefix}rperp_hist.png, {out_prefix}summary.txt")
+
+
+
+
+# === BL2 radial & axis metrics  ==============================================
+# Measures:
+#   • r⊥(BL2): radial distance (projected) of BL2 COM relative to apo axis ẑ
+#   • θ(PN, PB): angle between PLpro→NAB and PLpro→BL2 vectors (deg)
+#   • d_line(BL2 | PN): distance of BL2 from the PLpro→NAB line (in-plane)
+#
+# Uses the same conventions as run_nab_plpro_radial_clench:
+#   - Align every frame to a rigid PLpro CA core via Kabsch (JAX)
+#   - Define ẑ using the apo mean of r_NAB
+#   - Apply minimal-image to COM vectors if unit cell lengths exist
+
+def _heavy_indices_by_resSeq_set(top, res_set):
+    idxs = []
+    for a in top.atoms:
+        if a.residue.resSeq in res_set and a.element.symbol != "H":
+            idxs.append(a.index)
+    return np.array(idxs, dtype=int)
+
+def run_bl2_radial_axis_metrics(
+    traj_apo_file="production_md_no_ligand.dcd",
+    top_apo_file="final_structure_no_ligand.pdb",
+    traj_holo_file="production_md.dcd",
+    top_holo_file="final_structure.pdb",
+    plpro_range=(1,338),
+    nab_range=(339,454),
+    bl2_res_list=(266,267,268,269,270,271),   # canonical BL2 neighborhood; adapt if needed
+    out_prefix="bl2_",
+    figure_dpi=180
+):
+    # --- Load
+    ta = md.load_dcd(traj_apo_file, top=top_apo_file)
+    th = md.load_dcd(traj_holo_file, top=top_holo_file)
+
+    # --- CA for PLpro alignment
+    caA = _ca_indices_in_range(ta.topology, *plpro_range)
+    caH = _ca_indices_in_range(th.topology, *plpro_range)
+    CAa, CAh, common_res = _intersect_by_resSeq(caA, caH)
+    if CAa.size == 0:
+        raise ValueError("No common PLpro CA atoms in the given range.")
+
+    print(f"[INFO] BL2 metrics: PLpro alignment uses {CAa.size} CA residues "
+          f"(resSeq {min(common_res)}–{max(common_res)}).")
+
+    # --- Heavy-atom selections
+    PLa = _heavy_indices_in_range(ta.topology, *plpro_range)
+    NBa = _heavy_indices_in_range(ta.topology, *nab_range)
+    PLh = _heavy_indices_in_range(th.topology, *plpro_range)
+    NBh = _heavy_indices_in_range(th.topology, *nab_range)
+
+    BL2a = _heavy_indices_by_resSeq_set(ta.topology, set(bl2_res_list))
+    BL2h = _heavy_indices_by_resSeq_set(th.topology, set(bl2_res_list))
+    if BL2a.size == 0 or BL2h.size == 0:
+        print("❗ BL2 heavy atoms not found with the provided resSeq list; "
+              "check numbering or shrink to {268,269}.")
+        return
+
+    Xa = jnp.array(ta.xyz)  # (Fa, Na, 3)
+    Xh = jnp.array(th.xyz)  # (Fh, Nh, 3)
+    Qref = Xa[0, CAa, :]
+
+    # Kabsch per frame on CA
+    def R_t_for_frame_CA(X, CAidx):
+        return _kabsch_R_t(X[CAidx, :], Qref)
+    Ra, ta_trans = jax.vmap(lambda X: R_t_for_frame_CA(X, CAa))(Xa)
+    Rh, th_trans = jax.vmap(lambda X: R_t_for_frame_CA(X, CAh))(Xh)
+
+    # COM after align helper
+    def COM_after_align(X, idxs, R, t):
+        Y = X[idxs, :]
+        Y_al = _apply_RT(Y, R, t)
+        return jnp.mean(Y_al, axis=0)
+
+    # COMs
+    PLcom_a = jax.vmap(lambda X,R,t: COM_after_align(X, PLa, R, t))(Xa, Ra, ta_trans)
+    NBcom_a = jax.vmap(lambda X,R,t: COM_after_align(X, NBa, R, t))(Xa, Ra, ta_trans)
+    BL2com_a= jax.vmap(lambda X,R,t: COM_after_align(X, BL2a, R, t))(Xa, Ra, ta_trans)
+
+    PLcom_h = jax.vmap(lambda X,R,t: COM_after_align(X, PLh, R, t))(Xh, Rh, th_trans)
+    NBcom_h = jax.vmap(lambda X,R,t: COM_after_align(X, NBh, R, t))(Xh, Rh, th_trans)
+    BL2com_h= jax.vmap(lambda X,R,t: COM_after_align(X, BL2h, R, t))(Xh, Rh, th_trans)
+
+    # Minimal image on COM differences if box present
+    def diff_minimage(A, B, L):   # returns (B - A) with nearest-image if L available
+        d = B - A
+        return jnp.where(jnp.isfinite(L).all(),
+                         d - L * jnp.round(d / L),
+                         d)
+
+    if ta.unitcell_lengths is not None and np.all(np.isfinite(ta.unitcell_lengths)):
+        La = jnp.array(ta.unitcell_lengths)
+        rN_a = diff_minimage(PLcom_a, NBcom_a, La)
+        rB_a = diff_minimage(PLcom_a, BL2com_a, La)
+    else:
+        rN_a = NBcom_a - PLcom_a
+        rB_a = BL2com_a - PLcom_a
+
+    if th.unitcell_lengths is not None and np.all(np.isfinite(th.unitcell_lengths)):
+        Lh = jnp.array(th.unitcell_lengths)
+        rN_h = diff_minimage(PLcom_h, NBcom_h, Lh)
+        rB_h = diff_minimage(PLcom_h, BL2com_h, Lh)
+    else:
+        rN_h = NBcom_h - PLcom_h
+        rB_h = BL2com_h - PLcom_h
+
+    # Apo axis and projector
+    zhat = jnp.mean(rN_a, axis=0); zhat = zhat / jnp.linalg.norm(zhat)
+    P = jnp.eye(3) - jnp.outer(zhat, zhat)
+
+    # r⊥(BL2)
+    rperp_bl2_a = jnp.linalg.norm(rB_a @ P.T, axis=1)
+    rperp_bl2_h = jnp.linalg.norm(rB_h @ P.T, axis=1)
+
+    # θ between rN and rB (deg)
+    def angle_deg(u, v):
+        nu = jnp.linalg.norm(u, axis=1)
+        nv = jnp.linalg.norm(v, axis=1)
+        cos = jnp.clip(jnp.sum(u*v, axis=1)/(nu*nv + 1e-12), -1.0, 1.0)
+        return jnp.degrees(jnp.arccos(cos))
+    theta_a = angle_deg(rN_a, rB_a)
+    theta_h = angle_deg(rN_h, rB_h)
+
+    # d_line: distance of BL2 from line along rN (remove component along unit rN)
+    def dist_to_line(u, r):
+        # u: direction vectors (frames,3); r: BL2 vectors (frames,3)
+        nu = jnp.linalg.norm(u, axis=1, keepdims=True) + 1e-12
+        û = u / nu
+        proj = jnp.sum(r * û, axis=1, keepdims=True) * û
+        res  = r - proj
+        return jnp.linalg.norm(res, axis=1)
+    dline_a = dist_to_line(rN_a, rB_a)
+    dline_h = dist_to_line(rN_h, rB_h)
+
+    # Summaries
+    def mean_ci(x):
+        x = np.asarray(x)
+        mu = float(x.mean())
+        sd = float(x.std(ddof=1)) if x.size > 1 else 0.0
+        se = sd / np.sqrt(max(1, x.size))
+        return mu, 1.96*se, sd
+
+    mu_ra, ci_ra, _ = mean_ci(rperp_bl2_a);   mu_rh, ci_rh, _ = mean_ci(rperp_bl2_h)
+    mu_ta, ci_ta, _ = mean_ci(theta_a);       mu_th, ci_th, _ = mean_ci(theta_h)
+    mu_da, ci_da, _ = mean_ci(dline_a);       mu_dh, ci_dh, _ = mean_ci(dline_h)
+
+    d_r   = mu_rh - mu_ra
+    d_th  = mu_th - mu_ta
+    d_dln = mu_dh - mu_da
+
+    print("\n[RESULT] r⊥(BL2) apo  = {:.3f} ± {:.3f} nm".format(mu_ra, ci_ra))
+    print(  "[RESULT] r⊥(BL2) holo = {:.3f} ± {:.3f} nm".format(mu_rh, ci_rh))
+    print(  "[RESULT] Δ⟨r⊥(BL2)⟩   = {:.3f} nm".format(d_r))
+
+    print(  "\n[RESULT] θ(PN,PB) apo  = {:.2f} ± {:.2f}°".format(mu_ta, ci_ta))
+    print(    "[RESULT] θ(PN,PB) holo = {:.2f} ± {:.2f}°".format(mu_th, ci_th))
+    print(    "[RESULT] Δ⟨θ⟩          = {:.2f}°".format(d_th))
+
+    print(  "\n[RESULT] d_line(BL2|PN) apo  = {:.3f} ± {:.3f} nm".format(mu_da, ci_da))
+    print(    "[RESULT] d_line(BL2|PN) holo = {:.3f} ± {:.3f} nm".format(mu_dh, ci_dh))
+    print(    "[RESULT] Δ⟨d_line⟩          = {:.3f} nm".format(d_dln))
+
+    # Plots
+    plt.figure(figsize=(9,4))
+    plt.plot(np.asarray(rperp_bl2_a), label="Apo", alpha=0.8)
+    plt.plot(np.asarray(rperp_bl2_h), label="Holo", alpha=0.8)
+    plt.xlabel("Frame"); plt.ylabel(r"$r_\perp(\mathrm{BL2})$ (nm)")
+    plt.title("BL2 radial distance (projected)")
+    plt.legend(); plt.tight_layout()
+    plt.savefig(f"{out_prefix}bl2_rperp_timeseries.png", dpi=figure_dpi)
+
+    plt.figure(figsize=(9,4))
+    plt.plot(np.asarray(theta_a), label="Apo", alpha=0.8)
+    plt.plot(np.asarray(theta_h), label="Holo", alpha=0.8)
+    plt.xlabel("Frame"); plt.ylabel("θ(PN,PB) (deg)")
+    plt.title("Angle between PLpro→NAB and PLpro→BL2")
+    plt.legend(); plt.tight_layout()
+    plt.savefig(f"{out_prefix}bl2_angle_timeseries.png", dpi=figure_dpi)
+
+    plt.figure(figsize=(9,4))
+    plt.plot(np.asarray(dline_a), label="Apo", alpha=0.8)
+    plt.plot(np.asarray(dline_h), label="Holo", alpha=0.8)
+    plt.xlabel("Frame"); plt.ylabel("d_line(BL2 | PN) (nm)")
+    plt.title("BL2 deviation from PLpro→NAB line")
+    plt.legend(); plt.tight_layout()
+    plt.savefig(f"{out_prefix}bl2_dline_timeseries.png", dpi=figure_dpi)
+
+    with open(f"{out_prefix}bl2_summary.txt","w") as f:
+        f.write(f"r_perp_BL2_apo  = {mu_ra:.6f} ± {ci_ra:.6f} nm\n")
+        f.write(f"r_perp_BL2_holo = {mu_rh:.6f} ± {ci_rh:.6f} nm\n")
+        f.write(f"delta_r_perp_BL2 = {d_r:.6f} nm\n\n")
+        f.write(f"theta_apo  = {mu_ta:.6f} ± {ci_ta:.6f} deg\n")
+        f.write(f"theta_holo = {mu_th:.6f} ± {ci_th:.6f} deg\n")
+        f.write(f"delta_theta = {d_th:.6f} deg\n\n")
+        f.write(f"dline_apo  = {mu_da:.6f} ± {ci_da:.6f} nm\n")
+        f.write(f"dline_holo = {mu_dh:.6f} ± {ci_dh:.6f} nm\n")
+        f.write(f"delta_dline = {d_dln:.6f} nm\n")
+    print(f"✅ Saved: {out_prefix}bl2_* (three plots) and {out_prefix}bl2_summary.txt")
+
+
+# === Protomer span percentiles (r05/r95) ======================================
+# For each frame, project all heavy atoms in (PLpro ∪ NAB) into the radial plane
+# and compute the 5th/95th percentiles of their distances from the PLpro COM.
+# Summarize Δ⟨r95⟩ and Δ⟨r05⟩ between holo and apo.
+
+def run_protomer_span_metrics(
+    traj_apo_file="production_md_no_ligand.dcd",
+    top_apo_file="final_structure_no_ligand.pdb",
+    traj_holo_file="production_md.dcd",
+    top_holo_file="final_structure.pdb",
+    plpro_range=(1,338),
+    nab_range=(339,454),
+    out_prefix="span_",
+    figure_dpi=180
+):
+    # Load
+    ta = md.load_dcd(traj_apo_file, top=top_apo_file)
+    th = md.load_dcd(traj_holo_file, top=top_holo_file)
+
+    # CA for PLpro alignment
+    caA = _ca_indices_in_range(ta.topology, *plpro_range)
+    caH = _ca_indices_in_range(th.topology, *plpro_range)
+    CAa, CAh, common_res = _intersect_by_resSeq(caA, caH)
+    if CAa.size == 0:
+        raise ValueError("No common PLpro CA atoms in the given range.")
+    print(f"[INFO] Span metrics: PLpro alignment uses {CAa.size} CA residues.")
+
+    # Heavy-atom selections
+    PLa = _heavy_indices_in_range(ta.topology, *plpro_range)
+    NBa = _heavy_indices_in_range(ta.topology, *nab_range)
+    PLh = _heavy_indices_in_range(th.topology, *plpro_range)
+    NBh = _heavy_indices_in_range(th.topology, *nab_range)
+
+    # Coordinates and align
+    Xa = jnp.array(ta.xyz); Xh = jnp.array(th.xyz)
+    Qref = Xa[0, CAa, :]
+    def R_t_for_frame_CA(X, CAidx):
+        return _kabsch_R_t(X[CAidx, :], Qref)
+    Ra, ta_trans = jax.vmap(lambda X: R_t_for_frame_CA(X, CAa))(Xa)
+    Rh, th_trans = jax.vmap(lambda X: R_t_for_frame_CA(X, CAh))(Xh)
+
+    def COM_after_align(X, idxs, R, t):
+        Y = X[idxs, :]; Y_al = _apply_RT(Y, R, t); return jnp.mean(Y_al, axis=0)
+
+    PLcom_a = jax.vmap(lambda X,R,t: COM_after_align(X, PLa, R, t))(Xa, Ra, ta_trans)
+    NBcom_a = jax.vmap(lambda X,R,t: COM_after_align(X, NBa, R, t))(Xa, Ra, ta_trans)
+    PLcom_h = jax.vmap(lambda X,R,t: COM_after_align(X, PLh, R, t))(Xh, Rh, th_trans)
+    NBcom_h = jax.vmap(lambda X,R,t: COM_after_align(X, NBh, R, t))(Xh, Rh, th_trans)
+
+    # Axis from apo
+    rN_a = NBcom_a - PLcom_a
+    zhat = jnp.mean(rN_a, axis=0); zhat = zhat / jnp.linalg.norm(zhat)
+    P = jnp.eye(3) - jnp.outer(zhat, zhat)
+
+    # All atoms of PLpro+NAB
+    idxs_a = np.concatenate([PLa, NBa]).astype(int)
+    idxs_h = np.concatenate([PLh, NBh]).astype(int)
+
+    # Per-frame r05/r95 (use numpy.percentile on arrays to keep things simple/robust)
+    r05_a, r95_a, r05_h, r95_h = [], [], [], []
+    Fa = Xa.shape[0]; Fh = Xh.shape[0]
+
+    for f in range(Fa):
+        # align full coordinates of the selected set
+        Y = _apply_RT(Xa[f, idxs_a, :], Ra[f], ta_trans[f])
+        # vectors from PLpro COM
+        v = Y - PLcom_a[f]            # (Na,3)
+        vperp = jnp.linalg.norm(v @ P.T, axis=1)
+        vperp_np = np.asarray(vperp)
+        r05_a.append(np.percentile(vperp_np, 5))
+        r95_a.append(np.percentile(vperp_np, 95))
+
+    for f in range(Fh):
+        Y = _apply_RT(Xh[f, idxs_h, :], Rh[f], th_trans[f])
+        v = Y - PLcom_h[f]
+        vperp = jnp.linalg.norm(v @ P.T, axis=1)
+        vperp_np = np.asarray(vperp)
+        r05_h.append(np.percentile(vperp_np, 5))
+        r95_h.append(np.percentile(vperp_np, 95))
+
+    r05_a = np.array(r05_a); r95_a = np.array(r95_a)
+    r05_h = np.array(r05_h); r95_h = np.array(r95_h)
+
+    def mean_ci(x):
+        mu = float(np.mean(x))
+        sd = float(np.std(x, ddof=1)) if len(x) > 1 else 0.0
+        se = sd / np.sqrt(max(1,len(x)))
+        return mu, 1.96*se, sd
+
+    mu05a, ci05a, _ = mean_ci(r05_a); mu95a, ci95a, _ = mean_ci(r95_a)
+    mu05h, ci05h, _ = mean_ci(r05_h); mu95h, ci95h, _ = mean_ci(r95_h)
+
+    d05 = mu05h - mu05a
+    d95 = mu95h - mu95a
+
+    print("\n[RESULT] r05 apo  = {:.3f} ± {:.3f} nm | r95 apo  = {:.3f} ± {:.3f} nm".format(mu05a, ci05a, mu95a, ci95a))
+    print(  "[RESULT] r05 holo = {:.3f} ± {:.3f} nm | r95 holo = {:.3f} ± {:.3f} nm".format(mu05h, ci05h, mu95h, ci95h))
+    print(  "[RESULT] Δ⟨r05⟩ = {:.3f} nm   Δ⟨r95⟩ = {:.3f} nm".format(d05, d95))
+
+    # Plots
+    plt.figure(figsize=(10,4))
+    plt.plot(r05_a, label="r05 apo", alpha=0.8); plt.plot(r95_a, label="r95 apo", alpha=0.8)
+    plt.plot(r05_h, label="r05 holo", alpha=0.8); plt.plot(r95_h, label="r95 holo", alpha=0.8)
+    plt.xlabel("Frame"); plt.ylabel("r05 / r95 (nm)"); plt.title("Protomer span percentiles")
+    plt.legend(); plt.tight_layout(); plt.savefig(f"{out_prefix}span_timeseries.png", dpi=figure_dpi)
+
+    plt.figure(figsize=(6,4))
+    labels = ["r05 apo","r05 holo","r95 apo","r95 holo"]
+    means  = [mu05a, mu05h, mu95a, mu95h]
+    yerr   = [ci05a, ci05h, ci95a, ci95h]
+    plt.bar(labels, means, yerr=yerr, alpha=0.8)
+    plt.ylabel("Mean ± 95% CI (nm)"); plt.xticks(rotation=20); plt.title("Span summary")
+    plt.tight_layout(); plt.savefig(f"{out_prefix}span_summary.png", dpi=figure_dpi)
+
+    with open(f"{out_prefix}span_summary.txt","w") as f:
+        f.write(f"r05_apo  = {mu05a:.6f} ± {ci05a:.6f} nm\n")
+        f.write(f"r05_holo = {mu05h:.6f} ± {ci05h:.6f} nm\n")
+        f.write(f"delta_r05 = {d05:.6f} nm\n\n")
+        f.write(f"r95_apo  = {mu95a:.6f} ± {ci95a:.6f} nm\n")
+        f.write(f"r95_holo = {mu95h:.6f} ± {ci95h:.6f} nm\n")
+        f.write(f"delta_r95 = {d95:.6f} nm\n")
+    print(f"✅ Saved: {out_prefix}span_timeseries.png, {out_prefix}span_summary.png, {out_prefix}span_summary.txt")
+
+
+def run_local_flux_proxies(
+    traj_file="production_md.dcd",
+    top_file="final_structure.pdb",
+    plpro_range=(743, 1051),   # inclusive resSeq for PLpro in your PDB numbering
+    nab_range=(1088, 1203),    # inclusive resSeq for NAB
+    R=0.6,                     # cylinder radius (nm) around the PLpro→NAB axis
+    delta=0.15,                # plane offset from each COM toward the axis (nm)
+    eps=0.02,                  # dead-zone around planes to suppress jitter (nm)
+    bin_frames=50,             # bin crossing counts for smoother plots
+    out_prefix="flux_"
+):
+    """
+    Counts water (and ion) crossings per frame through two planes orthogonal to
+    the PLpro→NAB axis, within a cylinder of radius R.
+
+    'Mouth' plane: near PLpro side, at s = +delta from PLpro-COM toward NAB.
+    'Butt' plane : near NAB   side, at s = L - delta (L = COM distance).
+
+    Outputs:
+      - {out_prefix}flux_timeseries.png    (binned counts vs frame)
+      - {out_prefix}flux_summary.txt       (rates per ns, mouth vs butt, water vs ions)
+    """
+    import mdtraj as md, jax.numpy as jnp, numpy as np, matplotlib.pyplot as plt, seaborn as sns
+    from tqdm import tqdm
+
+    traj = md.load_dcd(traj_file, top=top_file)
+    atoms = list(traj.topology.atoms)
+    coords = jnp.array(traj.xyz)                    # (F, N, 3)
+    F, N = coords.shape[0], coords.shape[1]
+
+    # Time step (ns)
+    if hasattr(traj, "time") and len(traj.time) > 1:
+        dt_ns = float(np.median(np.diff(traj.time))) / 1000.0  # mdtraj time is ps
+    else:
+        dt_ns = 0.002  # fallback to 2 fs per step if missing
+
+    # Select PLpro & NAB heavy atoms by resSeq (your numbering is already canonical)
+    resseq = np.array([a.residue.resSeq for a in atoms])
+    is_protein = np.array([a.residue.is_protein for a in atoms])
+    pl_idx = np.array([i for i,a in enumerate(atoms)
+                       if is_protein[i] and plpro_range[0] <= resseq[i] <= plpro_range[1]], dtype=int)
+    nab_idx = np.array([i for i,a in enumerate(atoms)
+                        if is_protein[i] and nab_range[0] <= resseq[i] <= nab_range[1]], dtype=int)
+
+    if pl_idx.size == 0 or nab_idx.size == 0:
+        print("❗ Check PLpro/NAB resSeq ranges; no atoms matched.")
+        return
+
+    # COMs (per-frame) and axis
+    com_pl  = jnp.mean(coords[:, pl_idx, :], axis=1)   # (F,3)
+    com_nab = jnp.mean(coords[:, nab_idx, :], axis=1)  # (F,3)
+    u_vec   = com_nab - com_pl                         # (F,3)
+    L       = jnp.linalg.norm(u_vec, axis=1)           # (F,)
+    u_hat   = u_vec / L[:, None]                       # normalize axis
+
+    # Plane locations along s (per frame)
+    s_plane_mouth = jnp.full((F,), float(delta))       # PLpro side (s=delta)
+    s_plane_butt  = L - float(delta)                   # NAB side (s=L-delta)
+
+    # Selections: water O and common ions
+    def _names(a): return (a.residue.name.strip().upper(), a.name.strip().upper())
+    water_O = [i for i,a in enumerate(atoms)
+               if _names(a)[0] in {"HOH","WAT","SOL"} and _names(a)[1] in {"O","OW"}]
+    ion_set = {"NA","K","CL","MG","MN","ZN","CA"}
+    ions    = [i for i,a in enumerate(atoms)
+               if _names(a)[0] in ion_set or _names(a)[1] in ion_set]
+
+    def _count_crossings(sel_idx):
+        if len(sel_idx) == 0:
+            return np.zeros(F-1, dtype=int), np.zeros(F-1, dtype=int)
+        pos   = coords[:, sel_idx, :]                 # (F, S, 3)
+        r_rel = pos - com_pl[:, None, :]              # relative to PLpro COM
+        s     = jnp.sum(r_rel * u_hat[:, None, :], axis=2)             # (F,S)
+        rperp = jnp.linalg.norm(r_rel - s[:, :, None] * u_hat[:, None, :], axis=2)  # (F,S)
+
+        in_cyl_prev = rperp[:-1, :] < R
+        in_cyl_curr = rperp[1:,  :] < R
+
+        # Frame-wise plane positions
+        spm_prev = s_plane_mouth[:-1, None]; spm_curr = s_plane_mouth[1:, None]
+        spb_prev = s_plane_butt [:-1, None]; spb_curr = s_plane_butt [1:, None]
+
+        s_prev = s[:-1, :]; s_curr = s[1:, :]
+
+        # cross if the sign (relative to plane) changes and both sides are outside the jitter band
+        def _cross(s_prev, s_curr, sp_prev, sp_curr):
+            side_prev = s_prev > sp_prev
+            side_curr = s_curr > sp_curr
+            far_prev  = jnp.abs(s_prev - sp_prev) > eps
+            far_curr  = jnp.abs(s_curr - sp_curr) > eps
+            return (side_prev != side_curr) & far_prev & far_curr
+
+        cross_mouth = _cross(s_prev, s_curr, spm_prev, spm_curr) & in_cyl_prev & in_cyl_curr
+        cross_butt  = _cross(s_prev, s_curr, spb_prev, spb_curr) & in_cyl_prev & in_cyl_curr
+
+        return np.array(cross_mouth.sum(axis=1)), np.array(cross_butt.sum(axis=1))
+
+    w_mouth, w_butt = _count_crossings(water_O)
+    i_mouth, i_butt = _count_crossings(ions)
+
+    total_time_ns = dt_ns * (F - 1)
+    rates = {
+        "water_mouth": w_mouth.sum() / total_time_ns,
+        "water_butt" : w_butt.sum()  / total_time_ns,
+        "ions_mouth" : i_mouth.sum() / total_time_ns,
+        "ions_butt"  : i_butt.sum()  / total_time_ns,
+    }
+
+    # Plots
+    def _bin(arr, k):  # sum in non-overlapping windows
+        if arr.size == 0: return arr
+        n = (arr.size // k) * k
+        return arr[:n].reshape(-1, k).sum(axis=1)
+
+    bins = bin_frames
+    plt.figure(figsize=(11,4))
+    plt.plot(_bin(w_mouth, bins), label="Water – mouth")
+    plt.plot(_bin(w_butt,  bins), label="Water – butt")
+    if i_mouth.sum()+i_butt.sum() > 0:
+        plt.plot(_bin(i_mouth, bins), label="Ions – mouth", alpha=0.7)
+        plt.plot(_bin(i_butt,  bins), label="Ions – butt",  alpha=0.7)
+    plt.xlabel(f"Frame (binned x{bins})"); plt.ylabel("Crossings / bin")
+    plt.title("Local crossing counts within axial cylinder")
+    plt.legend(); plt.tight_layout()
+    plt.savefig(f"{out_prefix}flux_timeseries.png", dpi=180); plt.show()
+
+    with open(f"{out_prefix}flux_summary.txt", "w") as f:
+        f.write(f"dt_ns={dt_ns:.6f}, total_time_ns={total_time_ns:.3f}\n")
+        for k,v in rates.items():
+            f.write(f"{k}: {v:.3f} crossings/ns\n")
+    print("✅ Saved:", f"{out_prefix}flux_timeseries.png", "and", f"{out_prefix}flux_summary.txt")
+    print("Rates (crossings/ns):", rates)
+
+# === Apo vs Holo local flux comparator =======================================
+# Counts water/ion crossings through planes near the "mouth" (PLpro side)
+# and the "butt" (NAB side), within a cylinder of radius R around the PLpro→NAB axis.
+# Produces side-by-side plots and a text summary with rates, 95% CIs, and deltas.
+
+def run_local_flux_proxies_compare(
+    traj_apo_file="production_md_no_ligand.dcd",
+    top_apo_file="final_structure_no_ligand.pdb",
+    traj_holo_file="production_md.dcd",
+    top_holo_file="final_structure.pdb",
+    plpro_range=(1, 338),
+    nab_range=(339, 454),
+    R=0.60,                   # cylinder radius (nm)
+    delta=0.15,               # *if* end_mode="com": plane offset from each COM toward the axis
+    eps=0.02,                 # dead-zone around planes (nm) to reject grazing contacts
+    bin_frames=50,            # frames per bin for smoothing/CI (crossings only)
+    out_prefix="fluxcmp_",
+    require_in_cyl_both=False, # crossings: was OR before; keep default False for water
+    # ---- NEW (all optional; defaults keep old behavior) ----
+    end_mode="com",           # "com" (legacy) or "rim" (use distal rim atoms along the axis)
+    rim_pct=0.10,             # fraction of most distal atoms at each end when end_mode="rim"
+    slab=0.20,                # occupancy half-thickness around each entrance plane (nm)
+    make_occupancy_plots=True # also plot presence near each entrance
+):
+    """
+    Local flux proxies at PLpro (cytosolic entrance) and NAB (luminal entrance).
+    Adds 'occupancy' near each entrance so solvent at NAB is counted even if it
+    doesn't cross the plane. Optional 'rim' end placement improves plane location.
+    """
+    import mdtraj as md, jax.numpy as jnp, numpy as np
+    import matplotlib.pyplot as plt, seaborn as sns
+
+    # ---------- helpers ----------
+    def _select_indices(top, res_range):
+        lo, hi = res_range
+        idxs = []
+        for i, a in enumerate(top.atoms):
+            if a.residue.is_protein and a.element.symbol != "H":
+                if lo <= a.residue.resSeq <= hi:
+                    idxs.append(i)
+        return np.array(idxs, dtype=int)
+
+    def _select_waters(top):
+        sel = top.select("(water or resname HOH or resname WAT or resname SOL) and (name O or name OW)")
+        return np.array(sel, dtype=int)
+
+    def _select_ions(top):
+        ion_names = ["Na","NA","K","Cl","CL","Mg","MG","Ca","CA","Zn","ZN","Mn","MN","SOD","POT"]
+        parts = [f"name {n}" for n in ion_names] + [f"resname {n}" for n in ion_names]
+        qry = " or ".join(parts)
+        sel = top.select(qry)
+        return np.array(sel, dtype=int)
+
+    def _nearest_image(rel, Lbox):
+        if Lbox is None: return rel
+        L = jnp.array(Lbox)  # (F,3)
+        return rel - L[:,None,:]*jnp.round(rel/(L[:,None,:]+1e-12))
+
+    def _frame_dt_ns(traj):
+        dt_ns = None
+        ts = getattr(traj, "timestep", None)
+        if ts is not None:
+            try:
+                dt_ns = float(ts)/1000.0  # ps -> ns
+            except Exception:
+                dt_ns = None
+        if dt_ns is None:
+            t = getattr(traj, "time", None)
+            if t is not None and len(t) > 1:
+                dt_ns = float(np.median(np.diff(t)))/1000.0
+        if dt_ns is None:
+            dt_ns = 0.002
+        return dt_ns
+
+    def _bin_sum(arr, k):
+        if arr.size == 0: return arr
+        n = (arr.size // k) * k
+        return arr[:n].reshape(-1, k).sum(axis=1)
+
+    def _rate_CI_from_bins(counts, dt_ns, k):
+        bins = _bin_sum(counts, k)
+        if bins.size == 0:
+            return 0.0, 0.0, np.array([])
+        Tbin = k * dt_ns
+        rates = bins / Tbin
+        mu = float(rates.mean())
+        sd = float(rates.std(ddof=1)) if rates.size > 1 else 0.0
+        se = sd / np.sqrt(max(1, rates.size))
+        ci = 1.96 * se
+        return mu, ci, rates
+
+    def _place_entrance_planes(pos, pl_idx, nab_idx, Lbox):
+        """
+        Returns (s_plane_plpro, s_plane_nab) for every frame.
+        end_mode='com': planes at s=delta and s=L-delta (legacy).
+        end_mode='rim': planes at the distal rims along the axis (top/bottom rim_pct).
+        """
+        # COM axis
+        com_pl  = jnp.mean(pos[:, pl_idx, :], axis=1)   # (F,3)
+        com_nab = jnp.mean(pos[:, nab_idx, :], axis=1)  # (F,3)
+        u_vec   = com_nab - com_pl
+        Laxis   = jnp.linalg.norm(u_vec, axis=1)        # (F,)
+        u_hat   = u_vec / (Laxis[:,None] + 1e-12)       # (F,3)
+
+        if end_mode.lower() == "com":
+            s_plane_pl = jnp.full((pos.shape[0],), float(delta))
+            s_plane_nb = Laxis - float(delta)
+            anchor_pl  = com_pl
+            anchor_nb  = com_pl + (s_plane_nb[:,None] * u_hat)
+        else:
+            # Project all PLpro/NAB atoms onto the axis and pick the extreme rim_pct
+            rel_pl = _nearest_image(pos[:, pl_idx, :] - com_pl[:,None,:], Lbox)
+            rel_nb = _nearest_image(pos[:, nab_idx, :] - com_pl[:,None,:], Lbox)
+            s_pl   = jnp.sum(rel_pl * u_hat[:,None,:], axis=2)  # (F, Npl)
+            s_nb   = jnp.sum(rel_nb * u_hat[:,None,:], axis=2)  # (F, Nnb)
+
+            k_pl = max(1, int(np.ceil(rim_pct * s_pl.shape[1])))
+            k_nb = max(1, int(np.ceil(rim_pct * s_nb.shape[1])))
+
+            # PLpro entrance at the lowest s (closest to PLpro side)
+            s_pl_sorted = jnp.sort(s_pl, axis=1)
+            s_plane_pl  = jnp.mean(s_pl_sorted[:, :k_pl], axis=1)
+
+            # NAB entrance at the highest s (closest to NAB side)
+            s_nb_sorted = jnp.sort(s_nb, axis=1)
+            s_plane_nb  = jnp.mean(s_nb_sorted[:, -k_nb:], axis=1)
+
+            anchor_pl = com_pl + (s_plane_pl[:,None] * u_hat)
+            anchor_nb = com_pl + (s_plane_nb[:,None] * u_hat)
+
+        return (com_pl, u_hat, Laxis, s_plane_pl, s_plane_nb, anchor_pl, anchor_nb)
+
+    def _counts_and_occupancy(traj_file, top_file, tag=""):
+        t = md.load_dcd(traj_file, top=top_file)
+        top = t.topology
+        X = jnp.array(t.xyz)                      # (F,N,3), nm
+        F = X.shape[0]
+        dt_ns = _frame_dt_ns(t)
+        Lbox = t.unitcell_lengths if hasattr(t, "unitcell_lengths") else None
+
+        pl_idx  = _select_indices(top, plpro_range)
+        nab_idx = _select_indices(top, nab_range)
+        w_idx   = _select_waters(top)
+        i_idx   = _select_ions(top)
+
+        print(f"[{tag}] selected: PLpro atoms={pl_idx.size}, NAB atoms={nab_idx.size}, waters(O)={w_idx.size}, ions={i_idx.size}, dt={dt_ns:.4f} ns")
+
+        com_pl, u_hat, Laxis, s_pl, s_nb, anchor_pl, anchor_nb = _place_entrance_planes(X, pl_idx, nab_idx, Lbox)
+
+        # Helper for either water or ions
+        def _do(sel_idx):
+            if sel_idx.size == 0:
+                Z = np.zeros(F-1, dtype=int)
+                O = np.zeros(F, dtype=int)
+                Z2 = np.zeros(F-1, dtype=int)
+                O2 = np.zeros(F, dtype=int)
+                return Z, Z2, O, O2
+
+            pos   = X[:, sel_idx, :]
+            rel   = _nearest_image(pos - com_pl[:,None,:], Lbox)
+            s     = jnp.sum(rel * u_hat[:,None,:], axis=2)                       # (F,S)
+            rperp = jnp.linalg.norm(rel - s[:,:,None]*u_hat[:,None,:], axis=2)   # (F,S)
+
+            # ---- crossings ----
+            in_prev = rperp[:-1,:] < R
+            in_curr = rperp[1: ,:] < R
+            in_gate = (in_prev & in_curr) if require_in_cyl_both else (in_prev | in_curr)
+
+            spm_prev = s_pl[:-1,None]; spm_curr = s_pl[1:,None]
+            spb_prev = s_nb[:-1,None]; spb_curr = s_nb[1:,None]
+            s_prev   = s[:-1,:];     s_curr   = s[1:,:]
+
+            def _cross(sp_prev, sp_curr):
+                side_prev = s_prev > sp_prev
+                side_curr = s_curr > sp_curr
+                far_prev  = jnp.abs(s_prev - sp_prev) > eps
+                far_curr  = jnp.abs(s_curr - sp_curr) > eps
+                return (side_prev != side_curr) & far_prev & far_curr
+
+            cross_pl = (_cross(spm_prev, spm_curr) & in_gate).sum(axis=1)  # per-frame
+            cross_nb = (_cross(spb_prev, spb_curr) & in_gate).sum(axis=1)
+
+            # ---- occupancy near each entrance (presence, not crossings) ----
+            occ_pl = ((jnp.abs(s - s_pl[:,None]) <= slab) & (rperp < R)).sum(axis=1)  # per-frame # molecules
+            occ_nb = ((jnp.abs(s - s_nb[:,None]) <= slab) & (rperp < R)).sum(axis=1)
+
+            return np.array(cross_pl), np.array(cross_nb), np.array(occ_pl), np.array(occ_nb)
+
+        w_cross_pl, w_cross_nb, w_occ_pl, w_occ_nb = _do(w_idx)
+        i_cross_pl, i_cross_nb, i_occ_pl, i_occ_nb = _do(i_idx)
+
+        return {
+            "dt_ns": dt_ns, "n_frames": F,
+            # crossings (per-frame)
+            "w_pl_cross": w_cross_pl, "w_nb_cross": w_cross_nb,
+            "i_pl_cross": i_cross_pl, "i_nb_cross": i_cross_nb,
+            # occupancy (per-frame counts)
+            "w_pl_occ": w_occ_pl, "w_nb_occ": w_occ_nb,
+            "i_pl_occ": i_occ_pl, "i_nb_occ": i_occ_nb
+        }
+
+    # ---------- compute (apo & holo) ----------
+    A = _counts_and_occupancy(traj_apo_file,  top_apo_file,  tag="APO ")
+    H = _counts_and_occupancy(traj_holo_file, top_holo_file, tag="HOLO")
+
+    # ---------- crossings: time series ----------
+    labL = "cytosolic entrance (PLpro side)"
+    labR = "luminal entrance (NAB side)"
+
+    plt.figure(figsize=(12,5))
+    plt.subplot(1,2,1); plt.title(f"Water crossings – {labL}")
+    plt.plot(_bin_sum(A["w_pl_cross"], bin_frames), label="Apo")
+    plt.plot(_bin_sum(H["w_pl_cross"], bin_frames), label="Holo")
+    plt.xlabel(f"Frame (binned ×{bin_frames})"); plt.ylabel("Crossings / bin")
+    plt.legend(); plt.grid(alpha=0.3)
+
+    plt.subplot(1,2,2); plt.title(f"Water crossings – {labR}")
+    plt.plot(_bin_sum(A["w_nb_cross"], bin_frames), label="Apo")
+    plt.plot(_bin_sum(H["w_nb_cross"], bin_frames), label="Holo")
+    plt.xlabel(f"Frame (binned ×{bin_frames})"); plt.ylabel("Crossings / bin")
+    plt.legend(); plt.grid(alpha=0.3)
+    plt.tight_layout(); plt.savefig(f"{out_prefix}water_crossings_timeseries.png", dpi=180)
+
+    if (A["i_pl_cross"].sum() + A["i_nb_cross"].sum() +
+        H["i_pl_cross"].sum() + H["i_nb_cross"].sum()) > 0:
+        plt.figure(figsize=(12,5))
+        plt.subplot(1,2,1); plt.title(f"Ion crossings – {labL}")
+        plt.plot(_bin_sum(A["i_pl_cross"], bin_frames), label="Apo")
+        plt.plot(_bin_sum(H["i_pl_cross"], bin_frames), label="Holo")
+        plt.xlabel(f"Frame (binned ×{bin_frames})"); plt.ylabel("Crossings / bin")
+        plt.legend(); plt.grid(alpha=0.3)
+
+        plt.subplot(1,2,2); plt.title(f"Ion crossings – {labR}")
+        plt.plot(_bin_sum(A["i_nb_cross"], bin_frames), label="Apo")
+        plt.plot(_bin_sum(H["i_nb_cross"], bin_frames), label="Holo")
+        plt.xlabel(f"Frame (binned ×{bin_frames})"); plt.ylabel("Crossings / bin")
+        plt.legend(); plt.grid(alpha=0.3)
+        plt.tight_layout(); plt.savefig(f"{out_prefix}ion_crossings_timeseries.png", dpi=180)
+
+    # ---------- crossings: summary bar with 95% CIs ----------
+    labels = [("w_pl_cross", f"Water – {labL}"),
+              ("w_nb_cross", f"Water – {labR}"),
+              ("i_pl_cross", f"Ions – {labL}"),
+              ("i_nb_cross", f"Ions – {labR}")]
+    rows = []
+    apo_means, apo_cis, holo_means, holo_cis, xticks = [], [], [], [], []
+    for key, text in labels:
+        muA, ciA, _ = _rate_CI_from_bins(A[key], A["dt_ns"], bin_frames)
+        muH, ciH, _ = _rate_CI_from_bins(H[key], H["dt_ns"], bin_frames)
+        pct = (muH - muA)/muA*100 if muA > 1e-12 else np.nan
+        rows.append(f"{text}: Apo {muA:.3f}±{ciA:.3f} | Holo {muH:.3f}±{ciH:.3f} | Δ={muH-muA:.3f} ({pct:.1f}%) crossings/ns")
+        apo_means.append(muA); apo_cis.append(ciA); holo_means.append(muH); holo_cis.append(ciH); xticks.append(text)
+
+    x = np.arange(len(xticks)); w = 0.35
+    plt.figure(figsize=(10,4))
+    plt.bar(x-w/2, apo_means, yerr=apo_cis, width=w, label="Apo", alpha=0.85)
+    plt.bar(x+w/2, holo_means, yerr=holo_cis, width=w, label="Holo", alpha=0.85)
+    plt.xticks(x, xticks, rotation=10); plt.ylabel("Rate (crossings/ns)")
+    plt.title("Local flux rates with 95% CI (per‑bin)"); plt.legend(); plt.tight_layout()
+    plt.savefig(f"{out_prefix}rates_bar.png", dpi=180)
+
+    # ---------- NEW: occupancy (presence near entrances) ----------
+    if make_occupancy_plots:
+        def _mean_ci(x):
+            x = np.asarray(x, float)
+            mu = float(x.mean()) if x.size else 0.0
+            sd = float(x.std(ddof=1)) if x.size > 1 else 0.0
+            ci = 1.96 * sd / np.sqrt(max(1, x.size))
+            return mu, ci
+
+        # Per-frame timeseries
+        plt.figure(figsize=(12,6))
+        plt.subplot(2,2,1); plt.title(f"Water occupancy – {labL}")
+        plt.plot(A["w_pl_occ"], alpha=0.7, label="Apo"); plt.plot(H["w_pl_occ"], alpha=0.7, label="Holo")
+        plt.ylabel("# molecules"); plt.legend(); plt.grid(alpha=0.3)
+        plt.subplot(2,2,2); plt.title(f"Water occupancy – {labR}")
+        plt.plot(A["w_nb_occ"], alpha=0.7, label="Apo"); plt.plot(H["w_nb_occ"], alpha=0.7, label="Holo")
+        plt.grid(alpha=0.3)
+        plt.subplot(2,2,3); plt.title(f"Ion occupancy – {labL}")
+        plt.plot(A["i_pl_occ"], alpha=0.7, label="Apo"); plt.plot(H["i_pl_occ"], alpha=0.7, label="Holo")
+        plt.xlabel("Frame"); plt.ylabel("# ions"); plt.legend(); plt.grid(alpha=0.3)
+        plt.subplot(2,2,4); plt.title(f"Ion occupancy – {labR}")
+        plt.plot(A["i_nb_occ"], alpha=0.7, label="Apo"); plt.plot(H["i_nb_occ"], alpha=0.7, label="Holo")
+        plt.xlabel("Frame"); plt.grid(alpha=0.3)
+        plt.tight_layout(); plt.savefig(f"{out_prefix}occupancy_timeseries.png", dpi=180)
+
+        # Bar summary (mean ±95% CI)
+        occ_labels = [("w_pl_occ", f"Water – {labL}"),
+                      ("w_nb_occ", f"Water – {labR}"),
+                      ("i_pl_occ", f"Ions – {labL}"),
+                      ("i_nb_occ", f"Ions – {labR}")]
+        apo_mu, apo_ci, holo_mu, holo_ci, xt = [], [], [], [], []
+        for k, txt in occ_labels:
+            mA, cA = _mean_ci(A[k]); mH, cH = _mean_ci(H[k])
+            apo_mu.append(mA); apo_ci.append(cA); holo_mu.append(mH); holo_ci.append(cH); xt.append(txt)
+
+        x = np.arange(len(xt)); w = 0.35
+        plt.figure(figsize=(10,4))
+        plt.bar(x-w/2, apo_mu, yerr=apo_ci, width=w, label="Apo", alpha=0.85)
+        plt.bar(x+w/2, holo_mu, yerr=holo_ci, width=w, label="Holo", alpha=0.85)
+        plt.xticks(x, xt, rotation=10); plt.ylabel("Mean occupancy (# per frame)")
+        plt.title(f"Entrance occupancy (slab ±{slab:.2f} nm, radius {R:.2f} nm)")
+        plt.legend(); plt.tight_layout()
+        plt.savefig(f"{out_prefix}occupancy_bar.png", dpi=180)
+
+    # ---------- summary file ----------
+    T_apo  = A["dt_ns"]*(A["n_frames"]-1)
+    T_holo = H["dt_ns"]*(H["n_frames"]-1)
+    with open(f"{out_prefix}summary.txt","w") as f:
+        f.write(f"end_mode={end_mode}, rim_pct={rim_pct}, R={R} nm, delta={delta} nm, slab={slab} nm, require_in_cyl_both={require_in_cyl_both}\n")
+        f.write(f"bin_frames={bin_frames}, dt_ns_apo={A['dt_ns']:.6f}, dt_ns_holo={H['dt_ns']:.6f}\n")
+        f.write(f"total_time_ns: apo={T_apo:.3f}, holo={T_holo:.3f}\n\n")
+        for line in rows:
+            f.write(line + "\n")
+        if make_occupancy_plots:
+            def _mci(x):
+                x = np.asarray(x, float)
+                mu = float(x.mean()) if x.size else 0.0
+                sd = float(x.std(ddof=1)) if x.size > 1 else 0.0
+                ci = 1.96*sd/np.sqrt(max(1, x.size))
+                return mu, ci
+            def _emit(tag, arrA, arrH):
+                mA,cA = _mci(arrA); mH,cH = _mci(arrH)
+                f.write(f"{tag}: Apo {mA:.2f}±{cA:.2f}  |  Holo {mH:.2f}±{cH:.2f}  (#/frame)\n")
+            f.write("\n[Occupancy means ±95% CI]\n")
+            _emit(f"Water – {labL}", A["w_pl_occ"], H["w_pl_occ"])
+            _emit(f"Water – {labR}", A["w_nb_occ"], H["w_nb_occ"])
+            _emit(f"Ions  – {labL}", A["i_pl_occ"], H["i_pl_occ"])
+            _emit(f"Ions  – {labR}", A["i_nb_occ"], H["i_nb_occ"])
+
+    print("✅ Saved:",
+          f"{out_prefix}water_crossings_timeseries.png,",
+          f"{out_prefix}ion_crossings_timeseries.png (if any),",
+          f"{out_prefix}rates_bar.png,",
+          f"{out_prefix}occupancy_timeseries.png,",
+          f"{out_prefix}occupancy_bar.png,",
+          f"{out_prefix}summary.txt")
+
+def run_protomer_width_profile_compare(
+    traj_apo_file="production_md_no_ligand.dcd",
+    top_apo_file="final_structure_no_ligand.pdb",
+    traj_holo_file="production_md.dcd",
+    top_holo_file="final_structure.pdb",
+    plpro_range=(1, 338),             # your numbering (protein resSeq)
+    nab_range=(339, 454),
+    bl2_res_list=(266, 267, 268, 269, 270, 271),
+    slice_count=24,                    # number of z-slices along the protomer
+    y_limit=6.0,                      # nm, only for plot axis (not clipping)
+    out_prefix="width_"
+):
+    """
+    Builds a per-frame orthonormal frame tied to the protomer:
+      z_hat: COM(PLpro) -> COM(NAB)
+      x_hat: BL2 COM projected ⟂ z_hat (fallback to PLpro PCA axis if degenerate)
+      y_hat: z_hat × x_hat
+    Then computes y-span (max_y - min_y) among PROTEIN HEAVY atoms
+    in multiple z-slices, ignoring waters/ions entirely.
+
+    Saves:
+      - {out_prefix}timeseries.png      (mean y-width vs time, apo/holo overlay)
+      - {out_prefix}heatmap_apo.png     (frame × slice width heatmap)
+      - {out_prefix}heatmap_holo.png
+      - {out_prefix}summary.txt         (means, deltas)
+    """
+    import mdtraj as md, jax.numpy as jnp, numpy as np
+    import matplotlib.pyplot as plt
+
+    # ---------- helpers ----------
+    def _frame_dt_ns(traj):
+        ts = getattr(traj, "timestep", None)
+        if ts is not None:
+            try: return float(ts)/1000.0
+            except Exception: pass
+        t = getattr(traj, "time", None)
+        if t is not None and len(t) > 1:
+            return float(np.median(np.diff(t)))/1000.0
+        return 0.001  # sensible fallback for your 1 ps stride (=0.001 ns)
+
+    def _min_image_rel(rel, Lbox):
+        # rel: (F,S,3), Lbox: (F,3) nm
+        if Lbox is None or not np.all(np.isfinite(Lbox)):
+            return rel
+        L = jnp.array(Lbox)
+        return rel - L[:,None,:]*jnp.round(rel/(L[:,None,:]+1e-12))
+
+    def _protein_heavy_indices(top, res_range=None):
+        lo, hi = (None, None) if res_range is None else res_range
+        idxs = []
+        for i, a in enumerate(top.atoms):
+            rn = a.residue.name.strip().upper()
+            # protein heavy atom only
+            if a.residue.is_protein and a.element.symbol != "H":
+                # exclude common solvent/ions by residue name
+                if rn in {"HOH","WAT","SOL","NA","CL","K","MG","CA","ZN","MN","SOD","POT"}:
+                    continue
+                if res_range is None:
+                    idxs.append(i)
+                else:
+                    rs = a.residue.resSeq
+                    if lo <= rs <= hi:
+                        idxs.append(i)
+        return np.array(idxs, dtype=int)
+
+    def _res_list_indices(top, res_list):
+        res_set = set(int(r) for r in res_list)
+        idxs = []
+        for i, a in enumerate(top.atoms):
+            if a.residue.is_protein and a.element.symbol != "H":
+                if a.residue.resSeq in res_set:
+                    idxs.append(i)
+        return np.array(idxs, dtype=int)
+
+    def _fallback_x_from_pca(coords):
+        # coords: (N,3), return first principal axis
+        X = coords - coords.mean(axis=0, keepdims=True)
+        C = X.T @ X
+        w, v = np.linalg.eigh(np.array(C))
+        axis = v[:, np.argmax(w)]
+        return jnp.array(axis / (np.linalg.norm(axis)+1e-12))
+
+    def _build_axes_per_frame(X, top, pl_idx, nab_idx, bl2_idx, Lbox, x_ref=None, z_ref=None):
+        """
+        Returns x_hat, y_hat, z_hat per frame with sign stabilization vs ref.
+        X: (F,N,3) nm
+        """
+        com_pl  = jnp.mean(X[:, pl_idx, :], axis=1)   # (F,3)
+        com_nab = jnp.mean(X[:, nab_idx, :], axis=1)  # (F,3)
+        vec_z   = com_nab - com_pl
+        z_hat   = vec_z / (jnp.linalg.norm(vec_z, axis=1, keepdims=True)+1e-12)  # (F,3)
+
+        # BL2 anchor (could be small set)
+        com_bl2 = jnp.mean(X[:, bl2_idx, :], axis=1) if bl2_idx.size>0 else None
+
+        x_hat = []
+        y_hat = []
+        for f in range(X.shape[0]):
+            zh = z_hat[f]
+            # BL2-based perpendicular
+            if com_bl2 is not None:
+                v = com_bl2[f] - com_pl[f]
+                v = v - jnp.dot(v, zh) * zh          # remove z component
+                v_norm = jnp.linalg.norm(v)
+                if v_norm < 1e-4:
+                    # fallback to PCA on PLpro cloud for stability
+                    v = _fallback_x_from_pca(np.array(X[f, pl_idx, :]))
+                else:
+                    v = v / v_norm
+            else:
+                v = _fallback_x_from_pca(np.array(X[f, pl_idx, :]))
+
+            yh = jnp.cross(zh, v)
+            yh = yh / (jnp.linalg.norm(yh)+1e-12)
+            xh = jnp.cross(yh, zh)                    # re-orthogonalize
+            xh = xh / (jnp.linalg.norm(xh)+1e-12)
+
+            # sign stabilization vs references (avoid frame-to-frame flips)
+            if z_ref is not None and jnp.dot(zh, z_ref) < 0:
+                zh = -zh; xh = -xh; yh = -yh
+            if x_ref is not None and jnp.dot(xh, x_ref) < 0:
+                xh = -xh; yh = -yh
+            x_hat.append(xh); y_hat.append(yh); z_hat = z_hat.at[f].set(zh)
+
+            # update refs softly
+            if f == 0:
+                x_ref = xh; z_ref = zh
+
+        return jnp.stack(x_hat, axis=0), jnp.stack(y_hat, axis=0), z_hat
+
+    def _widths_for(traj_file, top_file, tag):
+        t = md.load_dcd(traj_file, top=top_file)
+        top = t.topology
+        X   = jnp.array(t.xyz)                       # (F,N,3)
+        F   = X.shape[0]
+        dt  = _frame_dt_ns(t)
+        Lbox = t.unitcell_lengths if hasattr(t, "unitcell_lengths") else None
+
+        pl_idx  = _protein_heavy_indices(top, plpro_range)
+        nab_idx = _protein_heavy_indices(top, nab_range)
+        if pl_idx.size == 0 or nab_idx.size == 0:
+            raise ValueError(f"{tag}: empty PLpro/NAB selection — check numbering.")
+        bl2_idx = _res_list_indices(top, bl2_res_list)
+
+        # protein heavy atoms only across whole protomer:
+        prot_idx = _protein_heavy_indices(top, None)
+
+        # Build axes per frame
+        x_hat, y_hat, z_hat = _build_axes_per_frame(X, top, pl_idx, nab_idx, bl2_idx, Lbox)
+
+        # Place everything relative to COM(PLpro) to avoid box jumps; min image first
+        com_pl  = jnp.mean(X[:, pl_idx, :], axis=1)                # (F,3)
+        rel     = X[:, prot_idx, :] - com_pl[:, None, :]           # (F,S,3)
+        rel     = _min_image_rel(rel, Lbox)                        # handle PBC
+
+        # Coordinates in the protomer frame
+        # s = projection on z, u = on x, v = on y
+        s = jnp.einsum("fsk,fk->fs", rel, z_hat)                   # (F,S)
+        u = jnp.einsum("fsk,fk->fs", rel, x_hat)                   # (F,S)
+        v = jnp.einsum("fsk,fk->fs", rel, y_hat)                   # (F,S)
+
+        # Use dynamic length along axis = distance between COMs
+        com_nab = jnp.mean(X[:, nab_idx, :], axis=1)
+        Laxis   = jnp.linalg.norm(com_nab - com_pl, axis=1)        # (F,)
+
+        # Define per-frame z-slices in [0, Laxis]
+        widths = np.zeros((F, slice_count), dtype=float)
+        for f in range(F):
+            L = float(Laxis[f])
+            if L < 1e-3:  # degenerate
+                continue
+            dz = L / slice_count
+            s_edges = np.linspace(0.0, L, slice_count+1)
+            s_cent  = 0.5*(s_edges[:-1] + s_edges[1:])
+            sf = np.array(s[f])   # (S,)
+            vf = np.array(v[f])   # (S,)
+            for k in range(slice_count):
+                mask = (sf >= s_edges[k]) & (sf < s_edges[k+1])
+                if not np.any(mask):
+                    widths[f, k] = np.nan
+                else:
+                    # robust span: 5–95 percentile to ignore stray atoms
+                    vals = np.sort(vf[mask])
+                    lo   = np.percentile(vals, 5)
+                    hi   = np.percentile(vals, 95)
+                    widths[f, k] = max(0.0, hi - lo)
+
+        # Aggregate: mean width over slices per frame
+        mean_width = np.nanmean(widths, axis=1)  # (F,)
+        return {
+            "dt_ns": dt, "widths": widths, "mean": mean_width
+        }
+
+    # ---------- compute ----------
+    A = _widths_for(traj_apo_file,  top_apo_file,  tag="APO ")
+    H = _widths_for(traj_holo_file, top_holo_file, tag="HOLO")
+
+    # ---------- plots ----------
+    # (1) timeseries
+    tA = np.arange(len(A["mean"])) * A["dt_ns"]
+    tH = np.arange(len(H["mean"])) * H["dt_ns"]
+    plt.figure(figsize=(10,4))
+    plt.plot(tA, A["mean"], label="Apo")
+    plt.plot(tH, H["mean"], label="Ligand-bound")
+    plt.ylim(0, y_limit)
+    plt.xlabel("Time (ns)"); plt.ylabel("Mean y-width (nm)")
+    plt.title("Protomer y-width (apo vs holo)")
+    plt.grid(alpha=0.3); plt.legend(); plt.tight_layout()
+    plt.savefig(f"{out_prefix}timeseries.png", dpi=180)
+
+    # (2) heatmaps (frame × slice)
+    def _heatmap(W, title, fname):
+        plt.figure(figsize=(11,4))
+        plt.imshow(np.nan_to_num(W, nan=0.0).T, aspect="auto", origin="lower",
+                   vmin=0.0, vmax=y_limit)  # cap colorbar at y_limit
+        plt.colorbar(label="y-width (nm)")
+        plt.xlabel("Frame"); plt.ylabel("Slice index (0=PLpro side → NAB side)")
+        plt.title(title); plt.tight_layout(); plt.savefig(fname, dpi=180)
+    _heatmap(A["widths"], "Apo width profile (frame × slice)", f"{out_prefix}heatmap2_apo.png")
+    _heatmap(H["widths"], "Holo width profile (frame × slice)", f"{out_prefix}heatmap2_holo.png")
+
+    # ---------- summary ----------
+    muA = float(np.nanmean(A["mean"]))
+    muH = float(np.nanmean(H["mean"]))
+    d   = muH - muA
+    pct = (d/muA*100.0) if muA>1e-12 else np.nan
+    with open(f"{out_prefix}summary.txt","w") as f:
+        f.write(f"slice_count={slice_count}, y_limit={y_limit} nm\n")
+        f.write(f"apo_mean_width={muA:.3f} nm\n")
+        f.write(f"holo_mean_width={muH:.3f} nm\n")
+        f.write(f"delta={d:.3f} nm ({pct:.1f}%)\n")
+
+    print("✅ Saved:",
+          f"{out_prefix}timeseries.png,",
+          f"{out_prefix}heatmap_apo.png,",
+          f"{out_prefix}heatmap_holo.png,",
+          f"{out_prefix}summary.txt")
+
+def run_protomer_width_transport_compare(
+    traj_apo_file="production_md_no_ligand.dcd",
+    top_apo_file="final_structure_no_ligand.pdb",
+    traj_holo_file="production_md.dcd",
+    top_holo_file="final_structure.pdb",
+    plpro_range=(1, 338),
+    nab_range=(339, 454),
+    bl2_res_list=(266, 267, 268, 269, 270, 271),
+    n_slices=24,
+    y_cap_nm=6.0,                 # 幅の上限（外れ値で暴れないためのクリップ）
+    min_atoms_per_slice=8,        # slice 幅の算出に必要な最小原子数
+    bin_frames=50,                # CI 用の時間ビニング
+    out_prefix="width_"
+):
+    import mdtraj as md, jax.numpy as jnp, numpy as np
+    import matplotlib.pyplot as plt, seaborn as sns
+    from tqdm import tqdm
+
+    # --- 選択ユーティリティ ---
+    def _protomer_heavy_idxs(top, lo, hi):
+        idxs = []
+        for i,a in enumerate(top.atoms):
+            if a.residue.is_protein and a.element.symbol != "H":
+                if lo <= a.residue.resSeq <= hi:
+                    idxs.append(i)
+        return np.array(idxs, dtype=int)
+
+    def _bl2_idxs(top, bl2_list):
+        want = set(int(x) for x in bl2_list)
+        idxs = [i for i,a in enumerate(top.atoms)
+                if a.residue.is_protein and a.residue.resSeq in want and a.element.symbol != "H"]
+        if not idxs:
+            # フォールバック：CA のみで探す
+            idxs = [i for i,a in enumerate(top.atoms)
+                    if a.residue.is_protein and a.residue.resSeq in want and a.name.strip()=="CA"]
+        return np.array(idxs, dtype=int)
+
+    def _frame_dt_ns(traj):
+        ts = getattr(traj, "timestep", None)
+        if ts is not None:
+            try: return float(ts)/1000.0
+            except Exception: pass
+        t = getattr(traj, "time", None)
+        if t is not None and len(t)>1:
+            return float(np.median(np.diff(t)))/1000.0
+        return 0.001  # 安全側（1 ps）
+
+    def _orthonormal_basis(com_pl, com_nab, com_bl2, prev_basis=None):
+        # z: PLpro→NAB
+        u = com_nab - com_pl
+        Lu = jnp.linalg.norm(u)
+        zhat = u / (Lu + 1e-12)
+        # x: BL2 の“外向き”成分（z に直交）
+        r = com_bl2 - com_pl
+        r_perp = r - jnp.dot(r, zhat) * zhat
+        nr = jnp.linalg.norm(r_perp)
+        if nr < 1e-6 and prev_basis is not None:
+            xhat = prev_basis[0]; yhat = prev_basis[1]; zhat = prev_basis[2]
+        else:
+            xhat = r_perp / (nr + 1e-12)
+            yhat = jnp.cross(zhat, xhat)
+            yhat = yhat / (jnp.linalg.norm(yhat) + 1e-12)
+            xhat = jnp.cross(yhat, zhat)  # 正確に直交に補正
+        return xhat, yhat, zhat, float(Lu)
+
+    def _compute(traj_file, top_file, tag):
+        t = md.load_dcd(traj_file, top=top_file)
+        dt_ns = _frame_dt_ns(t)
+        top = t.topology
+        X = jnp.array(t.xyz)        # (F,N,3), nm
+        F  = X.shape[0]
+
+        pl_idx = _protomer_heavy_idxs(top, *plpro_range)
+        nb_idx = _protomer_heavy_idxs(top, *nab_range)
+        bl_idx = _bl2_idxs(top, bl2_res_list)
+        prot_idxs = np.concatenate([pl_idx, nb_idx])
+
+        if prot_idxs.size == 0 or bl_idx.size == 0:
+            raise ValueError("Protomer または BL2 の選択が空です。resSeq の範囲を確認してください。")
+
+        com_pl  = jnp.mean(X[:, pl_idx, :], axis=1)
+        com_nab = jnp.mean(X[:, nb_idx, :], axis=1)
+        com_bl2 = jnp.mean(X[:, bl_idx, :], axis=1)
+
+        # 出力用バッファ
+        width_mat = np.zeros((F, n_slices), dtype=np.float32)
+        mean_w    = np.zeros(F, dtype=np.float32)
+        R2        = np.zeros(F, dtype=np.float64)
+        R3        = np.zeros(F, dtype=np.float64)
+        Area      = np.zeros(F, dtype=np.float64)
+        L_axis    = np.zeros(F, dtype=np.float32)
+
+        prev_basis = None
+        prot = X[:, prot_idxs, :]
+
+        for f in tqdm(range(F), desc=f"[{tag}] width/proxy"):
+            xhat, yhat, zhat, L = _orthonormal_basis(com_pl[f], com_nab[f], com_bl2[f], prev_basis)
+            prev_basis = (xhat, yhat, zhat)
+            L_axis[f]  = L
+
+            # 原点を PLpro COM に取り、直交基底へ座標変換
+            rel = prot[f] - com_pl[f]
+            s   = jnp.dot(rel, zhat)                      # 軸方向 0..L
+            xco = jnp.dot(rel, xhat)
+            yco = jnp.dot(rel, yhat)
+            # 外れ点抑制（半径クラップ）
+            rad = jnp.sqrt(xco**2 + yco**2)
+            mask_all = (s>=0.0) & (s<=L) & (rad <= y_cap_nm)
+
+            if mask_all.sum() < min_atoms_per_slice:
+                continue
+
+            # スライス分割（0..L を n_slices 等分）
+            edges = jnp.linspace(0.0, L, n_slices+1)
+            w_list = []
+            for k in range(n_slices):
+                m = mask_all & (s>=edges[k]) & (s<edges[k+1])
+                if m.sum() >= min_atoms_per_slice:
+                    w = float(jnp.clip(jnp.max(yco[m]) - jnp.min(yco[m]), 0.0, y_cap_nm))
+                else:
+                    w = 0.0
+                width_mat[f, k] = w
+                w_list.append(w)
+
+            w_arr = np.array(w_list, dtype=np.float64)
+            dz    = float(L / n_slices) if L>1e-9 else 0.0
+            eps   = 1e-3
+
+            mean_w[f] = float(np.mean(w_arr))
+            Area[f]   = float(np.sum(w_arr) * dz)                          # A(t)
+            R2[f]     = float(np.sum(dz / np.maximum(w_arr, eps)**2))      # p=2
+            R3[f]     = float(np.sum(dz / np.maximum(w_arr, eps)**3))      # p=3
+
+        return {
+            "width": width_mat, "mean_w": mean_w, "R2": R2, "R3": R3,
+            "Area": Area, "L": L_axis, "dt_ns": dt_ns
+        }
+
+    # ---- 実行（Apo/Holo）----
+    A = _compute(traj_apo_file,  top_apo_file,  "Apo ")
+    H = _compute(traj_holo_file, top_holo_file, "Holo")
+
+    # ---- 可視化（ヒートマップ）----
+    def _heatmap(W, fname, title):
+        plt.figure(figsize=(11.8,4.2), dpi=140)
+        sns.heatmap(W.T, cmap="viridis", vmin=0, vmax=y_cap_nm,
+                    cbar_kws={'label': 'y-width (nm)'})
+        plt.xlabel("Frame"); plt.ylabel("Slice index (0=PLpro side → NAB side)")
+        plt.title(title); plt.tight_layout(); plt.savefig(fname); plt.close()
+
+    _heatmap(A["width"], f"{out_prefix}heatmap_apo.png",  "Apo width profile (frame × slice)")
+    _heatmap(H["width"], f"{out_prefix}heatmap_holo.png", "Holo width profile (frame × slice)")
+
+    # ---- 幅の平均（時系列）----
+    T_apo = np.arange(len(A["mean_w"])) * A["dt_ns"]
+    T_hol = np.arange(len(H["mean_w"])) * H["dt_ns"]
+    plt.figure(figsize=(7.2,3.2), dpi=140)
+    plt.plot(T_apo, A["mean_w"], label="Apo")
+    plt.plot(T_hol, H["mean_w"], label="Ligand-bound")
+    plt.xlabel("Time (ns)"); plt.ylabel("Mean y-width (nm)")
+    plt.title("Protomer y-width (apo vs holo)")
+    plt.legend(); plt.tight_layout(); plt.savefig(f"{out_prefix}mean_width_timeseries.png"); plt.close()
+
+    # ---- 等価抵抗と面積（時系列）----
+    def _plot_two(tsA,yA,tsH,yH,ylabel,title,fname):
+        plt.figure(figsize=(7.6,3.0), dpi=140)
+        plt.plot(tsA,yA,label="Apo"); plt.plot(tsH,yH,label="Ligand-bound")
+        plt.xlabel("Time (ns)"); plt.ylabel(ylabel); plt.title(title)
+        plt.legend(); plt.tight_layout(); plt.savefig(fname); plt.close()
+
+    _plot_two(T_apo,A["R2"],T_hol,H["R2"],"R₂ (arb.)","Equivalent resistance (p=2)",f"{out_prefix}R2_timeseries.png")
+    _plot_two(T_apo,A["R3"],T_hol,H["R3"],"R₃ (arb.)","Equivalent resistance (p=3)",f"{out_prefix}R3_timeseries.png")
+    _plot_two(T_apo,A["Area"],T_hol,H["Area"],"Slit area (nm²)","Slit area over axis",f"{out_prefix}area_timeseries.png")
+
+    # ---- 95%CI つき要約（ビン平均）----
+    def _bin_mean_ci(y, k):
+        if y.size==0: return 0.0, 0.0
+        n = (y.size//k)*k
+        if n==0: return float(y.mean()), 0.0
+        bins = y[:n].reshape(-1,k).mean(axis=1)
+        mu = float(bins.mean()); sd = float(bins.std(ddof=1)) if bins.size>1 else 0.0
+        ci = 1.96 * sd / np.sqrt(max(1, bins.size))
+        return mu, ci
+
+    rows = []
+    for key, label in [("R2","R₂ (p=2)"), ("R3","R₃ (p=3)"), ("Area","Area"), ("mean_w","Mean width")]:
+        muA, ciA = _bin_mean_ci(A[key], bin_frames)
+        muH, ciH = _bin_mean_ci(H[key], bin_frames)
+        d = muH - muA
+        pct = (d/muA*100.0) if abs(muA)>1e-12 else np.nan
+        rows.append((label, muA, ciA, muH, ciH, d, pct))
+
+    # 棒グラフ（R2/R3/Area/mean_w）
+    labels = [r[0] for r in rows]; apo_mu=[r[1] for r in rows]; apo_ci=[r[2] for r in rows]
+    hol_mu  =[r[3] for r in rows]; hol_ci=[r[4] for r in rows]
+    x = np.arange(len(labels)); w=0.35
+    plt.figure(figsize=(8.6,3.4), dpi=140)
+    plt.bar(x-w/2, apo_mu, yerr=apo_ci, width=w, label="Apo", alpha=0.88)
+    plt.bar(x+w/2, hol_mu, yerr=hol_ci, width=w, label="Ligand-bound", alpha=0.88)
+    plt.xticks(x, labels, rotation=15); plt.ylabel("Mean ±95% CI (per-bin)")
+    plt.title("Transport proxies (summary)"); plt.legend(); plt.tight_layout()
+    plt.savefig(f"{out_prefix}summary_bar.png"); plt.close()
+
+    # ---- テキスト出力 ----
+    with open(f"{out_prefix}summary.txt","w") as f:
+        f.write(f"n_slices={n_slices}, y_cap_nm={y_cap_nm}, min_atoms_per_slice={min_atoms_per_slice}, bin_frames={bin_frames}\n")
+        f.write(f"dt_ns: apo={A['dt_ns']:.6f}, holo={H['dt_ns']:.6f}\n")
+        f.write("Metric\tApo(mean±CI)\tHolo(mean±CI)\tΔ(H-A)\tΔ% vs Apo\n")
+        for label, muA, ciA, muH, ciH, d, pct in rows:
+            f.write(f"{label}\t{muA:.4f}±{ciA:.4f}\t{muH:.4f}±{ciH:.4f}\t{d:.4f}\t{pct:.1f}%\n")
+
+    print("✅ Saved:",
+          f"{out_prefix}heatmap_apo.png, {out_prefix}heatmap_holo.png,",
+          f"{out_prefix}mean_width_timeseries.png,",
+          f"{out_prefix}R2_timeseries.png, {out_prefix}R3_timeseries.png, {out_prefix}area_timeseries.png,",
+          f"{out_prefix}summary_bar.png, {out_prefix}summary.txt")
+
