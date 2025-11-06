@@ -6,13 +6,105 @@ from tqdm import tqdm
 import seaborn as sns
 import pandas as pd
 import builtins
+from pathlib import Path
 from collections import defaultdict
 from sklearn.decomposition import PCA
 from scipy.constants import Boltzmann
 
-# Helper: Get ligand atom indices
-def get_ligand_atoms(traj, ligand_resname="UNK"):
-    return [atom.index for atom in traj.topology.atoms if atom.residue.name.strip() == ligand_resname]
+#Helper
+def read_ligand_index(index_path="ligands_sdf.index"):
+    p = Path(index_path)
+    if not p.exists():
+        return []
+    return [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+def discover_unk_ligand_groups_from_top(top_file, resname="UNK", index_path="ligands_sdf.index"):
+    """
+    Discover per‑ligand atom sets by chainID for residues named 'UNK'.
+    Map them to names from ligands_sdf.index in order B, C, D, ...
+    Returns list of dicts: [{"name": "aspirin", "chain_id": "B", "atom_indices": [...]}, ...]
+    """
+    # Load topology (one frame is enough); mdtraj used only for parsing
+    t = md.load(top_file)  # PDB → 1 frame
+    atom_df, _ = t.topology.to_dataframe()
+    lig_df = atom_df[atom_df["resName"].str.strip() == resname]
+    if lig_df.empty:
+        return []
+
+    # Group UNK atoms by chainID (each ligand was added as its own chain)
+    by_chain = {cid: grp.index.values.astype(int).tolist()
+                for cid, grp in lig_df.groupby("chainID")}
+    chain_ids = sorted(by_chain.keys())
+
+    # Names from index, in order they were added in step 5
+    names = read_ligand_index(index_path)
+
+    out = []
+    for i, cid in enumerate(chain_ids):
+        nm = names[i] if i < len(names) else f"{resname}_{cid}"
+        out.append({"name": nm, "chain_id": cid, "atom_indices": by_chain[cid]})
+    return out
+
+def get_ligand_atoms(traj, ligand_resname="UNK", chain_id=None):
+    """
+    Previous behavior (chain_id=None) returned *all* UNK atoms.
+    With chain_id set ('B','C',...), returns only that ligand's atoms.
+    """
+    atom_df, _ = traj.topology.to_dataframe()
+    mask = atom_df["resName"].str.strip() == ligand_resname
+    if chain_id is not None:
+        mask = mask & (atom_df["chainID"] == chain_id)
+    return atom_df.index[mask].astype(int).tolist()
+
+#Multi-ligand wrappers
+def run_ligand_rmsd_multi(traj_file, top_file, out_prefix="", index_path="ligands_sdf.index"):
+    groups = discover_unk_ligand_groups_from_top(top_file, "UNK", index_path)
+    if not groups:
+        print("❗ No UNK ligands found; skipping ligand RMSD.")
+        return
+    for g in groups:
+        run_ligand_rmsd(traj_file, top_file, ligand_resname="UNK",
+                        out_prefix=f"{out_prefix}{g['name']}_", chain_id=g["chain_id"])
+
+def run_hydration_shell_multi(traj_file, top_file, out_prefix="", index_path="ligands_sdf.index", dist_cutoff=0.35):
+    groups = discover_unk_ligand_groups_from_top(top_file, "UNK", index_path)
+    if not groups:
+        print("❗ No UNK ligands found; skipping hydration shell.")
+        return
+    for g in groups:
+        run_hydration_shell(traj_file, top_file, ligand_resname="UNK",
+                            out_prefix=f"{out_prefix}{g['name']}_", dist_cutoff=dist_cutoff, chain_id=g["chain_id"])
+
+def run_contact_analysis_rna_multi(traj_file, top_file, out_prefix="", index_path="ligands_sdf.index"):
+    groups = discover_unk_ligand_groups_from_top(top_file, "UNK", index_path)
+    if not groups:
+        print("❗ No UNK ligands found; skipping RNA contact analysis.")
+        return
+    for g in groups:
+        run_contact_analysis_rna(traj_file, top_file, ligand_resname="UNK",
+                                 out_prefix=f"{out_prefix}{g['name']}_", chain_id=g["chain_id"])
+
+def run_contact_analysis_protein_multi(traj_file, top_file, out_prefix="", index_path="ligands_sdf.index"):
+    groups = discover_unk_ligand_groups_from_top(top_file, "UNK", index_path)
+    if not groups:
+        print("❗ No UNK ligands found; skipping protein contact analysis.")
+        return
+    for g in groups:
+        run_contact_analysis_protein(traj_file, top_file, ligand_resname="UNK",
+                                     out_prefix=f"{out_prefix}{g['name']}_", chain_id=g["chain_id"])
+
+def run_hbond_analysis_rna_multi(traj_file, top_file, out_prefix="", index_path="ligands_sdf.index",
+                                 dist_cutoff=0.35, angle_cutoff=120.0):
+    groups = discover_unk_ligand_groups_from_top(top_file, "UNK", index_path)
+    if not groups:
+        print("❗ No UNK ligands found; skipping RNA H‑bond analysis.")
+        return
+    for g in groups:
+        run_hbond_analysis_rna(traj_file, top_file, ligand_resname="UNK",
+                               out_prefix=f"{out_prefix}{g['name']}_",
+                               dist_cutoff=dist_cutoff, angle_cutoff=angle_cutoff, chain_id=g["chain_id"])
+
+
 
 # 1. Global RMSD (Overlay: holo vs apo)
 def run_rmsd_overlay(traj_apo_file, top_apo_file, traj_holo_file, top_holo_file, out_prefix=""):
@@ -67,9 +159,9 @@ def run_rmsf_overlay(traj_apo_file, top_apo_file, traj_holo_file, top_holo_file,
     print(f"✅ RMSF overlay saved as {fname}")
 
 # 3. Ligand RMSD (holo only)
-def run_ligand_rmsd(traj_file, top_file, ligand_resname="UNK", out_prefix=""):
+def run_ligand_rmsd(traj_file, top_file, ligand_resname="UNK", out_prefix="", chain_id=None):
     traj = md.load_dcd(traj_file, top=top_file)
-    ligand_atoms = get_ligand_atoms(traj, ligand_resname)
+    ligand_atoms = get_ligand_atoms(traj, ligand_resname, chain_id=chain_id)
     if not ligand_atoms:
         print("❗ No ligand atoms found; skipping ligand RMSD.")
         return
@@ -87,9 +179,9 @@ def run_ligand_rmsd(traj_file, top_file, ligand_resname="UNK", out_prefix=""):
     print(f"✅ Ligand RMSD plot saved as {fname}")
 
 # 4. Hydration Shell (holo only, JAX-accelerated)
-def run_hydration_shell(traj_file, top_file, ligand_resname="UNK", out_prefix="", dist_cutoff=0.35):
+def run_hydration_shell(traj_file, top_file, ligand_resname="UNK", out_prefix="", dist_cutoff=0.35, chain_id=None):
     traj = md.load_dcd(traj_file, top=top_file)
-    ligand_atoms = get_ligand_atoms(traj, ligand_resname)
+    ligand_atoms = get_ligand_atoms(traj, ligand_resname, chain_id=chain_id)
     water_atoms = traj.topology.select("water")
     # Compute distances (JAX)
     coords = jnp.array(traj.xyz)
@@ -113,7 +205,7 @@ def run_hydration_shell(traj_file, top_file, ligand_resname="UNK", out_prefix=""
     print(f"✅ Hydration shell plot saved as {fname}")
 
 # 5. Contact Analysis (holo only, but can extend)
-def run_contact_analysis_rna(traj_file, top_file, ligand_resname="UNK", out_prefix=""):
+def run_contact_analysis_rna(traj_file, top_file, ligand_resname="UNK", out_prefix="", chain_id=None):
     import mdtraj as md
     import jax.numpy as jnp
     from tqdm import tqdm
@@ -189,7 +281,7 @@ def run_contact_analysis_rna(traj_file, top_file, ligand_resname="UNK", out_pref
     plt.show()
     print(f"✅ Contact summary: text, csv, and plot saved (prefix {out_prefix})")
 
-def run_contact_analysis_protein(traj_file, top_file, ligand_resname="UNK", out_prefix=""):
+def run_contact_analysis_protein(traj_file, top_file, ligand_resname="UNK", out_prefix="", chain_id=None):
     import mdtraj as md
     import jax.numpy as jnp
     from tqdm import tqdm
@@ -266,7 +358,7 @@ def run_contact_analysis_protein(traj_file, top_file, ligand_resname="UNK", out_
 
 
 # 6. H-Bond Analysis (holo only, image heatmap)
-def run_hbond_analysis_rna(traj_file, top_file, ligand_resname="UNK", out_prefix="", dist_cutoff=0.35, angle_cutoff=120.0):
+def run_hbond_analysis_rna(traj_file, top_file, ligand_resname="UNK", out_prefix="", dist_cutoff=0.35, angle_cutoff=120.0, chain_id=None):
     import mdtraj as md, jax.numpy as jnp
     from tqdm import tqdm
     from collections import defaultdict, Counter
