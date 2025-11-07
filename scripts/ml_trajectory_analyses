@@ -1351,3 +1351,430 @@ def run_carboxylate_OP_checker_multi(traj_file, top_file, registry, base_prefix=
         run_carboxylate_OP_checker(traj_file, top_file, ligand_info=info,
                                    ligand_resname="UNK", out_prefix=_ligand_prefix(info, base_prefix))
 
+
+import numpy as np
+import jax.numpy as jnp
+import mdtraj as md
+import matplotlib.pyplot as plt
+import pandas as pd
+from tqdm import tqdm
+import seaborn as sns
+
+# --- fallbacks in case Part 1/2 hasn't defined these helpers in your cell ----
+try:
+    _ligand_prefix  # will raise NameError if missing
+except NameError:
+    def _ligand_prefix(ligand_info, base_prefix=""):
+        """
+        Build a per-ligand output prefix. Uses ligand_info.slug if available.
+        """
+        try:
+            slug = getattr(ligand_info, "slug", getattr(ligand_info, "name", "ligand"))
+            from re import sub
+            slug = sub(r'[^A-Za-z0-9_.-]+', '_', str(slug)).strip() or "ligand"
+            return f"{base_prefix}{slug}_"
+        except Exception:
+            return base_prefix
+
+try:
+    _select_atoms_for_ligand  # will raise NameError if missing
+except NameError:
+    def _select_atoms_for_ligand(traj, ligand_info):
+        """
+        Select atom indices belonging to the given UNK ligand (by chain + resSeq),
+        or fall back to ligand_info.atom_indices if present.
+        """
+        if hasattr(ligand_info, "atom_indices") and ligand_info.atom_indices is not None:
+            return list(np.asarray(ligand_info.atom_indices, dtype=int))
+        out = []
+        for a in traj.topology.atoms:
+            res = a.residue
+            if res.name.strip().upper() != "UNK":
+                continue
+            chain_id = getattr(res.chain, "id", None) or getattr(res.chain, "name", None) or str(res.chain.index)
+            if str(chain_id) == str(ligand_info.chain_id) and int(res.resSeq) == int(ligand_info.resSeq):
+                out.append(a.index)
+        return out
+
+# -----------------------------------------------------------------------------
+# 11. Backbone exposure overlay (apo vs holo) — multi‑ligand aware
+# -----------------------------------------------------------------------------
+def run_backbone_exposure_overlay(
+    ligand_dcd="production_md.dcd",
+    ligand_pdb="final_structure.pdb",
+    control_dcd="production_md_no_ligand.dcd",
+    control_pdb="final_structure_no_ligand.pdb",
+    ligand_resname="UNK",
+    topN=10,
+    out_prefix="backbone_exposure_",
+    ligand_info=None,   # <-- NEW (optional, for specific UNK chain)
+):
+    """
+    Compares RNA backbone exposure (proxy: neighbor count within 0.35 nm)
+    between holo (ligand present) and apo runs. Orders results by proximity
+    to the **selected ligand** centroid (if ligand_info provided), otherwise
+    by all UNK atoms (legacy fallback).
+
+    Outputs (prefixed per ligand when ligand_info is passed):
+      - {prefix}sasa.csv
+      - {prefix}delta_backbone_exposure_proxy.png
+      - {prefix}delta_exposure_sorted_by_distance.png
+      - {prefix}delta_exposure_vs_distance.png
+      - {prefix}top{N}_exposed.csv
+      - {prefix}top_exposed_residues.pdb  (best-effort)
+    """
+    # Helper for atom info dicts
+    def _extract_atom_info(traj_):
+        return [
+            {
+                'index': a.index,
+                'resname': a.residue.name.strip(),
+                'resid': a.residue.resSeq,
+                'atomname': a.name.strip()
+            }
+            for a in traj_.topology.atoms
+        ]
+
+    # ---------------- load holo & apo ----------------
+    traj_lig = md.load_dcd(ligand_dcd, top=ligand_pdb)
+    traj_ctrl = md.load_dcd(control_dcd, top=control_pdb)
+
+    atom_info_lig = _extract_atom_info(traj_lig)
+    atom_info_ctrl = _extract_atom_info(traj_ctrl)
+
+    coords_lig = jnp.array(traj_lig.xyz)
+    coords_ctrl = jnp.array(traj_ctrl.xyz)
+
+    # Backbone selection: RNA OP1/OP2/P
+    backbone_names = {"OP1", "OP2", "P"}
+    rna_resnames = {"A", "U", "G", "C"}
+
+    backbone_lig = [
+        i for i, atom in enumerate(atom_info_lig)
+        if atom['resname'] in rna_resnames and atom['atomname'] in backbone_names
+    ]
+    backbone_ctrl = [
+        i for i, atom in enumerate(atom_info_ctrl)
+        if atom['resname'] in rna_resnames and atom['atomname'] in backbone_names
+    ]
+
+    # Non-RNA neighbors (protein, water, ions, ligands…)
+    all_lig = set(range(len(atom_info_lig)))
+    all_ctrl = set(range(len(atom_info_ctrl)))
+    rna_idx_lig = set(i for i, atom in enumerate(atom_info_lig) if atom['resname'] in rna_resnames)
+    rna_idx_ctrl = set(i for i, atom in enumerate(atom_info_ctrl) if atom['resname'] in rna_resnames)
+    nonrna_lig = list(all_lig - rna_idx_lig)
+    nonrna_ctrl = list(all_ctrl - rna_idx_ctrl)
+
+    # Exposure proxy: neighbor counts < cutoff
+    def _exposure_count(coords, backbone_idxs, nonrna_idxs, cutoff=0.35):
+        n_frames = coords.shape[0]
+        counts = np.zeros((n_frames, len(backbone_idxs)), dtype=int)
+        for f in tqdm(range(n_frames), desc="Frames (Exposure)"):
+            nonrna_pos = coords[f, nonrna_idxs, :]
+            for k, bb_idx in enumerate(backbone_idxs):
+                bb_pos = coords[f, bb_idx, :]
+                dists = jnp.linalg.norm(nonrna_pos - bb_pos, axis=1)
+                counts[f, k] = (dists < cutoff).sum()
+        return counts
+
+    counts_lig = _exposure_count(coords_lig, backbone_lig, nonrna_lig)
+    counts_ctrl = _exposure_count(coords_ctrl, backbone_ctrl, nonrna_ctrl)
+
+    mean_exp_lig = counts_lig.mean(axis=0)
+    mean_exp_ctrl = counts_ctrl.mean(axis=0)
+
+    # Labels for backbone atoms
+    labels_lig = [f"{atom_info_lig[i]['resname']}{atom_info_lig[i]['resid']}-{atom_info_lig[i]['atomname']}"
+                  for i in backbone_lig]
+    labels_ctrl = [f"{atom_info_ctrl[i]['resname']}{atom_info_ctrl[i]['resid']}-{atom_info_ctrl[i]['atomname']}"
+                   for i in backbone_ctrl]
+
+    # Match by labels
+    lig_map = dict(zip(labels_lig, mean_exp_lig))
+    ctrl_map = dict(zip(labels_ctrl, mean_exp_ctrl))
+    common_labels = sorted(set(labels_lig) & set(labels_ctrl))
+    if not common_labels:
+        print("❗ No common RNA backbone labels between holo and apo; aborting.")
+        return
+    delta_exp = np.array([lig_map[l] - ctrl_map[l] for l in common_labels])
+
+    # --- Per‑ligand centroid for sorting (if ligand_info given) ---
+    if ligand_info is not None:
+        lig_atom_indices = _select_atoms_for_ligand(traj_lig, ligand_info)
+        if len(lig_atom_indices) == 0:
+            print(f"❗ No atoms for ligand {ligand_info.name}; cannot compute centroid. Using label order.")
+            dist_to_ligand = np.arange(len(common_labels), dtype=float)
+        else:
+            ligand_coords = coords_lig[:, np.asarray(lig_atom_indices, dtype=int), :]
+            ligand_centroid = ligand_coords.mean(axis=(0, 1))  # (3,)
+            # average position of each backbone atom over frames
+            bb_positions = np.array([coords_lig[:, idx, :].mean(axis=0) for idx in backbone_lig])
+            # map bb_positions to common_labels ordering
+            label_to_pos = dict(zip(labels_lig, bb_positions))
+            bb_pos_common = np.stack([label_to_pos[l] for l in common_labels], axis=0)  # (N,3)
+            dist_to_ligand = np.linalg.norm(bb_pos_common - np.asarray(ligand_centroid), axis=1)
+    else:
+        # Legacy fallback if no ligand specified
+        dist_to_ligand = np.arange(len(common_labels), dtype=float)
+
+    # Sort by proximity (closest first)
+    order = np.argsort(dist_to_ligand)
+    sorted_labels = [common_labels[i] for i in order]
+    sorted_delta = delta_exp[order]
+    sorted_dist = dist_to_ligand[order]
+
+    # Save CSV with all data
+    lp = _ligand_prefix(ligand_info, out_prefix)
+    df_sasa = pd.DataFrame({
+        "label": common_labels,
+        "exp_lig": [lig_map[l] for l in common_labels],
+        "exp_ctrl": [ctrl_map[l] for l in common_labels],
+        "delta_exp": delta_exp
+    })
+    df_sasa.to_csv(lp + "sasa.csv", index=False)
+
+    # --- Plots ---
+    plt.figure(figsize=(20,5))
+    plt.bar(sorted_labels, sorted_delta)
+    plt.axhline(0, color='k', linestyle='--', alpha=0.6)
+    plt.xticks(rotation=90, fontsize=8)
+    plt.ylabel("ΔExposure (ligand – control, lower = more exposed)")
+    plt.title("Backbone Exposure Proxy (Contact Number): Ligand vs. Control")
+    plt.tight_layout()
+    plt.savefig(lp + "delta_backbone_exposure_proxy.png", dpi=180)
+    plt.show()
+
+    plt.figure(figsize=(22,5))
+    plt.bar(range(len(sorted_labels)), sorted_delta, tick_label=sorted_labels)
+    plt.axhline(0, color='k', linestyle='--', alpha=0.6)
+    plt.xticks(rotation=90, fontsize=8)
+    plt.ylabel("ΔExposure (ligand – control)")
+    plt.xlabel("Backbone atoms, sorted by distance from ligand centroid (closest → farthest)")
+    plt.title("Backbone Exposure Change (ΔExposure) vs. Proximity to Ligand")
+    plt.tight_layout()
+    plt.savefig(lp + "delta_exposure_sorted_by_distance.png", dpi=180)
+    plt.show()
+
+    plt.figure(figsize=(7,4))
+    plt.scatter(sorted_dist, sorted_delta, c=sorted_delta, cmap='coolwarm')
+    plt.axhline(0, color='k', linestyle='--', alpha=0.5)
+    plt.xlabel("Distance to Ligand Centroid (nm)")
+    plt.ylabel("ΔExposure (ligand – control)")
+    plt.title("Exposure Change vs. Ligand Distance")
+    plt.tight_layout()
+    plt.savefig(lp + "delta_exposure_vs_distance.png", dpi=180)
+    plt.show()
+
+    # Top N hotspots (most negative delta)
+    df_hotspot = pd.DataFrame({"label": sorted_labels, "delta_exp": sorted_delta, "dist_to_ligand": sorted_dist})
+    df_hotspot = df_hotspot.nsmallest(topN, 'delta_exp')
+    print(f"\nTop {topN} most negatively exposed backbone atoms (hotspots):")
+    print(df_hotspot)
+    df_hotspot.to_csv(lp + f"top{topN}_exposed.csv", index=False)
+
+    # Export as PDB for ChimeraX (best-effort)
+    try:
+        from Bio.PDB import PDBParser, PDBIO, Select
+        pdb = ligand_pdb
+        # Get set of (resname, resid) for all top-exposed backbone atoms
+        import re
+        hotspot_residues = set()
+        for label in df_hotspot['label']:
+            m = re.match(r'([AUGC])(\d+)-(\w+)', label)
+            if m:
+                resname, resid, _ = m.groups()
+                hotspot_residues.add((resname, int(resid)))
+        parser = PDBParser(QUIET=True)
+        structure = parser.get_structure("RNA", pdb)
+        class ResidueSelect(Select):
+            def accept_residue(self, residue):
+                resname = residue.get_resname().strip()
+                resid = residue.get_id()[1]
+                return (resname, resid) in hotspot_residues
+        io = PDBIO()
+        io.set_structure(structure)
+        io.save(lp + "top_exposed_residues.pdb", ResidueSelect())
+        print(f"Saved: {lp}top_exposed_residues.pdb")
+    except Exception as e:
+        print("❗ Could not write PDB for hotspots:", e)
+
+    print("✅ Backbone exposure checker complete!")
+
+def run_backbone_exposure_overlay_multi(
+    ligand_dcd="production_md.dcd",
+    ligand_pdb="final_structure.pdb",
+    control_dcd="production_md_no_ligand.dcd",
+    control_pdb="final_structure_no_ligand.pdb",
+    registry=None,
+    base_prefix="backbone_exposure_",
+    topN=10
+):
+    """
+    Iterate the overlay for each ligand in the registry with per‑ligand prefixes.
+    """
+    if not registry:
+        print("❗ Registry is empty; nothing to run.")
+        return
+    for info in registry:
+        run_backbone_exposure_overlay(
+            ligand_dcd=ligand_dcd, ligand_pdb=ligand_pdb,
+            control_dcd=control_dcd, control_pdb=control_pdb,
+            ligand_resname="UNK", topN=topN,
+            out_prefix=_ligand_prefix(info, base_prefix),
+            ligand_info=info,
+        )
+
+# -----------------------------------------------------------------------------
+# 12. π–π stacking analysis — multi‑ligand aware
+# -----------------------------------------------------------------------------
+def run_pi_pi_stacking(
+    traj_file,
+    top_file,
+    ligand_ring_defs,             # e.g., [["C1", "C2", "C3", "C4", "C5", "C6"], ...]
+    ligand_resname="UNK",
+    out_prefix="pi_pi_",
+    ligand_info=None,             # <-- NEW (optional)
+    distance_cutoff=0.6,          # nm
+    angle_cutoff_deg=30           # degrees |angle(normals)| <= 30 (or >= 150)
+):
+    """
+    Detect ligand↔RNA base π–π stacking events using ring centroids and normals.
+    - Distances/angles computed with jax.numpy
+    - ligand_info targets a specific UNK chain; otherwise falls back to all UNK
+    - RNA ring built from hexagon ring atoms (N1,C2,N3,C4,C5,C6) per base
+
+    Outputs:
+      - {prefix}stacking_events_PDBlabels.csv
+      - {prefix}stacking_events_PDBlabels_barplot.png
+    """
+    traj = md.load_dcd(traj_file, top=top_file)
+    coords = jnp.array(traj.xyz)
+    top = traj.topology
+    atoms = list(top.atoms)
+    n_frames = coords.shape[0]
+
+    # ---------------- RNA hexagon ring mapping ----------------
+    hexagon_ring_atoms = {"N1", "C2", "N3", "C4", "C5", "C6"}
+    ring_rows = []
+    for res in top.residues:
+        base = res.name.strip()
+        if base in {"A", "G", "C", "U"}:
+            for a in res.atoms:
+                if a.name.strip() in hexagon_ring_atoms:
+                    ring_rows.append((res.index, base, a.name.strip(), a.index))
+    rna_ring_df = pd.DataFrame(ring_rows, columns=["res_index", "base", "atom", "atom_index"])
+
+    rna_base_ring_idxs, rna_base_ring_labels, rna_base_pdbinfo = [], [], []
+    for res_index in rna_ring_df["res_index"].unique():
+        sub = rna_ring_df[rna_ring_df["res_index"] == res_index]
+        if len(sub) == 6:
+            idxs = sub.sort_values("atom")["atom_index"].tolist()
+            atom0 = top.atom(int(sub.iloc[0]["atom_index"]))
+            chain = getattr(atom0.residue.chain, "id", None) or getattr(atom0.residue.chain, "name", None) or "A"
+            base = atom0.residue.name.strip()
+            resSeq = atom0.residue.resSeq
+            label = f"{base}{resSeq}"
+            rna_base_ring_idxs.append(idxs)
+            rna_base_ring_labels.append(label)
+            rna_base_pdbinfo.append((chain, base, resSeq, label))
+
+    if len(rna_base_ring_idxs) == 0:
+        print("❗ No RNA hexagon rings found; aborting.")
+        return
+
+    # ---------------- Ligand ring mapping ----------------
+    if ligand_info is not None:
+        lig_set = set(_select_atoms_for_ligand(traj, ligand_info))
+        if not lig_set:
+            print(f"❗ No atoms for ligand {getattr(ligand_info, 'name', 'UNK')}; aborting.")
+            return
+        ligand_atoms_by_name = {a.name.strip(): a.index for a in atoms if a.index in lig_set}
+        ligand_tag = getattr(ligand_info, "name", ligand_resname)
+    else:
+        ligand_atoms_by_name = {a.name.strip(): a.index for a in atoms if a.residue.name.strip() == ligand_resname}
+        ligand_tag = ligand_resname
+
+    ligand_ring_idxs = []
+    for ring in ligand_ring_defs:
+        try:
+            idxs = [ligand_atoms_by_name[name] for name in ring]
+        except KeyError as e:
+            print(f"❗ Ligand atom name not found in topology for ring: {e}. Check ligand_ring_defs.")
+            return
+        ligand_ring_idxs.append(idxs)
+
+    if len(ligand_ring_idxs) == 0:
+        print("❗ No ligand rings mapped; aborting.")
+        return
+
+    # ---------------- Geometry helpers ----------------
+    def centroid_and_normal(ring_coords):
+        centroid = jnp.mean(ring_coords, axis=0)
+        v1 = ring_coords[1] - ring_coords[0]
+        v2 = ring_coords[2] - ring_coords[0]
+        n = jnp.cross(v1, v2)
+        n = n / jnp.linalg.norm(n)
+        return centroid, n
+
+    # ---------------- Scan frames ----------------
+    stack_events = []
+    for f in tqdm(range(n_frames), desc="Frames (π–π stacking)"):
+        for lidx, lring in enumerate(ligand_ring_idxs):
+            l_coords = coords[f, lring, :]
+            l_centroid, l_normal = centroid_and_normal(l_coords)
+            for ridx, rring in enumerate(rna_base_ring_idxs):
+                r_coords = coords[f, rring, :]
+                r_centroid, r_normal = centroid_and_normal(r_coords)
+                dist = jnp.linalg.norm(l_centroid - r_centroid)
+                cosang = jnp.clip(jnp.dot(l_normal, r_normal), -1.0, 1.0)
+                angle = jnp.degrees(jnp.arccos(cosang))
+                # parallel or anti-parallel within angle_cutoff, and near in space
+                if (dist <= distance_cutoff) and (angle <= angle_cutoff_deg or angle >= 180 - angle_cutoff_deg):
+                    chain, base, resSeq, label = rna_base_pdbinfo[ridx]
+                    stack_events.append((f, lidx, ridx, float(dist), float(angle), chain, base, int(resSeq), label))
+
+    lp = _ligand_prefix(ligand_info, out_prefix)
+    stack_df = pd.DataFrame(stack_events, columns=[
+        "frame", "ligand_ring", "rna_base_index", "distance", "angle", "chain", "base", "resSeq", "pdb_label"
+    ])
+    stack_df.to_csv(lp + "stacking_events_PDBlabels.csv", index=False)
+    print(f"✅ Saved {lp}stacking_events_PDBlabels.csv ({len(stack_df)} events)")
+
+    if not stack_df.empty:
+        counts = stack_df["pdb_label"].value_counts().sort_index()
+        plt.figure(figsize=(14,4))
+        plt.bar(counts.index, counts.values)
+        plt.xticks(rotation=90)
+        plt.ylabel("Stacking Events")
+        plt.title(f"π–π Stacking Events ({ligand_tag} ↔ RNA hexagon rings)")
+        plt.tight_layout()
+        plt.savefig(lp + "stacking_events_PDBlabels_barplot.png", dpi=150)
+        plt.show()
+    else:
+        print("No π–π stacking events detected with current cutoffs.")
+
+def run_pi_pi_stacking_multi(
+    traj_file,
+    top_file,
+    ligand_ring_defs,
+    registry=None,
+    base_prefix="pi_pi_",
+    distance_cutoff=0.6,
+    angle_cutoff_deg=30
+):
+    """
+    Iterate π–π stacking for each ligand in the registry with per‑ligand prefixes.
+    """
+    if not registry:
+        print("❗ Registry is empty; nothing to run.")
+        return
+    for info in registry:
+        run_pi_pi_stacking(
+            traj_file, top_file, ligand_ring_defs,
+            ligand_resname="UNK",
+            out_prefix=_ligand_prefix(info, base_prefix),
+            ligand_info=info,
+            distance_cutoff=distance_cutoff,
+            angle_cutoff_deg=angle_cutoff_deg,
+        )
