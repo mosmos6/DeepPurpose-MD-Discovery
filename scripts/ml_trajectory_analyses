@@ -705,3 +705,649 @@ def run_hbond_analysis_protein_for_all(traj_file, top_file, registry, base_prefi
             out_prefix=f"{base_prefix}{h.slug}_"
         )
 
+# 6b. H-Bond Analysis (PROTEIN) — multi‑ligand aware
+def run_hbond_analysis_protein(
+    traj_file,
+    top_file,
+    ligand_resname="UNK",
+    out_prefix="",
+    dist_cutoff=0.35,
+    angle_cutoff=120.0,
+    ligand_info=None,     # <-- NEW (optional)
+):
+    """
+    Find protein↔ligand H-bonds. If ligand_info is provided, restrict to that specific UNK chain.
+    Distances/angles computed with jax.numpy (no mdtraj geometry helpers).
+    """
+    import mdtraj as md, jax.numpy as jnp
+    from collections import defaultdict, Counter
+    import pandas as pd, numpy as np, seaborn as sns, matplotlib.pyplot as plt
+    from tqdm import tqdm
+
+    traj = md.load_dcd(traj_file, top=top_file)
+    atoms = list(traj.topology.atoms)
+    coords = jnp.array(traj.xyz)
+
+    # --- atom sets ---
+    if ligand_info is not None:
+        ligand_atoms_list = _select_atoms_for_ligand(traj, ligand_info)
+        ligand_atoms_set  = set(ligand_atoms_list)
+        if len(ligand_atoms_list) == 0:
+            print(f"❗ No atoms found for {ligand_info.name} ({ligand_info.sel_string}); skipping.")
+            return
+    else:
+        ligand_atoms_list = [a.index for a in atoms if a.residue.name.strip() == ligand_resname]
+        ligand_atoms_set  = set(ligand_atoms_list)
+        if len(ligand_atoms_list) == 0:
+            print("❗ No ligand atoms found; skipping protein H-bond analysis.")
+            return
+
+    # protein atoms: strict protein only
+    protein_atom_indices = [a.index for a in atoms if a.residue.is_protein]
+    if not protein_atom_indices:
+        print("❗ No protein atoms detected; skipping.")
+        return
+
+    # --- bond map ---
+    bond_map = {i: [] for i in range(len(atoms))}
+    for a, b in traj.topology.bonds:
+        bond_map[a.index].append(b.index)
+        bond_map[b.index].append(a.index)
+
+    # --- acceptors: N/O on protein or ligand (not water)
+    is_water = np.array([a.residue.name.strip() == "HOH" for a in atoms])
+    acceptors = []
+    for i, a in enumerate(atoms):
+        if is_water[i]:
+            continue
+        if a.element.symbol in ("N", "O"):
+            in_protein = (i in protein_atom_indices)
+            in_ligand  = (i in ligand_atoms_set)
+            if in_protein or in_ligand:
+                acceptors.append(i)
+    acceptors = np.array(acceptors, dtype=int)
+
+    # --- donors: heavy atoms (N/O/S) in protein or the target ligand, with ≥1 bonded H
+    donors, hydrogens = [], []
+    for i, a in enumerate(atoms):
+        if is_water[i]:
+            continue
+        in_protein = (i in protein_atom_indices)
+        in_ligand  = (i in ligand_atoms_set)
+        if not (in_protein or in_ligand):
+            continue
+        if a.element.symbol not in ("N", "O", "S"):
+            continue
+        Hs = [h for h in bond_map[i] if atoms[h].element.symbol == "H"]
+        if Hs:
+            donors.extend([i] * len(Hs))
+            hydrogens.extend(Hs)
+
+    donors = np.array(donors, dtype=int)
+    hydrogens = np.array(hydrogens, dtype=int)
+    if len(donors) == 0 or len(acceptors) == 0:
+        print("❗ No donors/acceptors detected after selection.")
+        return
+
+    # --- donor–H–acceptor triplets (exclude self-acceptor)
+    triplets = []
+    acceptor_set = set(acceptors.tolist())
+    for d, h in zip(donors, hydrogens):
+        for a_idx in acceptor_set:
+            if a_idx != d:
+                triplets.append((d, h, a_idx))
+    triplets = np.array(triplets, dtype=np.int32)
+    donor_idxs    = jnp.array(triplets[:, 0])
+    hydrogen_idxs = jnp.array(triplets[:, 1])
+    acceptor_idxs = jnp.array(triplets[:, 2])
+
+    # --- mask: require ligand involvement (either donor or acceptor in the target ligand)
+    ligand_atom_indices = jnp.array(ligand_atoms_list, dtype=jnp.int32)
+    involves_ligand_mask = jnp.isin(donor_idxs, ligand_atom_indices) | jnp.isin(acceptor_idxs, ligand_atom_indices)
+
+    # --- scan frames ---
+    h_bonds_found = []
+    n_frames = coords.shape[0]
+    for f in tqdm(range(n_frames), desc="Scanning H-bonds (protein)"):
+        xyz = coords[f]
+        d_xyz = xyz[donor_idxs]
+        h_xyz = xyz[hydrogen_idxs]
+        a_xyz = xyz[acceptor_idxs]
+
+        vec_HA = h_xyz - a_xyz
+        dist_HA = jnp.linalg.norm(vec_HA, axis=1)
+
+        vec_DH   = h_xyz - d_xyz
+        norm_DH  = vec_DH / jnp.linalg.norm(vec_DH, axis=1)[:, None]
+        norm_HA  = vec_HA / jnp.linalg.norm(vec_HA, axis=1)[:, None]
+        cosang   = jnp.sum(norm_DH * norm_HA, axis=1)
+        angles   = jnp.degrees(jnp.arccos(jnp.clip(cosang, -1.0, 1.0)))
+
+        passed = jnp.where((dist_HA < dist_cutoff) & (angles > angle_cutoff) & involves_ligand_mask)[0]
+        for idx in passed:
+            d = atoms[int(donor_idxs[idx])]
+            a = atoms[int(acceptor_idxs[idx])]
+            h_bonds_found.append((
+                f,
+                f"{d.residue.name} {d.residue.resSeq} ({d.name})",
+                f"{a.residue.name} {a.residue.resSeq} ({a.name})"
+            ))
+
+    # --- outputs
+    lp = _ligand_prefix(ligand_info, out_prefix)
+    with open(f"{lp}protein_hbond_summary.txt", "w") as f:
+        for frame, donor, acceptor in h_bonds_found:
+            f.write(f"[frame {frame}] {donor} → {acceptor}\n")
+    print(f"✅ Protein H-bond summary saved as {lp}protein_hbond_summary.txt")
+
+    # bar (top 20 residues)
+    from collections import Counter
+    residue_counter = Counter()
+    ligand_tag = ligand_info.name if ligand_info is not None else ligand_resname
+    for _, donor, acceptor in h_bonds_found:
+        for entry in (donor, acceptor):
+            if entry.startswith(ligand_tag):
+                continue
+            res_label = entry.split('(')[0].strip()
+            residue_counter[res_label] += 1
+
+    if len(residue_counter) > 0:
+        df = pd.DataFrame(residue_counter.items(), columns=["Residue", "Count"]).sort_values(
+            "Count", ascending=False).reset_index(drop=True)
+        plt.figure(figsize=(12, 6))
+        plt.bar(df["Residue"][:20], df["Count"][:20])
+        plt.title("Top 20 Protein Residues Involved in H-Bonds with Ligand", fontsize=14)
+        plt.xlabel("Protein Residue"); plt.ylabel("H-Bond Count")
+        plt.xticks(rotation=45, ha='right'); plt.grid(axis='y', linestyle='--', alpha=0.6)
+        plt.tight_layout(); plt.savefig(f"{lp}protein_hbond_top20_bar.png"); plt.show()
+
+    # roles stacked
+    from collections import Counter
+    donor_roles = Counter(); acceptor_roles = Counter()
+    for _, donor, acceptor in h_bonds_found:
+        if donor.startswith(ligand_tag):
+            res = acceptor.split('(')[0].strip()
+            donor_roles[res] += 1
+        elif acceptor.startswith(ligand_tag):
+            res = donor.split('(')[0].strip()
+            acceptor_roles[res] += 1
+    residues = list(set(donor_roles) | set(acceptor_roles))
+    if residues:
+        df_roles = pd.DataFrame({
+            "Residue": residues,
+            "Ligand as Donor":   [donor_roles.get(r, 0) for r in residues],
+            "Ligand as Acceptor":[acceptor_roles.get(r, 0) for r in residues]
+        }).sort_values(["Ligand as Donor", "Ligand as Acceptor"], ascending=False).head(20)
+        ax = df_roles.set_index("Residue").plot(kind="bar", stacked=True, figsize=(12, 6))
+        ax.set_title("Top 20 H-Bond Partners (Ligand as Donor vs Acceptor)", fontsize=14)
+        ax.set_ylabel("Bond Count"); ax.set_xlabel("Protein Residue")
+        plt.xticks(rotation=45, ha='right'); plt.grid(axis='y', linestyle='--', alpha=0.5)
+        plt.tight_layout(); plt.savefig(f"{lp}protein_hbond_roles_top20_stacked.png"); plt.show()
+
+    # heatmap (top 20)
+    from collections import defaultdict
+    framewise_counts = defaultdict(lambda: defaultdict(int))
+    for frame_idx in range(n_frames):
+        xyz = coords[frame_idx]
+        d_xyz = xyz[donor_idxs]; h_xyz = xyz[hydrogen_idxs]; a_xyz = xyz[acceptor_idxs]
+        vec_HA = h_xyz - a_xyz; dist_HA = jnp.linalg.norm(vec_HA, axis=1)
+        vec_DH = h_xyz - d_xyz
+        norm_DH = vec_DH / jnp.linalg.norm(vec_DH, axis=1)[:, None]
+        norm_HA = vec_HA / jnp.linalg.norm(vec_HA, axis=1)[:, None]
+        cosang  = jnp.sum(norm_DH * norm_HA, axis=1)
+        angles  = jnp.degrees(jnp.arccos(jnp.clip(cosang, -1.0, 1.0)))
+        passed = jnp.where((dist_HA < dist_cutoff) & (angles > angle_cutoff) & involves_ligand_mask)[0]
+        for idx in passed:
+            d = atoms[int(donor_idxs[idx])]; a = atoms[int(acceptor_idxs[idx])]
+            for atom in (d, a):
+                if atom.index in ligand_atoms_set:
+                    continue
+                res_key = f"{atom.residue.name} {atom.residue.resSeq}"
+                framewise_counts[frame_idx][res_key] += 1
+
+    total_counts = defaultdict(int)
+    for frame_dict in framewise_counts.values():
+        for res, count in frame_dict.items():
+            total_counts[res] += count
+    top_residues = sorted(total_counts, key=total_counts.get, reverse=True)[:20]
+
+    if top_residues:
+        heatmap_df = pd.DataFrame(index=range(n_frames), columns=top_residues).fillna(0)
+        for frame_idx, res_counts in framewise_counts.items():
+            for res in top_residues:
+                if res in res_counts:
+                    heatmap_df.at[frame_idx, res] = res_counts[res]
+        sns.heatmap(heatmap_df.T, cmap="YlOrBr", cbar_kws={'label': 'H-Bond Count'})
+        plt.title("Protein H-Bond Time Series per Residue (Top 20)")
+        plt.xlabel("Frame"); plt.ylabel("Protein Residue"); plt.tight_layout()
+        plt.savefig(f"{lp}protein_hbond_heatmap.png"); plt.show()
+
+    print(f"✅ Protein H-bond plots saved (prefix {lp})")
+
+
+# 7. PCA & FEL (Overlay) — unchanged (no ligand specificity)
+def run_pca_fel_overlay(traj_apo_file, top_apo_file, traj_holo_file, top_holo_file, out_prefix=""):
+    import mdtraj as md, numpy as np
+    import matplotlib.pyplot as plt
+    from sklearn.decomposition import PCA
+    from scipy.constants import Boltzmann
+
+    traj_apo  = md.load(traj_apo_file,  top=top_apo_file)
+    traj_holo = md.load(traj_holo_file, top=top_holo_file)
+
+    sel_apo  = traj_apo.top.select("nucleic and name P")
+    sel_holo = traj_holo.top.select("nucleic and name P")
+
+    def select_CA_intersection(t):
+        ca_map = {}
+        for a in t.top.atoms:
+            if a.name.strip() == "CA" and a.residue.is_protein:
+                key = (getattr(a.residue.chain, "id", ""), a.residue.resSeq)
+                ca_map[key] = a.index
+        return ca_map
+
+    if len(sel_apo) == 0 or len(sel_holo) == 0:
+        ca_apo  = select_CA_intersection(traj_apo)
+        ca_holo = select_CA_intersection(traj_holo)
+        common_keys = sorted(set(ca_apo) & set(ca_holo))
+        sel_apo  = np.array([ca_apo[k]  for k in common_keys], dtype=int)
+        sel_holo = np.array([ca_holo[k] for k in common_keys], dtype=int)
+
+    if sel_apo.size == 0 or sel_holo.size == 0:
+        raise ValueError("No atoms selected for PCA (neither RNA P nor protein CA found in common).")
+    if sel_apo.size != sel_holo.size:
+        raise ValueError(f"Selection mismatch: apo={sel_apo.size}, holo={sel_holo.size}.")
+
+    traj_apo_s  = traj_apo.atom_slice(sel_apo)
+    traj_holo_s = traj_holo.atom_slice(sel_holo)
+    traj_apo_s.superpose(traj_apo_s, 0)
+    traj_holo_s.superpose(traj_apo_s, 0)
+
+    xyz_apo  = traj_apo_s.xyz.reshape(traj_apo_s.n_frames, -1)
+    xyz_holo = traj_holo_s.xyz.reshape(traj_holo_s.n_frames, -1)
+
+    if xyz_apo.shape[1] == 0 or not np.all(np.isfinite(xyz_apo)):
+        raise ValueError("Apo feature matrix is empty or non-finite.")
+    if xyz_holo.shape[1] == 0 or not np.all(np.isfinite(xyz_holo)):
+        raise ValueError("Holo feature matrix is empty or non-finite.")
+
+    pca = PCA(n_components=2)
+    pca.fit(xyz_apo)
+    pc_apo  = pca.transform(xyz_apo)
+    pc_holo = pca.transform(xyz_holo)
+
+    plt.figure(figsize=(8,5))
+    plt.scatter(pc_apo[:,0],  pc_apo[:,1],  alpha=0.5, label="Apo")
+    plt.scatter(pc_holo[:,0], pc_holo[:,1], alpha=0.5, label="Holo")
+    plt.xlabel(f"PC1 ({pca.explained_variance_ratio_[0]*100:.2f}% var)")
+    plt.ylabel(f"PC2 ({pca.explained_variance_ratio_[1]*100:.2f}% var)")
+    plt.title("PCA Projection: Apo vs Ligand-bound")
+    plt.legend(); plt.grid(True); plt.tight_layout()
+    plt.savefig(f"{out_prefix}pca_overlay.png")
+    print(f"✅ PCA overlay saved as {out_prefix}pca_overlay.png")
+
+    def compute_fel(pc1, pc2, bins=100):
+        H, xedges, yedges = np.histogram2d(pc1, pc2, bins=bins, density=True)
+        P = H.T; P[P==0] = 1e-12
+        G = -Boltzmann * 310.15 * np.log(P); G -= G.min()
+        return G, xedges, yedges
+
+    G_apo, x_a, y_a   = compute_fel(pc_apo[:,0],  pc_apo[:,1])
+    G_holo, x_h, y_h  = compute_fel(pc_holo[:,0], pc_holo[:,1])
+    X_a, Y_a = np.meshgrid(x_a[:-1], y_a[:-1])
+    X_h, Y_h = np.meshgrid(x_h[:-1], y_h[:-1])
+
+    plt.figure(figsize=(12,5))
+    plt.subplot(1,2,1); cp1 = plt.contourf(X_a, Y_a, G_apo, levels=30, cmap="Blues")
+    plt.colorbar(cp1, label="Free Energy (J)"); plt.title("FEL: Apo");  plt.xlabel("PC1"); plt.ylabel("PC2")
+    plt.subplot(1,2,2); cp2 = plt.contourf(X_h, Y_h, G_holo, levels=30, cmap="Reds")
+    plt.colorbar(cp2, label="Free Energy (J)"); plt.title("FEL: Holo"); plt.xlabel("PC1"); plt.ylabel("PC2")
+    plt.tight_layout(); plt.savefig(f"{out_prefix}fel_overlay.png")
+    print(f"✅ FEL overlay saved as {out_prefix}fel_overlay.png")
+
+
+# 8. Watson–Crick checker (Overlay) — unchanged
+def run_wc_pair_checker_overlay(traj_apo_file, top_apo_file, traj_holo_file, top_holo_file, out_prefix=""):
+    import mdtraj as md, jax.numpy as jnp
+    from tqdm import tqdm
+    import matplotlib.pyplot as plt
+
+    def get_pairs(traj, coords):
+        topology = traj.topology
+        atoms = list(topology.atoms)
+        wc_pairs = {
+            ("A", "U"): ("N1", "N3"),
+            ("U", "A"): ("N3", "N1"),
+            ("G", "C"): ("N1", "N3"),
+            ("C", "G"): ("N3", "N1"),
+        }
+        min_seq_gap = 4
+        atom_lookup = {
+            (atom.residue.name.strip(), atom.residue.resSeq, atom.name): atom.index
+            for atom in atoms
+        }
+        rna_residues = [res for res in topology.residues if res.name.strip() in {"A","U","G","C"}]
+        pairs = []
+        for i, res1 in enumerate(rna_residues):
+            for j in range(i + 1, len(rna_residues)):
+                res2 = rna_residues[j]
+                if abs(res1.resSeq - res2.resSeq) < min_seq_gap:
+                    continue
+                key = (res1.name.strip(), res2.name.strip())
+                if key not in wc_pairs:
+                    continue
+                a1, a2 = wc_pairs[key]
+                idx1 = atom_lookup.get((res1.name.strip(), res1.resSeq, a1))
+                idx2 = atom_lookup.get((res2.name.strip(), res2.resSeq, a2))
+                if idx1 is None or idx2 is None:
+                    continue
+                # quick check on frame 0
+                dist = jnp.linalg.norm(coords[0, idx1] - coords[0, idx2])
+                if dist < 0.35:
+                    pairs.append((res1, idx1, res2, idx2))
+        return pairs
+
+    def pair_status_over_time(coords, pairs):
+        framewise_status = []
+        for frame in range(coords.shape[0]):
+            count = 0
+            for _, idx1, _, idx2 in pairs:
+                dist = jnp.linalg.norm(coords[frame, idx1] - coords[frame, idx2])
+                if dist < 0.35:
+                    count += 1
+            framewise_status.append(count)
+        return framewise_status
+
+    traj_apo = md.load_dcd(traj_apo_file, top=top_apo_file)
+    coords_apo = jnp.array(traj_apo.xyz)
+    pairs_apo = get_pairs(traj_apo, coords_apo)
+    print(f"✅ [Apo] Detected {len(pairs_apo)} WC pairs in frame 0")
+    wc_apo = pair_status_over_time(coords_apo, pairs_apo)
+
+    traj_holo = md.load_dcd(traj_holo_file, top=top_holo_file)
+    coords_holo = jnp.array(traj_holo.xyz)
+    pairs_holo = get_pairs(traj_holo, coords_holo)
+    print(f"✅ [Ligand] Detected {len(pairs_holo)} WC pairs in frame 0")
+    wc_holo = pair_status_over_time(coords_holo, pairs_holo)
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(wc_apo, label="Apo (No Ligand)")
+    plt.plot(wc_holo, label="Ligand-bound")
+    plt.xlabel("Frame"); plt.ylabel("Intact Watson–Crick Pairs")
+    plt.title("WC Base Pair Stability Over Time")
+    plt.grid(); plt.legend(); plt.tight_layout()
+    fname = f"{out_prefix}wc_pair_stability_overlay.png"
+    plt.savefig(fname); plt.show()
+    print(f"📊 Overlay plot saved as {fname}")
+
+
+# 9. Ligand–RNA Atom Contact Frequencies — multi‑ligand aware
+def run_ligand_rna_atom_contact_frequencies_safe(
+    traj_file="production_md.dcd",
+    top_file="final_structure.pdb",
+    ligand_resname="UNK",
+    out_prefix="",
+    ligand_info=None,    # <-- NEW (optional)
+):
+    """
+    Computes ligand↔RNA hydrogen-bond-derived contact frequencies of RNA atoms.
+    If ligand_info is provided, restrict to that specific UNK chain only.
+    """
+    import mdtraj as md, jax.numpy as jnp, numpy as np, pandas as pd, re
+    from collections import defaultdict
+    from IPython.display import display
+    from tqdm import tqdm
+
+    traj   = md.load_dcd(traj_file, top=top_file)
+    coords = jnp.array(traj.xyz)
+    atoms  = list(traj.topology.atoms)
+
+    # ligand atoms
+    if ligand_info is not None:
+        ligand_atoms_list = _select_atoms_for_ligand(traj, ligand_info)
+        ligand_atoms_set  = set(ligand_atoms_list)
+        if len(ligand_atoms_list) == 0:
+            print(f"❗ No atoms for {ligand_info.name}; skipping.")
+            return
+        ligand_tag = ligand_info.name
+    else:
+        ligand_atoms_list = [a.index for a in atoms if a.residue.name.strip() == ligand_resname]
+        ligand_atoms_set  = set(ligand_atoms_list)
+        if len(ligand_atoms_list) == 0:
+            print("❗ No UNK atoms; skipping.")
+            return
+        ligand_tag = ligand_resname
+
+    # bond map
+    bond_map = {i: [] for i in range(len(atoms))}
+    for a, b in traj.topology.bonds:
+        bond_map[a.index].append(b.index)
+        bond_map[b.index].append(a.index)
+
+    rna_bases = {"A", "U", "G", "C"}
+    # Acceptors: N/O on RNA only (not water)
+    acceptors = [a for a in atoms if (a.element.symbol in ('N','O') and a.residue.name.strip() in rna_bases)]
+    acceptor_indices_set = set(a.index for a in acceptors)
+
+    # triplets: donor-H (on RNA or ligand) → acceptor (RNA)
+    triplets_np = []
+    for h in atoms:
+        if h.element.symbol != 'H':
+            continue
+        is_on_rna    = h.residue.name.strip() in rna_bases
+        is_on_ligand = (h.index in ligand_atoms_set)
+        if not (is_on_rna or is_on_ligand):
+            continue
+        bonded = bond_map[h.index]
+        if not bonded:
+            continue
+        d_idx = bonded[0]
+        for a_idx in acceptor_indices_set:
+            if a_idx != d_idx:
+                triplets_np.append((d_idx, h.index, a_idx))
+
+    if len(triplets_np) == 0:
+        print("❗ No donor–H–acceptor triplets (RNA acceptors) found; skipping.")
+        return
+
+    triplets_np = np.array(triplets_np, dtype=np.int32)
+    triplets    = jnp.array(triplets_np)
+    donor_idxs    = triplets[:, 0]
+    hydrogen_idxs = triplets[:, 1]
+    acceptor_idxs = triplets[:, 2]
+
+    # mask: require ligand involvement (either donor or acceptor is the ligand)
+    ligand_atom_indices = jnp.array(ligand_atoms_list, dtype=jnp.int32)
+    involves_ligand_mask = jnp.isin(donor_idxs, ligand_atom_indices) | jnp.isin(acceptor_idxs, ligand_atom_indices)
+
+    # find putative H-bonds
+    h_bonds_found = []
+    dist_cutoff = 0.35
+    angle_cutoff = 120.0
+    n_frames = coords.shape[0]
+    for frame_idx in tqdm(range(n_frames), desc="Scanning ligand–RNA H-bonds"):
+        xyz = coords[frame_idx]
+        d_xyz = xyz[donor_idxs]; h_xyz = xyz[hydrogen_idxs]; a_xyz = xyz[acceptor_idxs]
+        vec_HA = h_xyz - a_xyz; dist_HA = jnp.linalg.norm(vec_HA, axis=1)
+        vec_DH = h_xyz - d_xyz
+        norm_DH = vec_DH / jnp.linalg.norm(vec_DH, axis=1)[:, None]
+        norm_HA = vec_HA / jnp.linalg.norm(vec_HA, axis=1)[:, None]
+        cosang  = jnp.sum(norm_DH * norm_HA, axis=1)
+        angles  = jnp.degrees(jnp.arccos(jnp.clip(cosang, -1.0, 1.0)))
+        passed  = jnp.where((dist_HA < dist_cutoff) & (angles > angle_cutoff) & involves_ligand_mask)[0]
+        for idx in passed:
+            d = atoms[int(donor_idxs[idx])]
+            a = atoms[int(acceptor_idxs[idx])]
+            h_bonds_found.append((
+                f"{d.residue.name} {d.residue.resSeq} ({d.name})",
+                f"{a.residue.name} {a.residue.resSeq} ({a.name})"
+            ))
+
+    if not h_bonds_found:
+        print("❗ No ligand–RNA H-bonds found. Nothing to tabulate.")
+        return
+
+    # tally RNA atom contacts from H-bonds
+    from collections import defaultdict
+    atom_contact_counts = defaultdict(int)
+    for donor, acceptor in h_bonds_found:
+        for entry in (donor, acceptor):
+            if entry.startswith(ligand_tag):
+                continue
+            m = re.match(r"([AUGC])\s\d+\s\((\w+)\)", entry)
+            if m:
+                base, atom = m.groups()
+                key = f"{base}-{atom}"
+                atom_contact_counts[key] += 1
+
+    df = pd.DataFrame(atom_contact_counts.items(), columns=["RNA Atom", "Contact Count"])
+    df = df.sort_values(by="Contact Count", ascending=False).reset_index(drop=True)
+
+    lp = _ligand_prefix(ligand_info, out_prefix)
+    print(f"🔹 Most Frequently Contacted RNA Atoms by {ligand_tag}:")
+    try:
+        from IPython.display import display
+        display(df.head(30))
+    except Exception:
+        print(df.head(30).to_string(index=False))
+    df.to_csv(f"{lp}ligand_rna_atom_contact_frequencies.csv", index=False)
+    print(f"✅ Saved to '{lp}ligand_rna_atom_contact_frequencies.csv'")
+
+
+# 10. Carboxylate – OP1/OP2 checker — multi‑ligand aware
+def run_carboxylate_OP_checker(
+    traj_file,
+    top_file,
+    ligand_resname="UNK",
+    out_prefix="carboxylate_OP_",
+    ligand_info=None,    # <-- NEW (optional)
+):
+    """
+    Checks and visualizes ligand carboxylate-O (or all O on ligand, fallback) contacts with RNA OP1/OP2.
+    If ligand_info is provided, restrict to that specific UNK chain only.
+    """
+    import mdtraj as md, jax.numpy as jnp, numpy as np, matplotlib.pyplot as plt, seaborn as sns
+    from tqdm import tqdm
+
+    traj  = md.load_dcd(traj_file, top=top_file)
+    atoms = list(traj.topology.atoms)
+
+    # --- ligand oxygen indices
+    if ligand_info is not None:
+        lig_atom_idx = set(_select_atoms_for_ligand(traj, ligand_info))
+        if not lig_atom_idx:
+            print(f"❗ No atoms for {ligand_info.name}; skipping.")
+            return
+        ligand_tag = ligand_info.name
+    else:
+        lig_atom_idx = set(a.index for a in atoms if a.residue.name.strip() == ligand_resname)
+        if not lig_atom_idx:
+            print("❗ No UNK atoms; skipping.")
+            return
+        ligand_tag = ligand_resname
+
+    carboxylate_O_names = {"O", "OXT", "O1", "O2"}
+    ligand_O_idxs = [
+        a.index for a in atoms
+        if (a.index in lig_atom_idx) and (a.name.strip() in carboxylate_O_names)
+    ]
+    if not ligand_O_idxs:
+        # fallback: any O on the ligand
+        ligand_O_idxs = [a.index for a in atoms if (a.index in lig_atom_idx) and (a.element.symbol == "O")]
+        if not ligand_O_idxs:
+            print("❗ No ligand O atoms; aborting carboxylate–OP analysis.")
+            return
+        print(f"Auto-detected ligand O atoms (fallback): {ligand_O_idxs}")
+
+    print(f"Found ligand O atoms (indices): {ligand_O_idxs}")
+
+    # --- RNA OP1/OP2 indices
+    rna_bases = {"A","U","G","C"}
+    phos_names = {"OP1","OP2"}
+    rna_OP_idxs, rna_OP_labels = [], []
+    for a in atoms:
+        if a.residue.name.strip() in rna_bases and a.name.strip() in phos_names:
+            rna_OP_idxs.append(a.index)
+            rna_OP_labels.append(f"{a.residue.name.strip()}{a.residue.resSeq}-{a.name.strip()}")
+    print(f"Found {len(rna_OP_idxs)} OP1/OP2 atoms in RNA backbone.")
+
+    coords = jnp.array(traj.xyz)
+    ligand_coords = coords[:, ligand_O_idxs, :]
+    rna_OP_coords = coords[:, rna_OP_idxs, :]
+    n_frames = coords.shape[0]
+    n_OP = len(rna_OP_idxs)
+    n_ligO = len(ligand_O_idxs)
+
+    threshold = 0.35  # nm
+    contact_matrix = np.zeros((n_frames, n_OP), dtype=int)
+    print("Computing contacts (ligand O ↔ RNA OP1/OP2)...")
+    for f in tqdm(range(n_frames)):
+        for li in range(n_ligO):
+            dists = jnp.linalg.norm(rna_OP_coords[f] - ligand_coords[f, li], axis=1)
+            contact_matrix[f] = np.logical_or(contact_matrix[f], dists < threshold)
+
+    occupancy = contact_matrix.sum(axis=0) / n_frames
+
+    lp = _ligand_prefix(ligand_info, out_prefix)
+    np.save(lp + "contact_matrix.npy", contact_matrix)
+    np.save(lp + "occupancy.npy", occupancy)
+    with open(lp + "labels.txt", "w") as f:
+        for label in rna_OP_labels:
+            f.write(label + "\n")
+
+    plt.figure(figsize=(14, 3))
+    sns.heatmap(contact_matrix.T, cmap="Blues", cbar=True, yticklabels=rna_OP_labels)
+    plt.title(f"{ligand_tag}: Ligand O – RNA OP1/OP2 Contacts (framewise)")
+    plt.xlabel("Frame"); plt.ylabel("RNA OP1/OP2 Atom")
+    plt.tight_layout(); plt.savefig(lp + "contact_heatmap.png", dpi=200); plt.show()
+
+    plt.figure(figsize=(16, 4))
+    sns.barplot(x=rna_OP_labels, y=occupancy)
+    plt.xticks(rotation=90)
+    plt.ylabel("Contact Occupancy (fraction)")
+    plt.title(f"{ligand_tag}: Occupancy of Ligand O – RNA OP1/OP2")
+    plt.tight_layout(); plt.savefig(lp + "occupancy.png", dpi=200); plt.show()
+
+    op_contact_sorted = sorted(list(zip(rna_OP_labels, occupancy)), key=lambda x: x[1], reverse=True)
+    print("\nTop 10 ligand–OP contacts by occupancy:")
+    for label, occ in op_contact_sorted[:10]:
+        print(f'{label}: {occ:.3f}')
+
+    print(f"✅ Carboxylate–OP checker complete! (prefix '{lp}')")
+
+
+# -----------------------------
+# Convenience wrappers (optional)
+# -----------------------------
+def run_contact_analysis_rna_multi(traj_file, top_file, registry, base_prefix=""):
+    for info in registry.values():
+        run_contact_analysis_rna(traj_file, top_file, ligand_info=info,
+                                 ligand_resname="UNK", out_prefix=_ligand_prefix(info, base_prefix))
+
+def run_contact_analysis_protein_multi(traj_file, top_file, registry, base_prefix=""):
+    for info in registry.values():
+        run_contact_analysis_protein(traj_file, top_file, ligand_info=info,
+                                     ligand_resname="UNK", out_prefix=_ligand_prefix(info, base_prefix))
+
+def run_hbond_analysis_rna_multi(traj_file, top_file, registry, base_prefix="", dist_cutoff=0.35, angle_cutoff=120.0):
+    for info in registry.values():
+        run_hbond_analysis_rna(traj_file, top_file, ligand_info=info,
+                               ligand_resname="UNK", out_prefix=_ligand_prefix(info, base_prefix),
+                               dist_cutoff=dist_cutoff, angle_cutoff=angle_cutoff)
+
+def run_hbond_analysis_protein_multi(traj_file, top_file, registry, base_prefix="", dist_cutoff=0.35, angle_cutoff=120.0):
+    for info in registry.values():
+        run_hbond_analysis_protein(traj_file, top_file, ligand_info=info,
+                                   ligand_resname="UNK", out_prefix=_ligand_prefix(info, base_prefix),
+                                   dist_cutoff=dist_cutoff, angle_cutoff=angle_cutoff)
+
+def run_ligand_rna_atom_contact_frequencies_multi(traj_file, top_file, registry, base_prefix=""):
+    for info in registry.values():
+        run_ligand_rna_atom_contact_frequencies_safe(traj_file, top_file, ligand_info=info,
+                                                     ligand_resname="UNK", out_prefix=_ligand_prefix(info, base_prefix))
+
+def run_carboxylate_OP_checker_multi(traj_file, top_file, registry, base_prefix="carboxylate_OP_"):
+    for info in registry.values():
+        run_carboxylate_OP_checker(traj_file, top_file, ligand_info=info,
+                                   ligand_resname="UNK", out_prefix=_ligand_prefix(info, base_prefix))
+
