@@ -146,7 +146,7 @@ def run_ligand_rmsd(traj_file, top_file, ligand_resname="UNK", out_prefix="", li
     fname = f"{out_prefix}ligand_rmsd.png"; plt.savefig(fname)
     print(f"✅ Ligand RMSD plot saved as {fname}")
 
-def run_ligand_rmsd_multi(traj_file="production_md.dcd", top_file="final_structure.pdb",
+def run_ligand_rmsd_multi(traj_file="production_md.dcd", top_file="final_structure.cif",
                            ligand_resname="UNK", out_dir="analysis"):
     ligs = discover_ligands(top_file, ligand_resname)
     Path(out_dir).mkdir(exist_ok=True)
@@ -179,7 +179,7 @@ def run_hydration_shell(traj_file, top_file, ligand_resname="UNK", out_prefix=""
     fname = f"{out_prefix}hydration_shell.png"; plt.savefig(fname)
     print(f"✅ Hydration shell plot saved as {fname}")
 
-def run_hydration_shell_multi(traj_file="production_md.dcd", top_file="final_structure.pdb",
+def run_hydration_shell_multi(traj_file="production_md.dcd", top_file="final_structure.cif",
                               ligand_resname="UNK", out_dir="analysis", dist_cutoff=0.35):
     ligs = discover_ligands(top_file, ligand_resname)
     Path(out_dir).mkdir(exist_ok=True)
@@ -260,7 +260,7 @@ def run_contact_analysis_rna(traj_file, top_file, ligand_resname="UNK", out_pref
     plt.savefig(f"{out_prefix}contact_barplot.png"); plt.show()
     print(f"✅ RNA contact summary saved (prefix {out_prefix})")
 
-def run_contact_analysis_rna_multi(traj_file="production_md.dcd", top_file="final_structure.pdb",
+def run_contact_analysis_rna_multi(traj_file="production_md.dcd", top_file="final_structure.cif",
                                    ligand_resname="UNK", out_dir="analysis"):
     ligs = discover_ligands(top_file, ligand_resname)
     Path(out_dir).mkdir(exist_ok=True)
@@ -338,7 +338,7 @@ def run_contact_analysis_protein(traj_file, top_file, ligand_resname="UNK", out_
     plt.tight_layout(); plt.savefig(f"{out_prefix}protein_contact_barplot.png"); plt.show()
     print(f"✅ Protein contact summary saved (prefix {out_prefix})")
 
-def run_contact_analysis_protein_multi(traj_file="production_md.dcd", top_file="final_structure.pdb",
+def run_contact_analysis_protein_multi(traj_file="production_md.dcd", top_file="final_structure.cif",
                                        ligand_resname="UNK", out_dir="analysis"):
     ligs = discover_ligands(top_file, ligand_resname)
     Path(out_dir).mkdir(exist_ok=True)
@@ -455,7 +455,7 @@ def run_hbond_analysis_rna(traj_file, top_file, ligand_resname="UNK", out_prefix
         plt.ylabel("Bond Count"); plt.xlabel("RNA Residue"); plt.xticks(rotation=45, ha='right'); plt.tight_layout()
         plt.grid(axis='y', linestyle='--', alpha=0.5); plt.savefig(f"{out_prefix}hbond_roles_top20_stacked.png"); plt.show()
 
-def run_hbond_analysis_rna_multi(traj_file="production_md.dcd", top_file="final_structure.pdb",
+def run_hbond_analysis_rna_multi(traj_file="production_md.dcd", top_file="final_structure.cif",
                                  ligand_resname="UNK", out_dir="analysis",
                                  dist_cutoff=0.35, angle_cutoff=120.0):
     ligs = discover_ligands(top_file, ligand_resname)
@@ -551,7 +551,7 @@ def run_hbond_analysis_protein(traj_file, top_file, ligand_resname="UNK", out_pr
         plt.tight_layout(); plt.grid(axis='y', linestyle='--', alpha=0.6)
         plt.savefig(f"{out_prefix}protein_hbond_top20_bar.png"); plt.show()
 
-def run_hbond_analysis_protein_multi(traj_file="production_md.dcd", top_file="final_structure.pdb",
+def run_hbond_analysis_protein_multi(traj_file="production_md.dcd", top_file="final_structure.cif",
                                      ligand_resname="UNK", out_dir="analysis",
                                      dist_cutoff=0.35, angle_cutoff=120.0):
     ligs = discover_ligands(top_file, ligand_resname)
@@ -751,7 +751,7 @@ def run_wc_pair_checker_overlay(
 
 # ---------------------- (9) RNA Atom contact summary (multi) -----------------
 
-def run_ligand_rna_atom_contact_frequencies_safe(traj_file="production_md.dcd", top_file="final_structure.pdb",
+def run_ligand_rna_atom_contact_frequencies_safe(traj_file="production_md.dcd", top_file="final_structure.cif",
                                                  ligand_resname="UNK", out_prefix="", ligand_atom_indices=None):
     """
     Same as your original, but restricted to one ligand instance if 'ligand_atom_indices' is provided.
@@ -839,7 +839,7 @@ def run_ligand_rna_atom_contact_frequencies_safe(traj_file="production_md.dcd", 
     df.to_csv(f"{out_prefix}ligand_rna_atom_contact_frequencies.csv", index=False)
     print(f"✅ Saved to '{out_prefix}ligand_rna_atom_contact_frequencies.csv'")
 
-def run_ligand_rna_atom_contact_frequencies_multi(traj_file="production_md.dcd", top_file="final_structure.pdb",
+def run_ligand_rna_atom_contact_frequencies_multi(traj_file="production_md.dcd", top_file="final_structure.cif",
                                                   ligand_resname="UNK", out_dir="analysis"):
     ligs = discover_ligands(top_file, ligand_resname)
     Path(out_dir).mkdir(exist_ok=True)
