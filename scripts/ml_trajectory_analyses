@@ -563,6 +563,192 @@ def run_hbond_analysis_protein_multi(traj_file="production_md.dcd", top_file="fi
                                    angle_cutoff=angle_cutoff,
                                    ligand_atom_indices=L["atom_indices"])
 
+# 7. PCA & FEL (Overlay) — same signature your UI expects
+def run_pca_fel_overlay(traj_apo_file, top_apo_file, traj_holo_file, top_holo_file, out_prefix=""):
+    import mdtraj as md
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from sklearn.decomposition import PCA
+    from scipy.constants import Boltzmann
+
+    # --- load
+    traj_apo  = md.load(traj_apo_file,  top=top_apo_file)
+    traj_holo = md.load(traj_holo_file, top=top_holo_file)
+
+    # --- try RNA selection (phosphorus)
+    sel_apo  = traj_apo.top.select("nucleic and name P")
+    sel_holo = traj_holo.top.select("nucleic and name P")
+
+    def select_CA_intersection(t):
+        """Return Cα indices mapped by (chain.id, resSeq) for a protein."""
+        ca_map = {}
+        for a in t.top.atoms:
+            if a.name.strip() == "CA" and a.residue.is_protein:
+                key = (getattr(a.residue.chain, "id", ""), a.residue.resSeq)
+                ca_map[key] = a.index
+        return ca_map
+
+    # --- if no P atoms in either, fall back to protein CA matched by (chain,resSeq)
+    if len(sel_apo) == 0 or len(sel_holo) == 0:
+        ca_apo  = select_CA_intersection(traj_apo)
+        ca_holo = select_CA_intersection(traj_holo)
+        common_keys = sorted(set(ca_apo) & set(ca_holo))
+        sel_apo  = np.array([ca_apo[k]  for k in common_keys], dtype=int)
+        sel_holo = np.array([ca_holo[k] for k in common_keys], dtype=int)
+
+    # --- final sanity
+    if sel_apo.size == 0 or sel_holo.size == 0:
+        raise ValueError("No atoms selected for PCA (neither RNA P nor protein CA found in common).")
+    if sel_apo.size != sel_holo.size:
+        raise ValueError(f"Selection mismatch: apo={sel_apo.size}, holo={sel_holo.size} — "
+                         "ensure both trajectories cover the same residues.")
+
+    # --- slice & align
+    traj_apo_s  = traj_apo.atom_slice(sel_apo)
+    traj_holo_s = traj_holo.atom_slice(sel_holo)
+    traj_apo_s.superpose(traj_apo_s, 0)
+    traj_holo_s.superpose(traj_apo_s, 0)
+
+    # --- flatten for PCA
+    xyz_apo  = traj_apo_s.xyz.reshape(traj_apo_s.n_frames, -1)
+    xyz_holo = traj_holo_s.xyz.reshape(traj_holo_s.n_frames, -1)
+
+    # --- guard: finite and nonzero features
+    if xyz_apo.shape[1] == 0 or not np.all(np.isfinite(xyz_apo)):
+        raise ValueError("Apo feature matrix is empty or non-finite.")
+    if xyz_holo.shape[1] == 0 or not np.all(np.isfinite(xyz_holo)):
+        raise ValueError("Holo feature matrix is empty or non-finite.")
+
+    # --- PCA (fit on apo, project both)
+    pca = PCA(n_components=2)
+    pca.fit(xyz_apo)
+    pc_apo  = pca.transform(xyz_apo)
+    pc_holo = pca.transform(xyz_holo)
+
+    # --- plot PCA
+    plt.figure(figsize=(8,5))
+    plt.scatter(pc_apo[:,0],  pc_apo[:,1],  alpha=0.5, label="Apo",  color="blue")
+    plt.scatter(pc_holo[:,0], pc_holo[:,1], alpha=0.5, label="Holo", color="red")
+    plt.xlabel(f"PC1 ({pca.explained_variance_ratio_[0]*100:.2f}% var)")
+    plt.ylabel(f"PC2 ({pca.explained_variance_ratio_[1]*100:.2f}% var)")
+    plt.title("PCA Projection: Apo vs Ligand-bound")
+    plt.legend(); plt.grid(True); plt.tight_layout()
+    plt.savefig(f"{out_prefix}pca_overlay.png")
+    print(f"✅ PCA overlay saved as {out_prefix}pca_overlay.png")
+
+    # --- FEL helper
+    def compute_fel(pc1, pc2, bins=100):
+        H, xedges, yedges = np.histogram2d(pc1, pc2, bins=bins, density=True)
+        P = H.T
+        P[P == 0] = 1e-12  # avoid log(0)
+        G = -Boltzmann * 310.15 * np.log(P)  # 310.15 K (approx. 37°C)
+        G -= G.min()
+        return G, xedges, yedges
+
+    G_apo, x_a, y_a   = compute_fel(pc_apo[:,0],  pc_apo[:,1])
+    G_holo, x_h, y_h  = compute_fel(pc_holo[:,0], pc_holo[:,1])
+    X_a, Y_a = np.meshgrid(x_a[:-1], y_a[:-1])
+    X_h, Y_h = np.meshgrid(x_h[:-1], y_h[:-1])
+
+    plt.figure(figsize=(12,5))
+    plt.subplot(1,2,1); cp1 = plt.contourf(X_a, Y_a, G_apo, levels=30, cmap="Blues")
+    plt.colorbar(cp1, label="Free Energy (J)"); plt.title("FEL: Apo");  plt.xlabel("PC1"); plt.ylabel("PC2")
+    plt.subplot(1,2,2); cp2 = plt.contourf(X_h, Y_h, G_holo, levels=30, cmap="Reds")
+    plt.colorbar(cp2, label="Free Energy (J)"); plt.title("FEL: Holo"); plt.xlabel("PC1"); plt.ylabel("PC2")
+    plt.tight_layout(); plt.savefig(f"{out_prefix}fel_overlay.png")
+    print(f"✅ FEL overlay saved as {out_prefix}fel_overlay.png")
+
+# 8. WC checker (Overlay)
+
+def run_wc_pair_checker_overlay(
+    traj_apo_file, top_apo_file, traj_holo_file, top_holo_file, out_prefix=""
+):
+    """
+    Overlays Watson–Crick base pair stability for both apo and holo MD runs.
+    Saves plot as .png and prints number of pairs detected in each run.
+    """
+    import mdtraj as md
+    import jax.numpy as jnp
+    import matplotlib.pyplot as plt
+
+    def get_pairs(traj, coords):
+        topology = traj.topology
+        atoms = list(topology.atoms)
+        wc_pairs = {
+            ("A", "U"): ("N1", "N3"),
+            ("U", "A"): ("N3", "N1"),
+            ("G", "C"): ("N1", "N3"),
+            ("C", "G"): ("N3", "N1"),
+        }
+        min_seq_gap = 4
+        atom_lookup = {
+            (atom.residue.name.strip(), atom.residue.resSeq, atom.name): atom.index
+            for atom in atoms
+        }
+        rna_residues = [
+            res for res in topology.residues
+            if res.name.strip() in {"A", "U", "G", "C"}
+        ]
+        pairs = []
+        for i, res1 in enumerate(rna_residues):
+            for j in range(i + 1, len(rna_residues)):
+                res2 = rna_residues[j]
+                if abs(res1.resSeq - res2.resSeq) < min_seq_gap:
+                    continue
+                pair_key = (res1.name.strip(), res2.name.strip())
+                if pair_key not in wc_pairs:
+                    continue
+                atom1_name, atom2_name = wc_pairs[pair_key]
+                idx1 = atom_lookup.get((res1.name.strip(), res1.resSeq, atom1_name))
+                idx2 = atom_lookup.get((res2.name.strip(), res2.resSeq, atom2_name))
+                if idx1 is None or idx2 is None:
+                    continue
+                # Frame-0 screening
+                dist = jnp.linalg.norm(coords[0, idx1] - coords[0, idx2])
+                if dist < 0.35:  # nm
+                    pairs.append((res1, idx1, res2, idx2))
+        return pairs
+
+    def pair_status_over_time(coords, pairs):
+        framewise_status = []
+        for frame in range(coords.shape[0]):
+            count = 0
+            for res1, idx1, res2, idx2 in pairs:
+                dist = jnp.linalg.norm(coords[frame, idx1] - coords[frame, idx2])
+                if dist < 0.35:  # nm
+                    count += 1
+            framewise_status.append(count)
+        return framewise_status
+
+    # Apo
+    traj_apo = md.load_dcd(traj_apo_file, top=top_apo_file)
+    coords_apo = jnp.array(traj_apo.xyz)
+    pairs_apo = get_pairs(traj_apo, coords_apo)
+    print(f"✅ [Apo] Detected {len(pairs_apo)} WC pairs in frame 0")
+    wc_apo = pair_status_over_time(coords_apo, pairs_apo)
+
+    # Holo
+    traj_holo = md.load_dcd(traj_holo_file, top=top_holo_file)
+    coords_holo = jnp.array(traj_holo.xyz)
+    pairs_holo = get_pairs(traj_holo, coords_holo)
+    print(f"✅ [Ligand] Detected {len(pairs_holo)} WC pairs in frame 0")
+    wc_holo = pair_status_over_time(coords_holo, pairs_holo)
+
+    # Plot
+    plt.figure(figsize=(10, 4))
+    plt.plot(wc_apo, label="Apo (No Ligand)", color="blue")
+    plt.plot(wc_holo, label="Ligand-bound", color="red")
+    plt.xlabel("Frame")
+    plt.ylabel("Intact Watson–Crick Pairs")
+    plt.title("WC Base Pair Stability Over Time")
+    plt.grid()
+    plt.legend()
+    plt.tight_layout()
+    fname = f"{out_prefix}wc_pair_stability_overlay.png"
+    plt.savefig(fname)
+    plt.show()
+    print(f"📊 Overlay plot saved as {fname}")
+
 # ---------------------- (9) RNA Atom contact summary (multi) -----------------
 
 def run_ligand_rna_atom_contact_frequencies_safe(traj_file="production_md.dcd", top_file="final_structure.pdb",
