@@ -155,7 +155,7 @@ def _kabsch_rmsd(P, Q):
     return jnp.sqrt(jnp.mean(jnp.sum(diff * diff, axis=1)))
 
 def run_ligand_rmsd(traj_file, top_file, ligand_resname="UNK", out_prefix="", ligand_atom_indices=None):
-    traj = load_dcd_with_top(traj_file, top_file)
+    traj = md.load_dcd(traj_file, top=top_file)
     ligand_atoms = get_ligand_atoms(traj, ligand_resname, ligand_atom_indices)
     if not ligand_atoms:
         print("❗ No ligand atoms found; skipping ligand RMSD.")
