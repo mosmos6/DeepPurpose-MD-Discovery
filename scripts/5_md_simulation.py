@@ -619,7 +619,7 @@ rest_prot.addGlobalParameter("k_prot", 1000.0*kilojoule_per_mole/nanometer**2)
 rest_prot.addPerParticleParameter("x0")
 rest_prot.addPerParticleParameter("y0")
 rest_prot.addPerParticleParameter("z0")
-rest_prot.setUsesPeriodicBoundaryConditions(True)
+rest_prot.usesPeriodicBoundaryConditions(True)
 
 # Ligand heavy-atom restraints (gentle)
 rest_lig  = CustomExternalForce("0.5*k_lig*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
