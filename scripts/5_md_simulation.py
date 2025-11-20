@@ -18,6 +18,8 @@ from openmm.app import *
 from openmm import MonteCarloBarostat, LangevinMiddleIntegrator
 from openmm.unit import *
 from openmmforcefields.generators import SMIRNOFFTemplateGenerator
+from openmm import LocalEnergyMinimizer, CustomExternalForce
+from openmm.app import element
 from openff.toolkit.utils.exceptions import MoleculeParseError
 
 from openff.toolkit.topology import Molecule, Topology as OFFTopology
@@ -599,6 +601,63 @@ integrator.setRandomNumberSeed(seed)
 simulation = Simulation(modeller.topology, system, integrator)
 simulation.context.setPositions(modeller.positions)
 
+# === Stage‑0 position‑restrained minimization ===========================
+pos = modeller.positions  # initial coordinates with units
+
+# Identify atoms to restrain
+aa = {
+    "ALA","ARG","ASN","ASP","CYS","GLN","GLU","GLY","HIS","ILE","LEU","LYS","MET",
+    "PHE","PRO","SER","THR","TRP","TYR","VAL","SEC","PYL"
+}
+ligand_resname = "UNK"        # Ligands are UNK
+water_resname  = "HOH"
+
+# (A) strong restraints for PROTEIN heavy atoms
+rest_prot = CustomExternalForce("0.5*k*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
+rest_prot.addGlobalParameter("k", 1000.0*kilojoule_per_mole/nanometer**2)
+rest_prot.addPerParticleParameter("x0")
+rest_prot.addPerParticleParameter("y0")
+rest_prot.addPerParticleParameter("z0")
+
+# (B) gentle restraints for LIGAND heavy atoms (just to prevent early blow‑ups)
+rest_lig = CustomExternalForce("0.5*k*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
+rest_lig.addGlobalParameter("k", 100.0*kilojoule_per_mole/nanometer**2)
+rest_lig.addPerParticleParameter("x0")
+rest_lig.addPerParticleParameter("y0")
+rest_lig.addPerParticleParameter("z0")
+
+for i, atom in enumerate(modeller.topology.atoms()):
+    if atom.element is None or atom.element == element.hydrogen:
+        continue  # skip hydrogens
+    rname = (atom.residue.name or "").strip()
+
+    if rname in aa:  # protein heavy atoms
+        rest_prot.addParticle(i, pos[i])
+    elif rname == ligand_resname:  # ligand heavy atoms
+        rest_lig.addParticle(i, pos[i])
+    # water and everything else unrestrained
+
+# Add to the System and remember indices so we can remove later
+rest_prot_index = system.addForce(rest_prot)
+rest_lig_index  = system.addForce(rest_lig)
+
+# Reinitialize context so the new forces are active, then run a restrained minimization
+simulation.context.reinitialize(preserveState=False)
+simulation.context.setPositions(pos)
+
+print("🔹 Stage‑0: restrained minimization (protein heavy atoms strong; ligands gentle)…")
+LocalEnergyMinimizer.minimize(simulation.context,
+                              tolerance=10*kilojoule_per_mole,
+                              maxIterations=5000)
+
+# We can safely drop the *ligand* restraint right after the hardening step so ligands can settle
+system.removeForce(rest_lig_index)
+simulation.context.reinitialize(preserveState=True)
+print("🔓 Released ligand restraints.")
+# ============================================================================
+
+
+
 # =========================
 # Hotspot reporter (MixMD only)
 # =========================
@@ -635,6 +694,17 @@ simulation.step(500)  # 1 ps
 print("🔹 NPT Equilibration (5 ps)...")
 simulation.reporters.append(PDBReporter(f"npt_equilibrated{suffix}.pdb", 500))
 simulation.step(2500)  # 5 ps
+
+# === Drop protein restraints before production =========================
+try:
+    system.removeForce(rest_prot_index)
+    simulation.context.reinitialize(preserveState=True)
+    print("🔓 Removed protein restraints (entering production).")
+except Exception:
+    # If already removed or indices aren’t in scope, ignore
+    pass
+# ============================================================================
+
 
 print(f"🔥 Production MD: {args.n_steps:,} steps")
 simulation.reporters.append(DCDReporter(f"production_md{suffix}.dcd", 1000))
