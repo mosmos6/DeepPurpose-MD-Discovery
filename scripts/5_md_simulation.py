@@ -605,7 +605,7 @@ simulation = Simulation(modeller.topology, system, integrator)
 simulation.context.setPositions(modeller.positions)
 
 # === Stage‑0 position‑restrained minimization ===========================
-pos = modeller.positions  # initial coordinates with units
+pos = modeller.positions  # OpenMM Vec3 with units
 
 aa = {
     "ALA","ARG","ASN","ASP","CYS","GLN","GLU","GLY","HIS","ILE","LEU","LYS","MET",
@@ -613,52 +613,51 @@ aa = {
 }
 ligand_resname = "UNK"
 
-# (A) strong restraints for PROTEIN heavy atoms
+# Protein heavy-atom restraints (strong)
 rest_prot = CustomExternalForce("0.5*k_prot*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
 rest_prot.addGlobalParameter("k_prot", 1000.0*kilojoule_per_mole/nanometer**2)
 rest_prot.addPerParticleParameter("x0")
 rest_prot.addPerParticleParameter("y0")
 rest_prot.addPerParticleParameter("z0")
+rest_prot.setUsesPeriodicBoundaryConditions(True)
 
-# (B) gentle restraints for LIGAND heavy atoms
+# Ligand heavy-atom restraints (gentle)
 rest_lig  = CustomExternalForce("0.5*k_lig*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
 rest_lig.addGlobalParameter("k_lig", 100.0*kilojoule_per_mole/nanometer**2)
 rest_lig.addPerParticleParameter("x0")
 rest_lig.addPerParticleParameter("y0")
 rest_lig.addPerParticleParameter("z0")
+rest_lig.setUsesPeriodicBoundaryConditions(True)
 
 for i, atom in enumerate(modeller.topology.atoms()):
     # skip hydrogens
     if (atom.element is None) or (atom.element == element.hydrogen):
         continue
     rname = (atom.residue.name or "").strip()
-    x0, y0, z0 = pos[i].value_in_unit(nanometer)  # floats
-
-    if rname in aa:               # protein heavy atoms
+    x0, y0, z0 = pos[i].value_in_unit(nanometer)
+    if rname in aa:
         rest_prot.addParticle(i, [x0, y0, z0])
-    elif rname == ligand_resname: # ligand heavy atoms
+    elif rname == ligand_resname:
         rest_lig.addParticle(i, [x0, y0, z0])
 
-# Add restraints to the System
+# Add forces and activate them
 rest_prot_index = system.addForce(rest_prot)
 rest_lig_index  = system.addForce(rest_lig)
-
-# Reinitialize to activate the newly-added forces
 simulation.context.reinitialize(preserveState=False)
 simulation.context.setPositions(pos)
 
 print("🔹 Stage‑0: restrained minimization (protein heavy atoms strong; ligands gentle)…")
-LocalEnergyMinimizer.minimize(simulation.context,
-                              tolerance=10*kilojoule_per_mole,
-                              maxIterations=5000)
+LocalEnergyMinimizer.minimize(
+    simulation.context,
+    tolerance = 10*kilojoule_per_mole/nanometer,   # ← fixed units
+    maxIterations = 5000
+)
 
-# Let ligands relax freely after the hardening step
+# Let ligands relax after hardening
 system.removeForce(rest_lig_index)
 simulation.context.reinitialize(preserveState=True)
 print("🔓 Released ligand restraints.")
 # ============================================================================
-
-
 
 
 # =========================
