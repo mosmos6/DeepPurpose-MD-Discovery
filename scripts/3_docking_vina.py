@@ -124,6 +124,19 @@ def _compute_center(args):
             return x, y, z
         print("⚠️  No atoms in the specified RNA range; falling back to HETATM/ATOM centroid.")
 
+    # Priority 3a: specific HETATM names (e.g., 3E4)
+    if args.het_resnames:
+        wanted = {t.strip().upper() for t in args.het_resnames.split(",") if t.strip()}
+        sx = sy = sz = 0.0; n = 0
+        for ln in txt.splitlines():
+            if ln.startswith("HETATM") and ln[17:20].strip().upper() in wanted:
+                sx += float(ln[30:38]); sy += float(ln[38:46]); sz += float(ln[46:54]); n += 1
+        if n > 0:
+            x, y, z = round(sx/n,3), round(sy/n,3), round(sz/n,3)
+            print(f"📍 HETATM({','.join(sorted(wanted))}) centroid: x={x} y={y} z={z}")
+            return x, y, z
+        print(f"⚠️  No HETATM with names in {wanted}; falling back.")
+
     # Priority 3: HETATM centroid (if requested)
     if args.use_residue_centroid:
         resnames = set()
@@ -173,6 +186,9 @@ def main():
     ap.add_argument("--center_y", type=float, default=None)
     ap.add_argument("--center_z", type=float, default=None)
     ap.add_argument("--vina_seed", type=int, default=12345)
+    ap.add_argument("--het-resnames", type=str, default=None,
+                help="Comma-separated HETATM 3-letter names to centroid (e.g., '3E4,EPE').")
+
     args = ap.parse_args()
 
     if not RECEPTOR_PDBQT.exists():
