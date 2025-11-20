@@ -20,6 +20,9 @@ from openmm.unit import *
 from openmmforcefields.generators import SMIRNOFFTemplateGenerator
 from openmm import LocalEnergyMinimizer, CustomExternalForce
 from openmm.app import element
+from openmm.unit import nanometer, kilojoule_per_mole
+from openmm.app import element
+
 from openff.toolkit.utils.exceptions import MoleculeParseError
 
 from openff.toolkit.topology import Molecule, Topology as OFFTopology
@@ -604,44 +607,43 @@ simulation.context.setPositions(modeller.positions)
 # === Stage‑0 position‑restrained minimization ===========================
 pos = modeller.positions  # initial coordinates with units
 
-# Identify atoms to restrain
 aa = {
     "ALA","ARG","ASN","ASP","CYS","GLN","GLU","GLY","HIS","ILE","LEU","LYS","MET",
     "PHE","PRO","SER","THR","TRP","TYR","VAL","SEC","PYL"
 }
-ligand_resname = "UNK"        # Ligands are UNK
-water_resname  = "HOH"
+ligand_resname = "UNK"
 
 # (A) strong restraints for PROTEIN heavy atoms
-rest_prot = CustomExternalForce("0.5*k*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
-rest_prot.addGlobalParameter("k", 1000.0*kilojoule_per_mole/nanometer**2)
+rest_prot = CustomExternalForce("0.5*k_prot*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
+rest_prot.addGlobalParameter("k_prot", 1000.0*kilojoule_per_mole/nanometer**2)
 rest_prot.addPerParticleParameter("x0")
 rest_prot.addPerParticleParameter("y0")
 rest_prot.addPerParticleParameter("z0")
 
-# (B) gentle restraints for LIGAND heavy atoms (just to prevent early blow‑ups)
-rest_lig = CustomExternalForce("0.5*k*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
-rest_lig.addGlobalParameter("k", 100.0*kilojoule_per_mole/nanometer**2)
+# (B) gentle restraints for LIGAND heavy atoms
+rest_lig  = CustomExternalForce("0.5*k_lig*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
+rest_lig.addGlobalParameter("k_lig", 100.0*kilojoule_per_mole/nanometer**2)
 rest_lig.addPerParticleParameter("x0")
 rest_lig.addPerParticleParameter("y0")
 rest_lig.addPerParticleParameter("z0")
 
 for i, atom in enumerate(modeller.topology.atoms()):
-    if atom.element is None or atom.element == element.hydrogen:
-        continue  # skip hydrogens
+    # skip hydrogens
+    if (atom.element is None) or (atom.element == element.hydrogen):
+        continue
     rname = (atom.residue.name or "").strip()
+    x0, y0, z0 = pos[i].value_in_unit(nanometer)  # floats
 
-    if rname in aa:  # protein heavy atoms
-        rest_prot.addParticle(i, pos[i])
-    elif rname == ligand_resname:  # ligand heavy atoms
-        rest_lig.addParticle(i, pos[i])
-    # water and everything else unrestrained
+    if rname in aa:               # protein heavy atoms
+        rest_prot.addParticle(i, [x0, y0, z0])
+    elif rname == ligand_resname: # ligand heavy atoms
+        rest_lig.addParticle(i, [x0, y0, z0])
 
-# Add to the System and remember indices so we can remove later
+# Add restraints to the System
 rest_prot_index = system.addForce(rest_prot)
 rest_lig_index  = system.addForce(rest_lig)
 
-# Reinitialize context so the new forces are active, then run a restrained minimization
+# Reinitialize to activate the newly-added forces
 simulation.context.reinitialize(preserveState=False)
 simulation.context.setPositions(pos)
 
@@ -650,11 +652,12 @@ LocalEnergyMinimizer.minimize(simulation.context,
                               tolerance=10*kilojoule_per_mole,
                               maxIterations=5000)
 
-# We can safely drop the *ligand* restraint right after the hardening step so ligands can settle
+# Let ligands relax freely after the hardening step
 system.removeForce(rest_lig_index)
 simulation.context.reinitialize(preserveState=True)
 print("🔓 Released ligand restraints.")
 # ============================================================================
+
 
 
 
