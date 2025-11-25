@@ -604,24 +604,29 @@ integrator.setRandomNumberSeed(seed)
 simulation = Simulation(modeller.topology, system, integrator)
 simulation.context.setPositions(modeller.positions)
 
-# === Stage‑0 position‑restrained minimization ===========================
-pos = modeller.positions  # OpenMM Vec3 with units
+# --- Stage‑0: restrained pre‑minimization (protein heavy atoms strong, ligands gentle)
 
+from openmm.app import LocalEnergyMinimizer, element
+from openmm.unit import kilojoule_per_mole, nanometer
+
+pos = modeller.positions  # OpenMM Vec3 array with units
+
+# Amino‑acid set (protein)
 aa = {
     "ALA","ARG","ASN","ASP","CYS","GLN","GLU","GLY","HIS","ILE","LEU","LYS","MET",
     "PHE","PRO","SER","THR","TRP","TYR","VAL","SEC","PYL"
 }
-ligand_resname = "UNK"
+ligand_resname = "UNK"   # your ligands are written as UNK residues
 
-# Protein heavy-atom restraints (strong)
+# (A) Protein heavy‑atom restraints (independent global parameter name!)
 rest_prot = CustomExternalForce("0.5*k_prot*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
 rest_prot.addGlobalParameter("k_prot", 1000.0*kilojoule_per_mole/nanometer**2)
 rest_prot.addPerParticleParameter("x0")
 rest_prot.addPerParticleParameter("y0")
 rest_prot.addPerParticleParameter("z0")
-rest_prot.usesPeriodicBoundaryConditions(True)
+rest_prot.setUsesPeriodicBoundaryConditions(True)  # <-- the correct setter
 
-# Ligand heavy-atom restraints (gentle)
+# (B) Ligand heavy‑atom restraints (gentler; different global parameter name)
 rest_lig  = CustomExternalForce("0.5*k_lig*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
 rest_lig.addGlobalParameter("k_lig", 100.0*kilojoule_per_mole/nanometer**2)
 rest_lig.addPerParticleParameter("x0")
@@ -629,36 +634,40 @@ rest_lig.addPerParticleParameter("y0")
 rest_lig.addPerParticleParameter("z0")
 rest_lig.setUsesPeriodicBoundaryConditions(True)
 
+# Attach particles (skip hydrogens)
 for i, atom in enumerate(modeller.topology.atoms()):
-    # skip hydrogens
     if (atom.element is None) or (atom.element == element.hydrogen):
         continue
     rname = (atom.residue.name or "").strip()
-    x0, y0, z0 = pos[i].value_in_unit(nanometer)
+    x0, y0, z0 = pos[i].value_in_unit(nanometer)  # numeric nm values for x0/y0/z0
     if rname in aa:
         rest_prot.addParticle(i, [x0, y0, z0])
     elif rname == ligand_resname:
         rest_lig.addParticle(i, [x0, y0, z0])
 
-# Add forces and activate them
-rest_prot_index = system.addForce(rest_prot)
-rest_lig_index  = system.addForce(rest_lig)
+# Add forces to the System and activate them in the Context
+idx_prot = system.addForce(rest_prot)
+idx_lig  = system.addForce(rest_lig)
 simulation.context.reinitialize(preserveState=False)
 simulation.context.setPositions(pos)
 
-print("🔹 Stage‑0: restrained minimization (protein heavy atoms strong; ligands gentle)…")
-LocalEnergyMinimizer.minimize(
-    simulation.context,
-    tolerance = 10*kilojoule_per_mole/nanometer,   # ← fixed units
-    maxIterations = 5000
-)
+print("🔹 Stage‑0: restrained minimization…")
+# OpenMM changed the expected unit for 'tolerance' across versions.
+# Try force‑tolerance first (kJ/mol/nm), fall back to energy‑tolerance (kJ/mol).
+try:
+    LocalEnergyMinimizer.minimize(simulation.context,
+                                  tolerance=10*kilojoule_per_mole/nanometer,
+                                  maxIterations=5000)
+except TypeError:
+    LocalEnergyMinimizer.minimize(simulation.context,
+                                  tolerance=10*kilojoule_per_mole,
+                                  maxIterations=5000)
 
-# Let ligands relax after hardening
-system.removeForce(rest_lig_index)
+# Let ligands relax freely after the hardening step (keep protein restraints)
+system.removeForce(idx_lig)
 simulation.context.reinitialize(preserveState=True)
-print("🔓 Released ligand restraints.")
-# ============================================================================
-
+print("🔓 Released ligand restraints (protein restraints kept for early equilibration).")
+# --- end Stage‑0 --------------------------------------------------------------
 
 # =========================
 # Hotspot reporter (MixMD only)
