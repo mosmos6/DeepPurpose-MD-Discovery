@@ -604,67 +604,18 @@ integrator.setRandomNumberSeed(seed)
 simulation = Simulation(modeller.topology, system, integrator)
 simulation.context.setPositions(modeller.positions)
 
-# --- Stage‑0: restrained pre‑minimization (protein heavy atoms strong, ligands gentle)
+# ---- SIMPLE MINIMIZATION (no extra restraints) ----
+print("🔹 Energy Minimization (no extra restraints)…")
+LocalEnergyMinimizer.minimize(simulation.context)  # use default tolerance/iterations
+print("✅ Minimization complete.")
 
-pos = modeller.positions  # OpenMM Vec3 array with units
-
-# Amino‑acid set (protein)
-aa = {
-    "ALA","ARG","ASN","ASP","CYS","GLN","GLU","GLY","HIS","ILE","LEU","LYS","MET",
-    "PHE","PRO","SER","THR","TRP","TYR","VAL","SEC","PYL"
-}
-ligand_resname = "UNK"   # your ligands are written as UNK residues
-
-# (A) Protein heavy‑atom restraints (independent global parameter name!)
-rest_prot = CustomExternalForce("0.5*k_prot*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
-rest_prot.addGlobalParameter("k_prot", 700.0*kilojoule_per_mole/nanometer**2)
-rest_prot.addPerParticleParameter("x0")
-rest_prot.addPerParticleParameter("y0")
-rest_prot.addPerParticleParameter("z0")
-rest_prot.usesPeriodicBoundaryConditions = True  # <-- the correct setter
-
-# (B) Ligand heavy‑atom restraints (gentler; different global parameter name)
-rest_lig  = CustomExternalForce("0.5*k_lig*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
-rest_lig.addGlobalParameter("k_lig", 100.0*kilojoule_per_mole/nanometer**2)
-rest_lig.addPerParticleParameter("x0")
-rest_lig.addPerParticleParameter("y0")
-rest_lig.addPerParticleParameter("z0")
-rest_lig.usesPeriodicBoundaryConditions = True
-
-# Attach particles (skip hydrogens)
-for i, atom in enumerate(modeller.topology.atoms()):
-    if (atom.element is None) or (atom.element == element.hydrogen):
-        continue
-    rname = (atom.residue.name or "").strip()
-    x0, y0, z0 = pos[i].value_in_unit(nanometer)  # numeric nm values for x0/y0/z0
-    if rname in aa:
-        rest_prot.addParticle(i, [x0, y0, z0])
-    elif rname == ligand_resname:
-        rest_lig.addParticle(i, [x0, y0, z0])
-
-# Add forces to the System and activate them in the Context
-idx_prot = system.addForce(rest_prot)
-idx_lig  = system.addForce(rest_lig)
-simulation.context.reinitialize(preserveState=False)
-simulation.context.setPositions(pos)
-
-print("🔹 Stage‑0: restrained minimization…")
-# OpenMM changed the expected unit for 'tolerance' across versions.
-# Try force‑tolerance first (kJ/mol/nm), fall back to energy‑tolerance (kJ/mol).
-try:
-    LocalEnergyMinimizer.minimize(simulation.context,
-                                  tolerance=10*kilojoule_per_mole/nanometer,
-                                  maxIterations=5000)
-except TypeError:
-    LocalEnergyMinimizer.minimize(simulation.context,
-                                  tolerance=10*kilojoule_per_mole,
-                                  maxIterations=5000)
-
-# Let ligands relax freely after the hardening step (keep protein restraints)
-system.removeForce(idx_lig)
-simulation.context.reinitialize(preserveState=True)
-print("🔓 Released ligand restraints (protein restraints kept for early equilibration).")
-# --- end Stage‑0 --------------------------------------------------------------
+# (Optionally write out the minimized structure here)
+with open(f"minimized{suffix}.pdb", "w") as f:
+    PDBFile.writeFile(
+        simulation.topology,
+        simulation.context.getState(getPositions=True).getPositions(),
+        f
+    )
 
 # =========================
 # Hotspot reporter (MixMD only)
