@@ -617,7 +617,7 @@ ligand_resname = "UNK"   # your ligands are written as UNK residues
 
 # (A) Protein heavy‑atom restraints (independent global parameter name!)
 rest_prot = CustomExternalForce("0.5*k_prot*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
-rest_prot.addGlobalParameter("k_prot", 300.0*kilojoule_per_mole/nanometer**2)
+rest_prot.addGlobalParameter("k_prot", 700.0*kilojoule_per_mole/nanometer**2)
 rest_prot.addPerParticleParameter("x0")
 rest_prot.addPerParticleParameter("y0")
 rest_prot.addPerParticleParameter("z0")
