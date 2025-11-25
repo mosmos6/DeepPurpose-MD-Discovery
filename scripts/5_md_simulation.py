@@ -606,9 +606,6 @@ simulation.context.setPositions(modeller.positions)
 
 # --- Stage‑0: restrained pre‑minimization (protein heavy atoms strong, ligands gentle)
 
-from openmm.app import LocalEnergyMinimizer, element
-from openmm.unit import kilojoule_per_mole, nanometer
-
 pos = modeller.positions  # OpenMM Vec3 array with units
 
 # Amino‑acid set (protein)
