@@ -654,17 +654,6 @@ print("🔹 NPT Equilibration (5 ps)...")
 simulation.reporters.append(PDBReporter(f"npt_equilibrated{suffix}.pdb", 500))
 simulation.step(2500)  # 5 ps
 
-# === Drop protein restraints before production =========================
-try:
-    system.removeForce(rest_prot_index)
-    simulation.context.reinitialize(preserveState=True)
-    print("🔓 Removed protein restraints (entering production).")
-except Exception:
-    # If already removed or indices aren’t in scope, ignore
-    pass
-# ============================================================================
-
-
 print(f"🔥 Production MD: {args.n_steps:,} steps")
 simulation.reporters.append(DCDReporter(f"production_md{suffix}.dcd", 1000))
 simulation.reporters.append(StateDataReporter(f"production_md{suffix}.log", 1000, step=True, potentialEnergy=True, temperature=True))
