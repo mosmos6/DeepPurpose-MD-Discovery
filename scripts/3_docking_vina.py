@@ -1,8 +1,13 @@
+# 3_docking_vina.py
 # Author: Iori Mochizuki + patch
-# Updated: 2025-10-28
-# Description: Run docking with AutoDock Vina for one or many ligands.
-# - Primary discovery uses 'ligands.index' written by Step 1
-# - Output per ligand: output_<name>.pdbqt, best_docked_<name>.pdb, output_<name>.pdb
+# Updated: 2025-12-02
+#
+# Description:
+#   Run docking with AutoDock Vina for one or many ligands.
+#   - Primary discovery uses 'ligands.index' written by Step 1
+#   - NEW: --ligand-select allows restricting which ligands to dock
+#          (by 1-based index or by name)
+#   - Output per ligand: output_<name>.pdbqt, best_docked_<name>.pdb, output_<name>.pdb
 
 import argparse, json, re, subprocess
 from pathlib import Path
@@ -28,7 +33,6 @@ def _read_names_from_json():
     if not p.exists():
         return None
     try:
-        # Python JSON dict preserves insertion order (3.7+)
         d = json.loads(p.read_text(encoding="utf-8"))
         return [_safe(k) for k in d.keys()]
     except Exception:
@@ -96,30 +100,80 @@ def _resolve_ligands():
     pairs = [(_safe(f.stem), f) for f in files]
     return pairs
 
+def _filter_ligands_by_selector(all_pairs, selector: str | None):
+    """
+    all_pairs: list of (name, Path)
+    selector: comma-separated list of 1-based indices or names (stems)
+      - "1,3" → first and third in all_pairs
+      - "lucidenic_acid_A_reishi_,procyanidin_C1_GSE_" → by name
+    If selector is None, returns all_pairs unchanged.
+    """
+    if not selector:
+        return all_pairs
+
+    tokens = [t.strip() for t in selector.split(",") if t.strip()]
+    if not tokens:
+        return all_pairs
+
+    # 1-based index map
+    by_idx = {str(i): all_pairs[i-1] for i in range(1, len(all_pairs)+1)}
+    # name map
+    by_name = {nm: (nm, p) for nm, p in all_pairs}
+
+    selected = []
+    for tok in tokens:
+        if tok in by_idx:
+            selected.append(by_idx[tok])
+        elif tok in by_name:
+            selected.append(by_name[tok])
+        else:
+            print(f"⚠️  --ligand-select token '{tok}' not matched; ignoring.")
+
+    # Keep order consistent with all_pairs
+    seen = set()
+    ordered = []
+    for nm, p in all_pairs:
+        if (nm, p) in selected and (nm, p) not in seen:
+            ordered.append((nm, p))
+            seen.add((nm, p))
+
+    if not ordered:
+        print("⚠️  --ligand-select did not match any ligands; using all.")
+        return all_pairs
+    return ordered
+
 def _compute_center(args):
     # Priority 1: manual center
     if args.center_x is not None and args.center_y is not None and args.center_z is not None:
-        x = round(float(args.center_x), 3); y = round(float(args.center_y), 3); z = round(float(args.center_z), 3)
+        x = round(float(args.center_x), 3)
+        y = round(float(args.center_y), 3)
+        z = round(float(args.center_z), 3)
         print(f"📍 Docking box center (manual): x={x} y={y} z={z}")
         return x, y, z
 
     # Priority 2: RNA residue range centroid
     def _parse_range(s):
-        for dash in ['–', '—', '−', '‒', '―']: s = s.replace(dash, '-')
-        a, b = s.split('-'); return int(a), int(b)
+        for dash in ['–', '—', '−', '‒', '―']:
+            s = s.replace(dash, '-')
+        a, b = s.split('-')
+        return int(a), int(b)
 
     txt = RECEPTOR_FOR_CENTER.read_text()  # raises if missing (better fail fast)
 
     if args.rna and args.res_range:
         start, end = _parse_range(args.res_range)
-        sx = sy = sz = 0.0; n = 0
+        sx = sy = sz = 0.0
+        n = 0
         for ln in txt.splitlines():
             if ln.startswith("ATOM"):
                 resid = int(ln[22:26])
                 if start <= resid <= end:
-                    sx += float(ln[30:38]); sy += float(ln[38:46]); sz += float(ln[46:54]); n += 1
+                    sx += float(ln[30:38])
+                    sy += float(ln[38:46])
+                    sz += float(ln[46:54])
+                    n += 1
         if n > 0:
-            x, y, z = round(sx/n,3), round(sy/n,3), round(sz/n,3)
+            x, y, z = round(sx/n, 3), round(sy/n, 3), round(sz/n, 3)
             print(f"📍 RNA centroid {start}-{end}: x={x} y={y} z={z}")
             return x, y, z
         print("⚠️  No atoms in the specified RNA range; falling back to HETATM/ATOM centroid.")
@@ -127,38 +181,50 @@ def _compute_center(args):
     # Priority 3a: specific HETATM names (e.g., 3E4)
     if args.het_resnames:
         wanted = {t.strip().upper() for t in args.het_resnames.split(",") if t.strip()}
-        sx = sy = sz = 0.0; n = 0
+        sx = sy = sz = 0.0
+        n = 0
         for ln in txt.splitlines():
             if ln.startswith("HETATM") and ln[17:20].strip().upper() in wanted:
-                sx += float(ln[30:38]); sy += float(ln[38:46]); sz += float(ln[46:54]); n += 1
+                sx += float(ln[30:38])
+                sy += float(ln[38:46])
+                sz += float(ln[46:54])
+                n += 1
         if n > 0:
-            x, y, z = round(sx/n,3), round(sy/n,3), round(sz/n,3)
+            x, y, z = round(sx/n, 3), round(sy/n, 3), round(sz/n, 3)
             print(f"📍 HETATM({','.join(sorted(wanted))}) centroid: x={x} y={y} z={z}")
             return x, y, z
         print(f"⚠️  No HETATM with names in {wanted}; falling back.")
 
-    # Priority 3: HETATM centroid (if requested)
+    # Priority 3b: HETATM centroid (if requested)
     if args.use_residue_centroid:
         resnames = set()
         for ln in txt.splitlines():
             if ln.startswith("HETATM"):
                 resnames.add(ln[17:20].strip())
-        sx = sy = sz = 0.0; n = 0
+        sx = sy = sz = 0.0
+        n = 0
         for ln in txt.splitlines():
             if ln.startswith("HETATM") and (ln[17:20].strip() in resnames):
-                sx += float(ln[30:38]); sy += float(ln[38:46]); sz += float(ln[46:54]); n += 1
+                sx += float(ln[30:38])
+                sy += float(ln[38:46])
+                sz += float(ln[46:54])
+                n += 1
         if n > 0:
-            x, y, z = round(sx/n,3), round(sy/n,3), round(sz/n,3)
+            x, y, z = round(sx/n, 3), round(sy/n, 3), round(sz/n, 3)
             print(f"📍 HETATM centroid: x={x} y={y} z={z}")
             return x, y, z
         print("⚠️  No HETATM residues; falling back to ATOM centroid.")
 
     # Priority 4: all ATOM centroid
-    sx = sy = sz = 0.0; n = 0
+    sx = sy = sz = 0.0
+    n = 0
     for ln in txt.splitlines():
         if ln.startswith("ATOM"):
-            sx += float(ln[30:38]); sy += float(ln[38:46]); sz += float(ln[46:54]); n += 1
-    x, y, z = round(sx/n,3), round(sy/n,3), round(sz/n,3)
+            sx += float(ln[30:38])
+            sy += float(ln[38:46])
+            sz += float(ln[46:54])
+            n += 1
+    x, y, z = round(sx/n, 3), round(sy/n, 3), round(sz/n, 3)
     print(f"📍 ATOM centroid: x={x} y={y} z={z}")
     return x, y, z
 
@@ -179,15 +245,19 @@ def _extract_model1_pdb(in_pdbqt: Path, out_pdb: Path):
 
 def main():
     ap = argparse.ArgumentParser(description="Dock one or many ligands with AutoDock Vina.")
-    ap.add_argument("--use-residue-centroid", action="store_true")
-    ap.add_argument("--rna", action="store_true")
-    ap.add_argument("--res-range", type=str, default=None)
+    ap.add_argument("--use-residue-centroid", action="store_true",
+                    help="Use centroid of all HETATM residues (unless overridden by manual center or het_resnames).")
+    ap.add_argument("--rna", action="store_true", help="Enable RNA centroid mode.")
+    ap.add_argument("--res-range", type=str, default=None,
+                    help="Residue range for RNA centroid, e.g. '10-50'.")
     ap.add_argument("--center_x", type=float, default=None)
     ap.add_argument("--center_y", type=float, default=None)
     ap.add_argument("--center_z", type=float, default=None)
     ap.add_argument("--vina_seed", type=int, default=12345)
     ap.add_argument("--het-resnames", type=str, default=None,
-                help="Comma-separated HETATM 3-letter names to centroid (e.g., '3E4,EPE').")
+                    help="Comma-separated HETATM 3-letter names to centroid (e.g., '3E4,EPE').")
+    ap.add_argument("--ligand-select", type=str, default=None,
+                    help="Subset of ligands to dock, by 1-based index or name (comma separated).")
 
     args = ap.parse_args()
 
@@ -198,6 +268,10 @@ def main():
 
     ligands = _resolve_ligands()
     print(f"Found {len(ligands)} ligand(s): " + ", ".join(nm for nm, _ in ligands))
+
+    # NEW: apply selector, just like Step 5
+    ligands = _filter_ligands_by_selector(ligands, args.ligand_select)
+    print("Docking the following ligand(s): " + ", ".join(nm for nm, _ in ligands))
 
     cx, cy, cz = _compute_center(args)
 
