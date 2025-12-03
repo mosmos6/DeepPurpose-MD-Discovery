@@ -71,6 +71,7 @@ class ProbeHotspotReporter:
         self.center_mode = center_mode
         self._have_ref_com = False
         self._ref_com = (0.0, 0.0, 0.0)
+        self._next_step = 0
 
         # discover which probe residue names exist in topology
         present = {(res.name or "").upper().strip() for res in topology.residues()}
@@ -125,23 +126,8 @@ class ProbeHotspotReporter:
 
     # Critical fix: schedule aligned to stride multiples so it logs beyond step 0
     def describeNextReport(self, simulation):
-        # determine current integer step
-        step = 0
-        try:
-            step = int(simulation.currentStep)
-        except Exception:
-            try:
-                state = simulation.context.getState(getTime=True)
-                t  = state.getTime()                       # has units
-                dt = simulation.integrator.getStepSize()   # has units
-                step = int(round((t/dt)))
-            except Exception:
-                step = 0
-        n = self.reportInterval
-        rem = step % n
-        due = n if rem == 0 else (n - rem)
-        # (steps, positions, velocities, forces, energies, enforcePeriodicBox)
-        return (due, True, False, False, False, True)
+        
+        return (self.reportInterval, True, False, False, False, True)
 
     @staticmethod
     def _com_of_indices(positions, idxs):
@@ -159,16 +145,8 @@ class ProbeHotspotReporter:
     def report(self, simulation, state):
         pos = state.getPositions(asNumpy=False)  # list of Vec3 (nm)
 
-        # integer step again (for robust logging)
-        try:
-            step = int(simulation.currentStep)
-        except Exception:
-            try:
-                t  = state.getTime()
-                dt = simulation.integrator.getStepSize()
-                step = int(round((t/dt)))
-            except Exception:
-                step = -1
+        step = getattr(self, "_next_step", 0)
+        self._next_step = step + self.reportInterval
 
         # receptor-centered recentering
         dx = dy = dz = 0.0
