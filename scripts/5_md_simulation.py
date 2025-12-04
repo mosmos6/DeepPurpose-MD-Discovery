@@ -57,7 +57,7 @@ def _default_packmol_csv(receptor_path: Path) -> Path:
 # =========================
 class ProbeHotspotReporter:
     """
-    Write probe residue centroids (nm) every 'reportInterval' steps to CSV.
+    Write probe residue centroids (nm) every `reportInterval` steps to CSV.
     Columns: step,resname,resid,x_nm,y_nm,z_nm
 
     Coordinates are stabilized in a receptor-centered frame:
@@ -67,16 +67,13 @@ class ProbeHotspotReporter:
 
     def __init__(self, file_path, reportInterval, topology,
                  probe_resnames=None, center_mode="protein-com"):
-        # I/O + basic config
         self.file = open(file_path, "w")
         self.reportInterval = max(1, int(reportInterval))
         self.center_mode = center_mode
-
-        # reference COM bookkeeping
         self._have_ref_com = False
         self._ref_com = (0.0, 0.0, 0.0)
 
-        # --- which probe residue names exist in this topology? ---
+        # discover which probe residue names exist in topology
         present = {(res.name or "").upper().strip() for res in topology.residues()}
         auto_names = present & PROBE_NAME_SET
         if probe_resnames:
@@ -85,7 +82,7 @@ class ProbeHotspotReporter:
         else:
             self.probe_res = auto_names
 
-        # --- index groups for probe residues + anchors for protein COM ---
+        # index groups for probe residues + anchors for protein COM
         aa = {
             "ALA","ARG","ASN","ASP","CYS","GLN","GLU","GLY","HIS","ILE",
             "LEU","LYS","MET","PHE","PRO","SER","THR","TRP","TYR","VAL"
@@ -96,23 +93,20 @@ class ProbeHotspotReporter:
         for res in topology.residues():
             rn = (res.name or "").upper().strip()
 
-            # probe residues: store their atom indices as one group each
             if rn in self.probe_res:
                 idxs = [a.index for a in res.atoms()]
                 if idxs:
                     groups.append(idxs)
-                    resid_map.append(
-                        (rn, int(res.id) if res.id is not None else 0)
-                    )
+                    resid_map.append((rn, int(res.id) if res.id is not None else 0))
 
-            # protein anchors for COM (prefer CA)
             if rn in aa:
+                # prefer CA atoms
                 for a in res.atoms():
                     if (a.name or "").upper() == "CA":
                         self._protein_anchor_indices.append(a.index)
 
-        # fallback: non‑H protein atoms if there were no CA atoms
         if not self._protein_anchor_indices:
+            # fallback: non-H protein atoms
             for res in topology.residues():
                 rn = (res.name or "").upper().strip()
                 if rn in aa:
@@ -124,21 +118,27 @@ class ProbeHotspotReporter:
         self.groups = groups
         self.resid_map = resid_map
 
-        # --- header + diagnostic ---
+        # header + diagnostic
         self.file.write("# tracking_resnames=" + ";".join(sorted(self.probe_res)) + "\n")
         self.file.write("# center_mode=" + str(self.center_mode) + "\n")
         self.file.write("step,resname,resid,x_nm,y_nm,z_nm\n")
         self.file.flush()
 
+    # OpenMM calls this to ask: "how many steps until your next report?"
     def describeNextReport(self, simulation):
-        """
-        OpenMM asks: 'How many steps until your next report?'
-        We just say 'reportInterval' every time. OpenMM handles the
-        accumulation and will call report() every N steps.
-        """
+        try:
+            step = int(simulation.currentStep)
+        except Exception:
+            step = 0
+
+        # classic pattern: align to fixed multiples of reportInterval
         n = self.reportInterval
-        # steps, positions, velocities, forces, energies, enforcePeriodicBox
-        return (n, True, False, False, False, True)
+        steps_till_next = n - (step % n)
+        if steps_till_next <= 0:
+            steps_till_next = n
+
+        # (steps, positions, velocities, forces, energies, enforcePeriodicBox)
+        return (steps_till_next, True, False, False, False, True)
 
     @staticmethod
     def _com_of_indices(positions, idxs):
@@ -154,17 +154,11 @@ class ProbeHotspotReporter:
         return (sx/n, sy/n, sz/n)
 
     def report(self, simulation, state):
-        # Step number from OpenMM; this is the ONLY source of truth.
+        # Step number as OpenMM sees it *right now*
         try:
             step = int(simulation.currentStep)
         except Exception:
-            # very defensive fallback
-            try:
-                t  = state.getTime()
-                dt = simulation.integrator.getStepSize()
-                step = int(round((t/dt)))
-            except Exception:
-                step = -1
+            step = -1
 
         pos = state.getPositions(asNumpy=False)  # list of Vec3 (nm)
 
@@ -173,7 +167,6 @@ class ProbeHotspotReporter:
         if self.center_mode == "protein-com" and self._protein_anchor_indices:
             com_now = self._com_of_indices(pos, self._protein_anchor_indices)
             if not self._have_ref_com:
-                # store COM at first call as reference
                 self._ref_com = com_now
                 self._have_ref_com = True
             dx = self._ref_com[0] - com_now[0]
@@ -190,8 +183,7 @@ class ProbeHotspotReporter:
                 n += 1
             if n > 0:
                 self.file.write(
-                    f"{step},{resname},{resid},"
-                    f"{sx/n+dx:.5f},{sy/n+dy:.5f},{sz/n+dz:.5f}\n"
+                    f"{step},{resname},{resid},{sx/n+dx:.5f},{sy/n+dy:.5f},{sz/n+dz:.5f}\n"
                 )
         self.file.flush()
 
