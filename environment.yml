@@ -8,7 +8,7 @@ dependencies:
   - openmm
   - openmmforcefields
   - openff-toolkit
-  - mdtraj
+  - mdtraj=1.11.0
   - scikit-learn
   - pdbfixer
   - rdkit
