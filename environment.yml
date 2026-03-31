@@ -4,7 +4,7 @@ channels:
   - defaults
 dependencies:
   - python
-  - numpy<2.2.4
+  - numpy
   - openmm
   - openmmforcefields
   - openff-toolkit
@@ -15,7 +15,7 @@ dependencies:
   - pip
   - pip:
       - meeko
-      - vina==1.2.6
+      - vina
       - scipy
       - gemmi
       - biopython
