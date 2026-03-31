@@ -4,7 +4,7 @@ channels:
   - defaults
 dependencies:
   - python=3.13
-  - numpy<2.0
+  - numpy
   - openmm
   - openmmforcefields
   - openff-toolkit
