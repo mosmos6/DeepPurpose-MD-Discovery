@@ -15,7 +15,7 @@ dependencies:
   - pip
   - pip:
       - meeko
-      - vina=1.2.6
+      - vina==1.2.6
       - scipy
       - gemmi
       - biopython
