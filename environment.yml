@@ -3,12 +3,12 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  - python
-  - numpy
+  - python=3.11    # 🔧 Add this line to avoid Python 3.13
+  - numpy<2.0
   - openmm
   - openmmforcefields
   - openff-toolkit
-  - mdtraj
+  - mdtraj=1.11.0
   - scikit-learn
   - pdbfixer
   - rdkit
