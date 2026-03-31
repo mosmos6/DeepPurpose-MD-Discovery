@@ -3,7 +3,7 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  - python=3.13
+  - python
   - numpy<2.2.4
   - openmm
   - openmmforcefields
