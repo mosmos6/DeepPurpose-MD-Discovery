@@ -12,7 +12,7 @@
 import argparse, json, re, subprocess
 from pathlib import Path
 
-VINA_BIN = "./vina_1.2.5_linux_x86_64"
+VINA_BIN = "./vina_1.2.7_linux_x86_64"
 RECEPTOR_PDBQT = Path("receptor.pdbqt")
 RECEPTOR_FOR_CENTER = Path("receptor_for_centroid.pdb")
 
