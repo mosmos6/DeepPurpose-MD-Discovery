@@ -285,7 +285,7 @@ def _add_probes_from_packmol(modeller: Modeller,
         m.generate_conformers(n_conformers=1)
         m.name = res
         off_mols.append(m)
-    smirnoff = SMIRNOFFTemplateGenerator(molecules=off_mols)
+    smirnoff = SMIRNOFFTemplateGenerator(molecules=off_mols, forcefield="openff-2.3.0")
     forcefield.registerTemplateGenerator(smirnoff.generator)
 
     top_cache = {m.name: OFFTopology.from_molecules([m]).to_openmm() for m in off_mols}
@@ -421,7 +421,7 @@ def _add_ligands(modeller: Modeller, forcefield: ForceField, sdf_paths: list[Pat
         poss.append(to_openmm(lig.conformers[0]))
         print(f"   • ligand loaded from {sdf.name}")
 
-    smirnoff = SMIRNOFFTemplateGenerator(molecules=off_mols)
+    smirnoff = SMIRNOFFTemplateGenerator(molecules=off_mols, forcefield="openff-2.3.0")
     forcefield.registerTemplateGenerator(smirnoff.generator)
 
     for top, pos in zip(tops, poss):
